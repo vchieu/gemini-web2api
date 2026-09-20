@@ -75,11 +75,10 @@ class ModelRoutingTests(unittest.TestCase):
     # omitting inner[80] made the server fall back to 3.1 Pro for every model.
     def test_browser_captured_family_variant_pairs(self):
         cases = {
-            "gemini-3.5-flash": (1, 1),
             "gemini-3.6-flash": (1, 1),
             "gemini-3.1-pro": (3, 1),
             "gemini-3.1-pro-thinking": (3, 2),
-            "gemini-3.5-flash-thinking": (1, 2),
+            "gemini-3.6-flash-thinking": (1, 2),
             "gemini-3.5-flash-lite": (6, 1),
             "gemini-3.5-flash-thinking-lite": (5, 2),
         }
@@ -98,13 +97,13 @@ class ModelTicketTests(unittest.TestCase):
     # (1,1)+flash-ticket -> Flash, (3,1)+flash-ticket -> Flash (ticket wins).
     def test_ticket_mapping(self):
         self.assertEqual(
-            ticket_for("gemini-3.5-flash"), CONFIG["model_tickets"]["flash"])
+            ticket_for("gemini-3.6-flash"), CONFIG["model_tickets"]["flash"])
         self.assertEqual(
             ticket_for("gemini-3.1-pro"), CONFIG["model_tickets"]["pro"])
         self.assertEqual(
             ticket_for("gemini-3.5-flash-lite"), CONFIG["model_tickets"]["lite"])
         self.assertEqual(
-            ticket_for("gemini-3.5-flash-thinking"), CONFIG["model_tickets"]["flash-thinking"])
+            ticket_for("gemini-3.6-flash-thinking"), CONFIG["model_tickets"]["flash-thinking"])
         self.assertEqual(
             ticket_for("gemini-3.5-flash-thinking-lite"), CONFIG["model_tickets"]["lite-thinking"])
         self.assertEqual(

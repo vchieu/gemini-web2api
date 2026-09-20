@@ -38,7 +38,7 @@ python gemini_web2api.py
 |------|-----|
 | Base URL | `http://localhost:8081/v1` |
 | API Key | `config.json` 中的 `api_keys` 值；未配置则任意值均可 |
-| Model | `gemini-3.5-flash-thinking` |
+| Model | `gemini-3.6-flash-thinking` |
 
 ### curl
 
@@ -46,7 +46,7 @@ python gemini_web2api.py
 curl http://localhost:8081/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-your-key" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"你好！"}]}'
+  -d '{"model":"gemini-3.6-flash","messages":[{"role":"user","content":"你好！"}]}'
 ```
 
 ### OpenAI Python SDK
@@ -55,7 +55,7 @@ curl http://localhost:8081/v1/chat/completions \
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:8081/v1", api_key="sk-your-key")
 resp = client.chat.completions.create(
-    model="gemini-3.5-flash-thinking",
+    model="gemini-3.6-flash-thinking",
     messages=[{"role": "user", "content": "解释量子计算"}]
 )
 print(resp.choices[0].message.content)
@@ -79,23 +79,20 @@ gemini
 | 模型 | 说明 | 输出 |
 |------|------|--------|
 | `gemini-3.6-flash` | 全能模型 (网页版 Flash) | ~1.2万字符 |
-| `gemini-3.5-flash` | 全能模型 (别名，同一 Flash 后端) | ~1.2万字符 |
-| `gemini-3.5-flash-thinking` | Flash 扩展思考 | **~2万字符** |
-| `gemini-3.5-flash-thinking-lite` | Flash-Lite 扩展思考 | ~1.5万字符 |
+| `gemini-3.6-flash-thinking` | Flash 扩展思考 | **~2万字符** |
 | `gemini-3.5-flash-lite` | 高性价比、大容量 | ~1万字符 |
-| `gemini-3.1-flash-lite` | 高性价比、大容量 | ~1万字符 |
+| `gemini-3.5-flash-thinking-lite` | Flash-Lite 扩展思考 | ~1.5万字符 |
 | `gemini-3.1-pro` | 高阶数学与代码 (需 cookie) | ~1.2万字符 |
 | `gemini-3.1-pro-thinking` | Pro 扩展思考 | **~2万字符** |
-| `gemini-flash-lite` | 最快响应，轻量级 | ~1万字符 |
 
 ### 思考深度
 
 在任意模型名后追加 `@think=N`：
 
 ```
-gemini-3.5-flash-thinking@think=0   # 最深 (默认)
-gemini-3.5-flash-thinking@think=2   # 中等
-gemini-3.5-flash-thinking@think=4   # 最浅
+gemini-3.6-flash-thinking@think=0   # 最深 (默认)
+gemini-3.6-flash-thinking@think=2   # 中等
+gemini-3.6-flash-thinking@think=4   # 最浅
 ```
 
 ## 可选：Cookie 以启用 Pro
