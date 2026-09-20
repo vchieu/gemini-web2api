@@ -95,7 +95,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(ticket: str = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -111,6 +111,9 @@ def _build_headers() -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    if ticket:
+        from .models import TICKET_HEADER
+        headers[TICKET_HEADER] = ticket
     return headers
 
 
@@ -314,14 +317,47 @@ def extract_response_text(raw: str) -> str:
     return clean_text(last_text)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def upstream_echo(raw: str):
+    """Return (label, family, variant) echoed by upstream, or None.
+
+    The StreamGenerate response echoes the model that actually served the
+    request; comparing it against the requested family/variant detects
+    ignored model selection (e.g. expired model ticket).
+    """
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 200:
+            continue
+        try:
+            meta = json.loads(json.loads(line)[0][2])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            continue
+        if isinstance(meta, list) and len(meta) >= 60:
+            return meta[42], meta[58], meta[59]
+    return None
+
+
+def check_routing(raw: str, model_id: int, extra_fields: dict = None) -> None:
+    """Log a warning when upstream served a different model than requested."""
+    echo = upstream_echo(raw)
+    if not echo:
+        return
+    _, fam, var = echo
+    want_var = (extra_fields or {}).get(80)
+    if fam != model_id or (want_var is not None and var != want_var):
+        log(f"Routing mismatch: requested family={model_id} variant={want_var} "
+            f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
+            f"the model ticket in CONFIG['model_tickets'] may be expired — "
+            f"refresh it from a fresh browser capture")
+
+
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, ticket: str = None) -> str:
     """Non-streaming generation with retry."""
     refreshed = False
     if load_cookie()[0] and not CONFIG.get("xsrf_token"):
         refreshed = refresh_auth()
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(ticket)
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
@@ -338,6 +374,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            check_routing(raw, model_id, extra_fields)
             return extract_response_text(raw)
         except Exception as e:
             last_err = e
@@ -346,24 +383,24 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 log("Retrying with refreshed auth...")
                 body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
                 url = _get_url()
-                headers = _build_headers()
+                headers = _build_headers(ticket)
             elif attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, ticket: str = None):
     """Streaming generation via httpx with retry on connection failure."""
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, ticket)
         if text:
             yield text
         return
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
     url = _get_url()
-    headers = _build_headers()
+    headers = _build_headers(ticket)
     client = _get_httpx_client()
 
     last_err = None
@@ -373,7 +410,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         refreshed = refresh_auth()
         body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
         url = _get_url()
-        headers = _build_headers()
+        headers = _build_headers(ticket)
     for attempt in range(CONFIG["retry_attempts"]):
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
@@ -406,7 +443,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 log("Stream retry with refreshed auth...")
                 body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
                 url = _get_url()
-                headers = _build_headers()
+                headers = _build_headers(ticket)
             elif attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
                 time.sleep(CONFIG["retry_delay_sec"])

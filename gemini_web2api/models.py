@@ -6,65 +6,83 @@
 #   inner[80] = variant: 1=standard, 2=extended/thinking
 # E.g. 3.1 Pro=(3,1), 3.1 Pro Extended=(3,2), Flash Extended=(1,2),
 # Flash-Lite=(6,1), Flash-Lite Extended=(6,2).
-# The proxy previously sent only inner[79] and left inner[80] unset, so the
-# server fell back to its default (observed: 3.1 Pro) regardless of request.
+# HOWEVER: the server only honors these fields when the request also carries
+# the per-model ticket header X-Goog-Ext-525001261-Jspb (minted by the browser
+# per model family; embeds family/variant in plaintext). Without the ticket
+# the server falls back to the account default regardless of [79]/[80].
+# The ticket wins over the body fields when both are present.
 # Note: no field selects the exact 3.x point version within a family; the
-# server picks its current default (e.g. requesting "3.5-flash" yields (1,1)).
+# server picks its current default (e.g. requesting "3.5-flash" yields 3.6 Flash).
+
+TICKET_HEADER = "X-Goog-Ext-525001261-Jspb"
 
 MODELS = {
     "gemini-3.8-flash": {
-        "mode": 1, "think": 4, "variant": 1,
+        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "Latest workhorse model, best reasoning & coding (Sep 2026)",
     },
     "gemini-3.8-flash-thinking": {
-        "mode": 1, "think": 0, "variant": 2,
+        "mode": 1, "think": 0, "variant": 2, "ticket": "flash",
         "desc": "Deep thinking mode on the latest Flash backend",
     },
     "gemini-3.7-flash": {
-        "mode": 1, "think": 4, "variant": 1,
+        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "All-around model (Gemini 3.7 Flash)",
     },
     "gemini-3.6-flash": {
-        "mode": 1, "think": 4, "variant": 1,
+        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "All-around model (Gemini 3.6 Flash)",
     },
     "gemini-3.5-flash": {
-        "mode": 1, "think": 4, "variant": 1,
+        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "All-around model (Gemini 3.5 Flash)",
     },
     "gemini-3.5-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1,
+        "mode": 6, "think": 4, "variant": 1, "ticket": None,
         "desc": "Cost-efficient high-capacity model (Gemini 3.5 Flash-Lite)",
     },
     "gemini-3.1-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1,
+        "mode": 6, "think": 4, "variant": 1, "ticket": None,
         "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
-        "mode": 1, "think": 0, "variant": 2,
+        "mode": 1, "think": 0, "variant": 2, "ticket": "flash",
         "desc": "Deep thinking mode, longest output (~20k chars)",
     },
     "gemini-3.1-pro": {
-        "mode": 3, "think": 4, "variant": 1,
+        "mode": 3, "think": 4, "variant": 1, "ticket": "pro",
         "desc": "Pro model (requires cookie for real routing)",
     },
     "gemini-3.1-pro-enhanced": {
-        "mode": 3, "think": 4, "extra": {31: 2, 80: 3},
+        "mode": 3, "think": 4, "extra": {31: 2, 80: 3}, "ticket": "pro",
         "desc": "Pro with enhanced output (experimental)",
     },
     "gemini-auto": {
-        "mode": 4, "think": 4, "variant": 1,
+        "mode": 4, "think": 4, "variant": 1, "ticket": None,
         "desc": "Auto model selection",
     },
     "gemini-3.5-flash-thinking-lite": {
-        "mode": 5, "think": 0, "variant": 2,
+        "mode": 5, "think": 0, "variant": 2, "ticket": None,
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1,
+        "mode": 6, "think": 4, "variant": 1, "ticket": None,
         "desc": "Lightweight fast model",
     },
 }
+
+
+def ticket_for(model_name: str):
+    """Return the upstream ticket header value for a model, or None.
+
+    Looks up the model's ticket key in CONFIG["model_tickets"].
+    """
+    from .config import CONFIG
+    cfg = MODELS.get(model_name) or {}
+    key = cfg.get("ticket")
+    if not key:
+        return None
+    return (CONFIG.get("model_tickets") or {}).get(key)
 
 
 def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
