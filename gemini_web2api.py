@@ -68,6 +68,7 @@ DEFAULT_CONFIG = {
     "model_tickets": {
         "flash": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,"561701FD-A2E8-4275-98B0-636DFE1554F9",null,null,[[6,908199999],[1789884088,624000000]]]',
         "pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[6,620699999],[1789897904,515000000]]]',
+        "lite": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[null,95100000],[1789898801,131000000]]]',
     },
 }
 
@@ -106,11 +107,11 @@ MODELS = {
         "desc": "All-around model (Gemini 3.5 Flash)",
     },
     "gemini-3.5-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1, "ticket": None,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Cost-efficient high-capacity model (Gemini 3.5 Flash-Lite)",
     },
     "gemini-3.1-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1, "ticket": None,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
@@ -130,7 +131,7 @@ MODELS = {
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1, "ticket": None,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Lightweight fast model",
     },
 }

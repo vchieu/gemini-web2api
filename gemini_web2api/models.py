@@ -38,11 +38,11 @@ MODELS = {
         "desc": "All-around model (Gemini 3.5 Flash)",
     },
     "gemini-3.5-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1, "ticket": None,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Cost-efficient high-capacity model (Gemini 3.5 Flash-Lite)",
     },
     "gemini-3.1-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1, "ticket": None,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
@@ -66,7 +66,7 @@ MODELS = {
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
-        "mode": 6, "think": 4, "variant": 1, "ticket": None,
+        "mode": 6, "think": 4, "variant": 1, "ticket": "lite",
         "desc": "Lightweight fast model",
     },
 }
