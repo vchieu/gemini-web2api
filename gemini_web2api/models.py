@@ -14,21 +14,13 @@
 # Note: no field selects the exact 3.x point version within a family; the
 # server picks its current default (e.g. requesting "3.5-flash" yields 3.6 Flash).
 
+# Model list mirrors the Gemini web UI (Sep 2026): Flash / Flash Extended /
+# Flash-Lite (+Extended) / Pro (+Extended). Aliases (3.5/3.6) route to the
+# server's current family default — no field selects the exact 3.x version.
+
 TICKET_HEADER = "X-Goog-Ext-525001261-Jspb"
 
 MODELS = {
-    "gemini-3.8-flash": {
-        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
-        "desc": "Latest workhorse model, best reasoning & coding (Sep 2026)",
-    },
-    "gemini-3.8-flash-thinking": {
-        "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
-        "desc": "Deep thinking mode on the latest Flash backend",
-    },
-    "gemini-3.7-flash": {
-        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
-        "desc": "All-around model (Gemini 3.7 Flash)",
-    },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "All-around model (Gemini 3.6 Flash)",
@@ -47,23 +39,19 @@ MODELS = {
     },
     "gemini-3.5-flash-thinking": {
         "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "desc": "Extended thinking on Flash (~20k chars)",
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4, "variant": 1, "ticket": "pro",
         "desc": "Pro model (requires cookie for real routing)",
     },
-    "gemini-3.1-pro-enhanced": {
-        "mode": 3, "think": 4, "extra": {31: 2, 80: 3}, "ticket": "pro",
-        "desc": "Pro with enhanced output (experimental)",
-    },
-    "gemini-auto": {
-        "mode": 4, "think": 4, "variant": 1, "ticket": None,
-        "desc": "Auto model selection",
+    "gemini-3.1-pro-thinking": {
+        "mode": 3, "think": 1, "variant": 2, "ticket": "pro-thinking",
+        "desc": "Extended thinking on Pro",
     },
     "gemini-3.5-flash-thinking-lite": {
         "mode": 5, "think": 1, "variant": 2, "ticket": "lite-thinking",
-        "desc": "Dynamic thinking with adaptive depth",
+        "desc": "Extended thinking on Flash-Lite",
     },
     "gemini-flash-lite": {
         "mode": 6, "think": 4, "variant": 1, "ticket": "lite",

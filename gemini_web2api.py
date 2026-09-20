@@ -71,35 +71,20 @@ DEFAULT_CONFIG = {
         "lite": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[null,95100000],[1789898801,131000000]]]',
         "flash-thinking": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[null,332100000],[1789899397,281000000]]]',
         "lite-thinking": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[2,950300000],[1789899759,320000000]]]',
+        "pro-thinking": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[null,85000000],[1789900208,389000000]]]',
     },
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
 
 # ─── Models ──────────────────────────────────────────────────────────────────
-# Model selection uses TWO fields in the f.req inner array (live captures):
-#   inner[79] = family (1=flash, 3=pro, 4=auto, 5=dynamic-thinking, 6=lite)
-#   inner[80] = variant (1=standard, 2=extended/thinking)
-# HOWEVER: the server only honors these when the request also carries the
-# per-model ticket header X-Goog-Ext-525001261-Jspb (browser-minted per model
-# family). Without it the server falls back to the account default; the
-# ticket wins over body fields when both are present.
+# Mirrors the Gemini web UI (Sep 2026): Flash / Flash Extended / Flash-Lite
+# (+Extended) / Pro (+Extended). The server routes BY the per-model ticket
+# header X-Goog-Ext-525001261-Jspb and ignores f.req [79]/[80] without it.
 
 TICKET_HEADER = "X-Goog-Ext-525001261-Jspb"
 
 MODELS = {
-    "gemini-3.8-flash": {
-        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
-        "desc": "Latest workhorse model, best reasoning & coding (Sep 2026)",
-    },
-    "gemini-3.8-flash-thinking": {
-        "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
-        "desc": "Deep thinking mode on the latest Flash backend",
-    },
-    "gemini-3.7-flash": {
-        "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
-        "desc": "All-around model (Gemini 3.7 Flash)",
-    },
     "gemini-3.6-flash": {
         "mode": 1, "think": 4, "variant": 1, "ticket": "flash",
         "desc": "All-around model (Gemini 3.6 Flash)",
@@ -118,19 +103,19 @@ MODELS = {
     },
     "gemini-3.5-flash-thinking": {
         "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
-        "desc": "Deep thinking mode, longest output (~20k chars)",
+        "desc": "Extended thinking on Flash",
     },
     "gemini-3.1-pro": {
         "mode": 3, "think": 4, "variant": 1, "ticket": "pro",
         "desc": "Pro model (requires cookie for real routing)",
     },
-    "gemini-auto": {
-        "mode": 4, "think": 4, "variant": 1, "ticket": None,
-        "desc": "Auto model selection",
+    "gemini-3.1-pro-thinking": {
+        "mode": 3, "think": 1, "variant": 2, "ticket": "pro-thinking",
+        "desc": "Extended thinking on Pro",
     },
     "gemini-3.5-flash-thinking-lite": {
         "mode": 5, "think": 1, "variant": 2, "ticket": "lite-thinking",
-        "desc": "Dynamic thinking with adaptive depth",
+        "desc": "Extended thinking on Flash-Lite",
     },
     "gemini-flash-lite": {
         "mode": 6, "think": 4, "variant": 1, "ticket": "lite",

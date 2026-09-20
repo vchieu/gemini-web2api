@@ -30,6 +30,7 @@ DEFAULT_CONFIG = {
         "lite": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[null,95100000],[1789898801,131000000]]]',
         "flash-thinking": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[null,332100000],[1789899397,281000000]]]',
         "lite-thinking": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[2,950300000],[1789899759,320000000]]]',
+        "pro-thinking": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[null,85000000],[1789900208,389000000]]]',
     },
 }
 
