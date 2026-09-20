@@ -219,6 +219,105 @@ def update_bl_if_needed() -> bool:
     return False
 
 
+def extract_auth_from_html(html: str) -> tuple:
+    """Extract (xsrf_token, gemini_bl) from Gemini app page HTML."""
+    xsrf = None
+    m = re.search(r'"SNlM0e"\s*:\s*"([^"]+)"', html)
+    if m:
+        raw = m.group(1)
+        try:
+            xsrf = raw.encode().decode("unicode_escape")
+        except Exception:
+            xsrf = raw
+        xsrf = xsrf.replace("\\u003d", "=").replace("\\u0026", "&")
+    bl = None
+    b = re.search(r"(boq_assistant-bard-web-server_\d+\.\d+_p\d+)", html)
+    if b:
+        bl = b.group(1)
+    return xsrf, bl
+
+
+def persist_auth_to_file(xsrf, bl) -> None:
+    """Write refreshed xsrf_token/gemini_bl back to the JSON cookie file."""
+    cookie_file = CONFIG.get("cookie_file")
+    if not cookie_file or not os.path.exists(cookie_file):
+        return
+    try:
+        with open(cookie_file, "r") as f:
+            content = f.read().strip()
+        if not content.startswith("{"):
+            return
+        data = json.loads(content)
+        if xsrf:
+            data["xsrf_token"] = xsrf
+        if bl:
+            data["gemini_bl"] = bl
+        with open(cookie_file, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+    except Exception as e:
+        log(f"Auth persist failed: {e}")
+
+
+def refresh_auth() -> bool:
+    """Refresh xsrf_token/gemini_bl from the authenticated Gemini page.
+
+    SNlM0e rotates every few minutes, so a statically exported token goes
+    stale and Gemini answers 400 with an xsrf error. Re-fetch it with the
+    cookie session. Returns True if a usable token was obtained.
+    """
+    cookie_str, sapisid = load_cookie()
+    if not cookie_str:
+        return False
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Cookie": cookie_str,
+        }
+        if sapisid:
+            headers["Authorization"] = make_sapisidhash(sapisid)
+        url = f"https://gemini.google.com{account_prefix()}/app"
+        ctx = ssl.create_default_context()
+        proxy = CONFIG.get("proxy")
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx)
+            )
+            resp = opener.open(req, timeout=30)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+        html = resp.read().decode("utf-8", errors="replace")
+        xsrf, bl = extract_auth_from_html(html)
+        if xsrf and xsrf != CONFIG.get("xsrf_token"):
+            CONFIG["xsrf_token"] = xsrf
+        if bl and bl != CONFIG.get("gemini_bl"):
+            CONFIG["gemini_bl"] = bl
+        if xsrf:
+            persist_auth_to_file(xsrf, bl)
+            log("Auth refreshed from Gemini page")
+            return True
+        log("Auth refresh found no token")
+        return False
+    except Exception as e:
+        log(f"Auth refresh failed: {e}")
+        return False
+
+
+def is_xsrf_error(e) -> bool:
+    """Check whether an upstream error is a 400 xsrf rejection."""
+    if isinstance(e, urllib.error.HTTPError) and e.code == 400:
+        try:
+            return "xsrf" in e.read().decode("utf-8", errors="replace")
+        except Exception:
+            return True
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "status_code", None) == 400:
+        return True
+    return False
+
+
 def upload_images(images: list) -> list:
     """Upload parsed OpenAI image parts and return Gemini file references."""
     if not images:
@@ -247,6 +346,9 @@ def upload_images(images: list) -> list:
 
 def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None) -> str:
     """Send prompt to Gemini StreamGenerate with retry."""
+    refreshed = False
+    if load_cookie()[0] and not CONFIG.get("xsrf_token"):
+        refreshed = refresh_auth()
     inner = [None] * 80
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
@@ -324,6 +426,36 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
                 log("Retrying with updated BL...")
                 last_err = e
                 continue
+            if not refreshed and is_xsrf_error(e) and refresh_auth():
+                refreshed = True
+                log("Retrying with refreshed auth...")
+                last_err = e
+                params = {"f.req": json.dumps(outer)}
+                if CONFIG.get("xsrf_token"):
+                    params["at"] = CONFIG["xsrf_token"]
+                body = urllib.parse.urlencode(params).encode()
+                reqid = int(time.time()) % 1000000
+                prefix = account_prefix()
+                url = (
+                    f"https://gemini.google.com{prefix}/_/BardChatUi/data/"
+                    "assistant.lamda.BardFrontendService/StreamGenerate"
+                    f"?bl={CONFIG['gemini_bl']}&hl=en&_reqid={reqid}&rt=c"
+                )
+                headers = {
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://gemini.google.com",
+                    "Referer": f"https://gemini.google.com{prefix}/app",
+                    "X-Same-Domain": "1",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                }
+                if prefix:
+                    headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+                cookie_str, sapisid = load_cookie()
+                if cookie_str:
+                    headers["Cookie"] = cookie_str
+                if sapisid:
+                    headers["Authorization"] = make_sapisidhash(sapisid)
+                continue
             last_err = e
             if attempt < CONFIG["retry_attempts"] - 1:
                 log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
@@ -338,6 +470,8 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
 
 def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, file_refs: list = None):
     """Send prompt and yield incremental text deltas using httpx streaming."""
+    if load_cookie()[0] and not CONFIG.get("xsrf_token"):
+        refresh_auth()
     inner = [None] * 80
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
@@ -443,6 +577,13 @@ def gemini_stream_generate_iter(prompt: str, model_id: int, think_mode: int, fil
                     if text:
                         yield text
                     return
+            if is_xsrf_error(e) and refresh_auth():
+                log("Auth refreshed, falling back to non-streaming for this request")
+                raw = gemini_stream_generate(prompt, model_id, think_mode, file_refs)
+                text = extract_response_text(raw)
+                if text:
+                    yield text
+                return
             raise
 
 
