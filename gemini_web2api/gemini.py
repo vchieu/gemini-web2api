@@ -150,6 +150,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
+    log(f"Upstream model family={model_id} variant={(extra_fields or {}).get(80)}")
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
