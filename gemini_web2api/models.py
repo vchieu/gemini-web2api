@@ -22,7 +22,7 @@ MODELS = {
         "desc": "Latest workhorse model, best reasoning & coding (Sep 2026)",
     },
     "gemini-3.8-flash-thinking": {
-        "mode": 1, "think": 0, "variant": 2, "ticket": "flash",
+        "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
         "desc": "Deep thinking mode on the latest Flash backend",
     },
     "gemini-3.7-flash": {
@@ -46,7 +46,7 @@ MODELS = {
         "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
-        "mode": 1, "think": 0, "variant": 2, "ticket": "flash",
+        "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
         "desc": "Deep thinking mode, longest output (~20k chars)",
     },
     "gemini-3.1-pro": {

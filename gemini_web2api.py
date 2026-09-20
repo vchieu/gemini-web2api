@@ -69,6 +69,7 @@ DEFAULT_CONFIG = {
         "flash": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,"561701FD-A2E8-4275-98B0-636DFE1554F9",null,null,[[6,908199999],[1789884088,624000000]]]',
         "pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[6,620699999],[1789897904,515000000]]]',
         "lite": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[null,95100000],[1789898801,131000000]]]',
+        "flash-thinking": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[null,332100000],[1789899397,281000000]]]',
     },
 }
 
@@ -91,7 +92,7 @@ MODELS = {
         "desc": "Latest workhorse model, best reasoning & coding (Sep 2026)",
     },
     "gemini-3.8-flash-thinking": {
-        "mode": 1, "think": 0, "variant": 2, "ticket": "flash",
+        "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
         "desc": "Deep thinking mode on the latest Flash backend",
     },
     "gemini-3.7-flash": {
@@ -115,7 +116,7 @@ MODELS = {
         "desc": "Cost-efficient high-capacity model (Gemini 3.1 Flash-Lite)",
     },
     "gemini-3.5-flash-thinking": {
-        "mode": 1, "think": 0, "variant": 2, "ticket": "flash",
+        "mode": 1, "think": 1, "variant": 2, "ticket": "flash-thinking",
         "desc": "Deep thinking mode, longest output (~20k chars)",
     },
     "gemini-3.1-pro": {
