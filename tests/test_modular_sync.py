@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import _build_payload
+from gemini_web2api.models import resolve_model
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
 
@@ -66,6 +67,29 @@ class PayloadPersistenceTests(unittest.TestCase):
 
         self.assertEqual(inner[0][0], "describe")
         self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
+
+
+class ModelRoutingTests(unittest.TestCase):
+    # Model selection = inner[79] (family) + inner[80] (variant), decoded
+    # from live browser StreamGenerate captures (Sep 2026). Regression test:
+    # omitting inner[80] made the server fall back to 3.1 Pro for every model.
+    def test_browser_captured_family_variant_pairs(self):
+        cases = {
+            "gemini-3.5-flash": (1, 1),
+            "gemini-3.6-flash": (1, 1),
+            "gemini-3.1-pro": (3, 1),
+            "gemini-3.5-flash-thinking": (1, 2),
+            "gemini-3.1-pro-enhanced": (3, 3),
+            "gemini-3.5-flash-lite": (6, 1),
+            "gemini-3.5-flash-thinking-lite": (5, 2),
+        }
+        for name, (family, variant) in cases.items():
+            with self.subTest(model=name):
+                _, mode, _, err, extra = resolve_model(name)
+                self.assertIsNone(err)
+                inner = _decode_payload(_build_payload("hi", mode, 4, extra_fields=extra))
+                self.assertEqual(inner[79], family)
+                self.assertEqual(inner[80], variant)
 
 
 class MessageParsingTests(unittest.TestCase):
