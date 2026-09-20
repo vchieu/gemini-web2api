@@ -127,6 +127,15 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            # Cookie file may also carry auth_user / xsrf_token / gemini_bl.
+            # Sync them into CONFIG, otherwise StreamGenerate goes out
+            # without the `at` param and Gemini answers 400.
+            if data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data["xsrf_token"]
+            if "auth_user" in data and data["auth_user"] not in (None, ""):
+                CONFIG["auth_user"] = data["auth_user"]
+            if data.get("gemini_bl"):
+                CONFIG["gemini_bl"] = data["gemini_bl"]
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
