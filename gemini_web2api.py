@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
         "pro": '[1,null,null,null,"9d8ca3786ebdfbea",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[6,620699999],[1789897904,515000000]]]',
         "lite": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,1,"32C786FF-9AE2-49E5-A67C-0A35421F63A6",null,null,[[null,95100000],[1789898801,131000000]]]',
         "flash-thinking": '[1,null,null,null,"fbb127bbb056c959",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[null,332100000],[1789899397,281000000]]]',
+        "lite-thinking": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,6,2,"279B5F21-C196-4B10-8EC7-31625C0CABE6",null,null,[[2,950300000],[1789899759,320000000]]]',
     },
 }
 
@@ -128,7 +129,7 @@ MODELS = {
         "desc": "Auto model selection",
     },
     "gemini-3.5-flash-thinking-lite": {
-        "mode": 5, "think": 0, "variant": 2, "ticket": None,
+        "mode": 5, "think": 1, "variant": 2, "ticket": "lite-thinking",
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
@@ -445,7 +446,7 @@ def gemini_stream_generate(prompt: str, model_id: int, think_mode: int, file_ref
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            check_routing(raw, model_id, extra_fields)
+            check_routing(raw, model_id, extra_fields, ticket)
             return raw
         except urllib.error.HTTPError as e:
             if e.code == 405 and update_bl_if_needed():
@@ -650,15 +651,26 @@ def upstream_echo(raw: str):
     return None
 
 
-def check_routing(raw: str, model_id: int, extra_fields: dict = None) -> None:
-    """Log a warning when upstream served a different model than requested."""
+def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: str = None) -> None:
+    """Log a warning when upstream served a different model than requested.
+
+    When a ticket is used it wins over the body fields, so expectations are
+    read from the ticket's embedded (family, variant).
+    """
     echo = upstream_echo(raw)
     if not echo:
         return
     _, fam, var = echo
-    want_var = (extra_fields or {}).get(80)
-    if fam != model_id or (want_var is not None and var != want_var):
-        log(f"Routing mismatch: requested family={model_id} variant={want_var} "
+    if ticket:
+        try:
+            t = json.loads(ticket)
+            want_fam, want_var = t[14], t[15]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            want_fam, want_var = model_id, (extra_fields or {}).get(80)
+    else:
+        want_fam, want_var = model_id, (extra_fields or {}).get(80)
+    if fam != want_fam or (want_var is not None and var != want_var):
+        log(f"Routing mismatch: requested family={want_fam} variant={want_var} "
             f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
             f"the model ticket in CONFIG['model_tickets'] may be expired — "
             f"refresh it from a fresh browser capture")

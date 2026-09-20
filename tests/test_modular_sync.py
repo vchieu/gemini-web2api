@@ -105,6 +105,8 @@ class ModelTicketTests(unittest.TestCase):
             ticket_for("gemini-3.5-flash-lite"), CONFIG["model_tickets"]["lite"])
         self.assertEqual(
             ticket_for("gemini-3.5-flash-thinking"), CONFIG["model_tickets"]["flash-thinking"])
+        self.assertEqual(
+            ticket_for("gemini-3.5-flash-thinking-lite"), CONFIG["model_tickets"]["lite-thinking"])
         self.assertIsNone(ticket_for("gemini-auto"))
 
     def test_ticket_embeds_family_variant(self):
@@ -113,10 +115,12 @@ class ModelTicketTests(unittest.TestCase):
         pro = _json.loads(CONFIG["model_tickets"]["pro"])
         lite = _json.loads(CONFIG["model_tickets"]["lite"])
         think = _json.loads(CONFIG["model_tickets"]["flash-thinking"])
+        litethink = _json.loads(CONFIG["model_tickets"]["lite-thinking"])
         self.assertEqual((flash[14], flash[15]), (1, 1))
         self.assertEqual((pro[14], pro[15]), (3, 1))
         self.assertEqual((lite[14], lite[15]), (6, 1))
         self.assertEqual((think[14], think[15]), (1, 2))
+        self.assertEqual((litethink[14], litethink[15]), (6, 2))
 
     def test_ticket_header_sent(self):
         headers = _build_headers(ticket="TICKET-VALUE")

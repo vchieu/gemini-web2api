@@ -336,15 +336,26 @@ def upstream_echo(raw: str):
     return None
 
 
-def check_routing(raw: str, model_id: int, extra_fields: dict = None) -> None:
-    """Log a warning when upstream served a different model than requested."""
+def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: str = None) -> None:
+    """Log a warning when upstream served a different model than requested.
+
+    When a ticket is used it wins over the body fields, so expectations are
+    read from the ticket's embedded (family, variant).
+    """
     echo = upstream_echo(raw)
     if not echo:
         return
     _, fam, var = echo
-    want_var = (extra_fields or {}).get(80)
-    if fam != model_id or (want_var is not None and var != want_var):
-        log(f"Routing mismatch: requested family={model_id} variant={want_var} "
+    if ticket:
+        try:
+            t = json.loads(ticket)
+            want_fam, want_var = t[14], t[15]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            want_fam, want_var = model_id, (extra_fields or {}).get(80)
+    else:
+        want_fam, want_var = model_id, (extra_fields or {}).get(80)
+    if fam != want_fam or (want_var is not None and var != want_var):
+        log(f"Routing mismatch: requested family={want_fam} variant={want_var} "
             f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
             f"the model ticket in CONFIG['model_tickets'] may be expired — "
             f"refresh it from a fresh browser capture")
@@ -374,7 +385,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
-            check_routing(raw, model_id, extra_fields)
+            check_routing(raw, model_id, extra_fields, ticket)
             return extract_response_text(raw)
         except Exception as e:
             last_err = e

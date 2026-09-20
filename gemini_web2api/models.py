@@ -62,7 +62,7 @@ MODELS = {
         "desc": "Auto model selection",
     },
     "gemini-3.5-flash-thinking-lite": {
-        "mode": 5, "think": 0, "variant": 2, "ticket": None,
+        "mode": 5, "think": 1, "variant": 2, "ticket": "lite-thinking",
         "desc": "Dynamic thinking with adaptive depth",
     },
     "gemini-flash-lite": {
