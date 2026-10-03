@@ -159,6 +159,7 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+  "auto_update_bl": true,
   "auth_user": null,
   "xsrf_token": null,
   "strict_models": false,
@@ -175,7 +176,9 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
 
-> **安全提示**: 默认 `host` 为 `127.0.0.1`（仅本机）。如果绑定到 `0.0.0.0` 且 `api_keys` 为空，同网络内任何人都可以使用你的 Google 会话。对外暴露时务必设置 `api_keys`。
+将 `auto_update_bl` 设为 `false` 可锁定 `gemini_bl`：否则启动时的自动刷新会覆盖你手动配置的值.
+
+> **安全提示**: 默认 `host` 为 `127.0.0.1`（仅本机）。如果绑定到 `0.0.0.0` 且 `api_keys` 为空，同网络内任何人都可以使用你的 Google 会话。对外暴露时务必设置 `api_keys`。为防止忘记配置，服务端现在遇到非回环 `--host` 且无密钥时会直接拒绝启动，除非传入 `--allow-insecure`。
 
 未知模型名会静默回退到 `default_model`（响应会回显客户端发送的模型名），以兼容严格的客户端；将 `strict_models` 设为 `true` 可改为返回 `404 model_not_found`。
 
@@ -184,8 +187,13 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 ```bash
 cp config.example.json config.json
 docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker run -d --name gemini-web2api -p 127.0.0.1:8081:8081 -v ./config.json:/app/config.json gemini-web2api
 ```
+
+`docker-compose.local.yml` 同样只发布 `127.0.0.1:8081`：没有 `api_keys` 时，
+发布到所有网卡会把你的 Google 会话暴露给整个局域网。如需远程访问请在
+`config.json` 中设置 `api_keys`；非回环 `--host` 且无密钥时默认拒绝启动，
+除非传入 `--allow-insecure`。
 
 或使用 Docker Compose:
 
@@ -197,7 +205,7 @@ docker compose up -d
 如需挂载 Cookie 文件:
 
 ```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+docker run -d --name gemini-web2api -p 127.0.0.1:8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
 ```
 
 此时 `config.json` 中设置 `"cookie_file": "/app/cookie.txt"`.

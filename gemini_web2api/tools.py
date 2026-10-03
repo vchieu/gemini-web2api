@@ -25,7 +25,12 @@ def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
     if tool_choice == "required":
         return "\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only."
     if isinstance(tool_choice, dict):
-        fn_name = tool_choice.get("function", {}).get("name", "")
+        # Chat Completions uses {"type":"function","function":{"name":"x"}};
+        # the Responses API drops the nesting and uses {"type":"function","name":"x"}.
+        fn = tool_choice.get("function")
+        fn_name = fn.get("name", "") if isinstance(fn, dict) else ""
+        if not fn_name:
+            fn_name = tool_choice.get("name") or ""
         if fn_name:
             return f'\n\nIMPORTANT: You MUST call the tool "{fn_name}". Do not call other tools.'
     return ""
@@ -109,6 +114,75 @@ def tool_names(tools) -> set:
         if isinstance(fn, dict) and fn.get("name"):
             names.add(fn["name"])
     return names
+
+
+# Sits between the dropped leading block and the kept tail so the model can see
+# that history was removed rather than silently wondering what it missed.
+_TRUNCATION_MARKER = "[...truncated...]"
+
+
+def _join_prompt_parts(parts: list, max_bytes: int) -> str:
+    """Join message parts into a prompt, dropping the *middle* when too long.
+
+    Slicing the assembled prompt from the front (the obvious way) keeps the
+    system instruction and the oldest history while throwing away the newest
+    user message -- i.e. exactly the question that needs answering. Instead we
+    keep the leading block (tool definitions / system instruction) and as many
+    of the newest messages as fit, and mark the gap.
+    """
+    items = [p for p in parts if p]
+
+    def nbytes(text: str) -> int:
+        return len(text.encode("utf-8"))
+
+    full = "\n\n".join(items)
+    if nbytes(full) <= max_bytes:
+        return full
+
+    from .gemini import log
+    log(f"Prompt truncated to {max_bytes} bytes")
+
+    # Two separators around the marker.
+    budget = max_bytes - nbytes(_TRUNCATION_MARKER) - 4
+    if budget <= 0:
+        return full.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+    # 1. Keep the newest messages first: they carry the pending question and
+    #    the latest tool results.
+    tail = []
+    used = 0
+    for part in reversed(items):
+        if not tail:
+            if nbytes(part) > budget:
+                part = part.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+                tail.append(part)
+                used = budget
+                break
+            tail.append(part)
+            used = nbytes(part)
+            continue
+        cost = nbytes(part) + 2
+        if used + cost > budget:
+            break
+        tail.append(part)
+        used += cost
+    tail.reverse()
+
+    # 2. Spend whatever is left on the leading block (tool defs, system, ...).
+    #    This only ever adds a prefix, so history in the middle stays dropped.
+    remaining = budget - used
+    head = []
+    head_used = 0
+    for part in items[: len(items) - len(tail)]:
+        cost = nbytes(part) + (2 if head else 0)
+        if head_used + cost > remaining:
+            break
+        head.append(part)
+        head_used += cost
+
+    if head:
+        return "\n\n".join(head + [_TRUNCATION_MARKER] + tail)
+    return "\n\n".join([_TRUNCATION_MARKER] + tail)
 
 
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
@@ -195,7 +269,8 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function") or {}
                     name = json.dumps(fn.get("name", ""), ensure_ascii=False)
-                    args = fn.get("arguments", "{}")
+                    # An absent/empty "arguments" must still serialise as valid JSON.
+                    args = fn.get("arguments") or "{}"
                     if not isinstance(args, str):
                         args = json.dumps(args, ensure_ascii=False)
                     tc_strs.append(
@@ -213,12 +288,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         else:
             parts.append(_stringify_content(content))
 
-    prompt = "\n\n".join(p for p in parts if p)
-    if len(prompt.encode("utf-8")) > PROMPT_MAX_BYTES:
-        from .gemini import log
-        log(f"Prompt truncated to {PROMPT_MAX_BYTES} bytes")
-        prompt = prompt.encode("utf-8")[:PROMPT_MAX_BYTES].decode("utf-8", errors="ignore")
-    return prompt, images
+    return _join_prompt_parts(parts, PROMPT_MAX_BYTES), images
 
 
 def parse_tool_calls(text: str, allowed_names=None) -> tuple:

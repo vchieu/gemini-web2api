@@ -206,8 +206,10 @@ var DEFAULT_CONFIG = {
   // 空数组 [] 表示不验证，所有请求都可以访问（不推荐用于生产）
   // 设置后，客户端必须在请求头中提供有效的密钥
   // 支持 Bearer Token、x-api-key、x-goog-api-key、URL 参数 ?key=
-  // 示例: ["sk-gemini", "sk-my-custom-key"]
-  apiKeys: ['sk-gemini'],
+  // 示例: ["sk-my-random-secret", "sk-another"]
+  // 留空 [] 表示不校验密钥 —— 请务必配合 API_KEYS 环境变量使用，
+  // 否则任何知道你的 Worker 地址的人都能用你的 Google 会话。
+  apiKeys: [],
 
   // ---- Cookie 认证 ----
   // Gemini 对匿名请求有严格的速率限制（容易触发 429 Too Many Requests）
@@ -1424,9 +1426,14 @@ function toolChoiceInstruction(toolChoice, toolDefs) {
   if (toolChoice === 'required') {
     return '\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only.';
   }
-  if (typeof toolChoice === 'object' && toolChoice.function && toolChoice.function.name) {
-    return '\n\nIMPORTANT: You MUST call the tool "' + toolChoice.function.name +
-      '". Do not call other tools.';
+  if (typeof toolChoice === 'object' && toolChoice !== null) {
+    // Chat Completions nests it: {type:"function", function:{name:"x"}}
+    // Responses flattens it:     {type:"function", name:"x"}
+    var fnName = (toolChoice.function && toolChoice.function.name) || toolChoice.name;
+    if (fnName) {
+      return '\n\nIMPORTANT: You MUST call the tool "' + fnName +
+        '". Do not call other tools.';
+    }
   }
   return '';
 }
@@ -1575,8 +1582,10 @@ function messagesToPrompt(messages, tools, toolChoice) {
  * @param {string} text - 可能包含工具调用的响应文本
  * @returns {Object} { cleanText: 清理后的纯文本, toolCalls: 工具调用数组 }
  */
-function parseToolCalls(text) {
+function parseToolCalls(text, allowedNames) {
   var toolCalls = [];
+  var cleaned = '';
+  var lastEnd = 0;
 
   // 正则匹配 tool_call 代码块
   // /```tool_call\s*\n(.*?)\n```/gs
@@ -1585,34 +1594,60 @@ function parseToolCalls(text) {
   var pattern = /```tool_call\s*\n(.*?)\n```/gs;
   var match;
 
-  // 循环提取所有工具调用
+  // 循环提取所有工具调用；未声明或解析失败的代码块保留在文本中，
+  // 避免内容丢失
   while ((match = pattern.exec(text)) !== null) {
+    var accepted = null;
     try {
       // match[1] 是第一个捕获组，即 tool_call 代码块中的 JSON 内容
       var data = JSON.parse(match[1].trim());
 
-      // 构建 OpenAI 格式的工具调用对象
-      toolCalls.push({
-        id: 'call_' + generateShortId(8),       // 生成唯一的调用 ID
-        type: 'function',
-        function: {
-          name: data.name,                       // 函数名
-          arguments: JSON.stringify(data.arguments || {}),  // 参数（必须是 JSON 字符串）
-        },
-      });
+      // 只接受已声明的函数名；其它块保留原文
+      if (data && data.name &&
+          (!allowedNames || allowedNames.indexOf(data.name) !== -1)) {
+        var args = (data.arguments !== undefined) ? data.arguments
+                 : ((data.args !== undefined) ? data.args : {});
+        accepted = {
+          id: 'call_' + generateShortId(8),       // 生成唯一的调用 ID
+          type: 'function',
+          function: {
+            name: data.name,                       // 函数名
+            // arguments 必须是 JSON 字符串；已是字符串则直接使用
+            arguments: (typeof args === 'string') ? args : JSON.stringify(args || {}),
+          },
+        };
+      }
     } catch (e) {
-      // JSON 解析失败，跳过格式有误的代码块
-      // 不中断整个解析过程
+      // JSON 解析失败：保留原块，不要把内容一起删掉
     }
+    if (!accepted) continue;
+    cleaned += text.slice(lastEnd, match.index);
+    lastEnd = match.index + match[0].length;
+    toolCalls.push(accepted);
   }
+  cleaned += text.slice(lastEnd);
 
-  // 从文本中移除所有 tool_call 代码块
-  var cleanText = text.replace(pattern, '').trim();
+  // 只拼接已接受调用之间的原文；被拒绝的块保留在文本中
+  var cleanText = cleaned.trim();
 
   return {
     cleanText: cleanText,    // 清理后的纯文本
     toolCalls: toolCalls     // 工具调用数组
   };
+}
+
+/**
+ * 收集 tools 列表中声明的函数名，供 parseToolCalls 过滤使用
+ */
+function declaredFunctionNames(tools) {
+  var names = [];
+  for (var i = 0; tools && i < tools.length; i++) {
+    var tool = tools[i];
+    if (!tool || typeof tool !== 'object') continue;
+    var fn = (tool.type === 'function') ? (tool.function || tool) : tool;
+    if (fn && typeof fn === 'object' && fn.name) names.push(fn.name);
+  }
+  return names.length ? names : null;
 }
 
 /**
@@ -1839,6 +1874,15 @@ function checkApiKey(request, config) {
  */
 function sendJSON(data, status) {
   if (status === undefined) status = 200;
+  // OpenAI clients read error.type / error.code; callers here only supply a
+  // message, so fill the rest of the standard shape.
+  if (data && data.error && typeof data.error === 'object') {
+    if (!data.error.type) {
+      data.error.type = status >= 500 ? 'api_error' : 'invalid_request_error';
+    }
+    if (!('param' in data.error)) data.error.param = null;
+    if (!('code' in data.error)) data.error.code = null;
+  }
   // 将数据序列化为 JSON 字符串
   var body = JSON.stringify(data);
   // 构建并返回 Response 对象
@@ -1906,7 +1950,7 @@ function sendSSE(stream) {
  *   - thinkMode: 思考模式（0=深度思考, 4=自动）
  *   - error: 错误信息，null 表示正常
  */
-function resolveModel(modelName) {
+function resolveModel(modelName, fallbackModel) {
   var thinkOverride = null;
   var actualModelName = modelName;
 
@@ -1923,7 +1967,13 @@ function resolveModel(modelName) {
   // 查找模型配置
   var cfg = MODELS[actualModelName];
   if (!cfg) {
-    return { error: '未知模型: ' + actualModelName };
+    // Unknown model: fall back the way the Python server does so hard-coded
+    // client model lists keep working. The requested name is echoed back, so
+    // the client still sees its own model in the response.
+    cfg = fallbackModel ? MODELS[fallbackModel] : null;
+    if (!cfg) {
+      return { error: '未知模型: ' + actualModelName };
+    }
   }
 
   // 返回解析结果
@@ -1969,7 +2019,7 @@ function resolveModel(modelName) {
  */
 async function handleChatCompletions(request, body, config) {
   // ---- 第一步：解析模型 ----
-  var resolved = resolveModel(body.model || config.defaultModel);
+  var resolved = resolveModel(body.model || config.defaultModel, config.defaultModel);
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -1997,18 +2047,34 @@ async function handleChatCompletions(request, body, config) {
   // 所以即使请求了 stream=true，如果有 tools 也强制使用非流式
   if (!stream || tools) {
     try {
-      // 调用 Gemini API 获取完整响应
-      var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
-
-      // 提取并清理响应文本
-      var text = extractResponseText(raw);
+      // tool_choice 为 required / 指定函数时：没有解析出调用就强制再试一次
+      var requiredTool = body.tool_choice === 'required' ||
+        (body.tool_choice && typeof body.tool_choice === 'object' &&
+          !!((body.tool_choice.function && body.tool_choice.function.name) ||
+             body.tool_choice.name));
+      var allowedNames = declaredFunctionNames(tools);
+      var attempts = (!stream && requiredTool) ? 2 : 1;
+      var text = '';
       var toolCalls = null;
 
-      // 如果启用了工具，解析工具调用
-      if (tools && text) {
-        var parsed = parseToolCalls(text);
-        text = parsed.cleanText;
-        toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
+      for (var attempt = 0; attempt < attempts; attempt++) {
+        // 调用 Gemini API 获取完整响应
+        var callPrompt = (attempt > 0)
+          ? prompt + '\n\nIMPORTANT: Respond with a tool_call block ONLY.'
+          : prompt;
+        var raw = await geminiStreamGenerate(callPrompt, modelId, thinkMode, config);
+
+        // 提取并清理响应文本
+        text = extractResponseText(raw);
+        toolCalls = null;
+
+        // 如果启用了工具，解析工具调用
+        if (tools && text && body.tool_choice !== 'none') {
+          var parsed = parseToolCalls(text, allowedNames);
+          text = parsed.cleanText;
+          toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
+        }
+        if (toolCalls || !requiredTool) break;
       }
 
       // 构建响应消息
@@ -2350,7 +2416,7 @@ async function handleChatCompletions(request, body, config) {
  */
 async function handleResponses(request, body, config) {
   // 解析模型
-  var resolved = resolveModel(body.model || config.defaultModel);
+  var resolved = resolveModel(body.model || config.defaultModel, config.defaultModel);
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -2456,9 +2522,9 @@ async function handleResponses(request, body, config) {
     var text = extractResponseText(raw);
     var toolCalls = null;
 
-    // 解析工具调用
-    if (tools && text) {
-      var parsed = parseToolCalls(text);
+    // 解析工具调用（只接受已声明的函数名）
+    if (tools && text && body.tool_choice !== 'none') {
+      var parsed = parseToolCalls(text, declaredFunctionNames(tools));
       text = parsed.cleanText;
       toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
     }
@@ -2611,7 +2677,7 @@ async function handleGoogleAPI(request, body, stream, config) {
     return sendJSON({ error: { message: 'model not specified in path' } }, 400);
   }
 
-  var resolved = resolveModel(modelName);
+  var resolved = resolveModel(modelName, config.defaultModel);
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }

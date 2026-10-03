@@ -72,6 +72,28 @@ def _apply_max_tokens(text: str, max_tokens) -> tuple:
     return text, False
 
 
+def _responses_text_format(text_field) -> dict:
+    """Map a Responses API ``text.format`` object to a Chat ``response_format``.
+
+    The field name differs (``text.format`` vs ``response_format``) and the
+    JSON schema sits one level further up:
+    ``{"type":"json_schema","schema":{...}}`` instead of
+    ``{"type":"json_schema","json_schema":{"schema":{...}}}``.
+    """
+    if not isinstance(text_field, dict):
+        return None
+    fmt = text_field.get("format")
+    if not isinstance(fmt, dict):
+        return None
+    if fmt.get("type") == "json_object":
+        return {"type": "json_object"}
+    if fmt.get("type") == "json_schema":
+        if isinstance(fmt.get("json_schema"), dict):
+            return {"type": "json_schema", "json_schema": fmt["json_schema"]}
+        return {"type": "json_schema", "json_schema": {"schema": fmt.get("schema", {})}}
+    return None
+
+
 def _map_upstream_error(e) -> tuple:
     """Map an upstream exception to (status, message, type, code)."""
     status = getattr(e, "status", None)
@@ -290,6 +312,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
         except (BrokenPipeError, ConnectionResetError):
             pass
+        except Exception as e:
+            # Without this an exception escapes and the socket is dropped with
+            # no response at all, leaving the client waiting on a dead socket.
+            log(f"GET error: {e}")
+            try:
+                self.send_api_error(500, str(e), ERR_API)
+            except Exception:
+                pass
 
     def _resolve_request_model(self, req):
         """Resolve the requested model. Returns a tuple or None (error sent)."""
@@ -381,8 +411,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         allowed_names = tool_names(tools) or None
 
-        # Pure streaming (no tools): stream tokens straight through.
-        if stream and (not tools or tool_choice == "none"):
+        # Pure streaming (no tools, no post-processing): stream tokens straight through.
+        # When response_format is set the text still has to be defenced and
+        # normalised, so it has to go through the buffered path below.
+        if stream and not rf_instruction and (not tools or tool_choice == "none"):
             self._stream_chat(cid, echo_model, prompt, model_id, think_mode, file_refs,
                               extra, stop_strings, max_tokens, include_usage)
             return
@@ -489,7 +521,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         self._sse_chunk(cid, model, {"content": piece}, None)
                     buf = ""
                     break
-                if max_tokens and (len(full_text) + len(buf)) >= max_tokens * 4:
+                # `>` rather than `>=`: a reply that lands exactly on the budget
+                # is complete, and only a truncated reply may claim `length`.
+                if max_tokens and (len(full_text) + len(buf)) > max_tokens * 4:
                     allowed = max(0, max_tokens * 4 - len(full_text))
                     piece = buf[:allowed]
                     if piece:
@@ -584,9 +618,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                                  "content": output})
             elif itype == "function_call":
                 call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                # Codex omits `arguments` on a call it wants replayed from context;
+                # an empty string would serialise into the broken `"arguments": }`.
                 call = {"id": call_id, "type": "function",
                         "function": {"name": item.get("name", ""),
-                                     "arguments": item.get("arguments", "")}}
+                                     "arguments": item.get("arguments") or "{}"}}
                 if messages and messages[-1].get("role") == "assistant" \
                         and messages[-1].get("tool_calls"):
                     messages[-1]["tool_calls"].append(call)
@@ -611,7 +647,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     message["tool_calls"] = [
                         {"id": tc.get("call_id", f"call_{i}"), "type": "function",
                          "function": {"name": tc.get("name", ""),
-                                      "arguments": tc.get("arguments", "{}")}}
+                                      "arguments": tc.get("arguments") or "{}"}}
                         for i, tc in enumerate(tc_list)
                     ]
                 messages.append(message)
@@ -637,12 +673,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
 
-        rf_instruction = build_response_format_instruction(req.get("response_format"))
+        rf = req.get("response_format")
+        if rf is None:
+            rf = _responses_text_format(req.get("text"))
+        rf_instruction = build_response_format_instruction(rf)
         if rf_instruction:
             prompt = prompt + rf_instruction
         if not prompt.strip():
             self.send_api_error(400, "empty input", ERR_INVALID_REQUEST)
             return
+
+        stop_strings = _normalize_stop(req.get("stop"))
+        max_tokens = req.get("max_output_tokens")
 
         try:
             file_refs = _upload_images(images)
@@ -657,9 +699,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text, tool_calls = parse_tool_calls(text, allowed_names)
         if rf_instruction and text:
             text = strip_code_fence(text)
+        text = _apply_stop(text, stop_strings)
+        text, truncated = _apply_max_tokens(text, max_tokens)
         if not text and not tool_calls:
             self.send_api_error(502, "empty response from upstream", ERR_API)
             return
+
+        # Responses reports a cut-off answer as incomplete rather than completed.
+        final_status = "incomplete" if truncated else "completed"
+        status_fields = {"incomplete_details": {"reason": "max_output_tokens"}} if truncated else {}
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -727,16 +775,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                              text=content_part["text"])
                         emit("response.content_part.done", **event_fields, part=content_part)
                     emit("response.output_item.done", output_index=output_index, item=item)
-            emit("response.completed", response={
-                **base_response, "status": "completed", "output": output, "usage": usage})
+            final_event = "response.incomplete" if truncated else "response.completed"
+            emit(final_event, response={**base_response, "status": final_status,
+                                        "output": output, "usage": usage, **status_fields})
             self.wfile.flush()
         else:
             self.send_json({
                 "id": rid, "object": "response", "created_at": int(time.time()),
-                "status": "completed", "model": echo_model, "output": output,
+                "status": final_status, "model": echo_model, "output": output,
                 "usage": {"input_tokens": len(prompt) // 4,
                           "output_tokens": len(text or "") // 4,
                           "total_tokens": (len(prompt) + len(text or "")) // 4},
+                **status_fields,
             })
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
@@ -808,6 +858,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+                # The 200 is already sent, so the only way to tell the client
+                # is a Google-shaped error event on the same stream.
+                status, message, gstatus = _map_google_error(e)
+                try:
+                    err_obj = {"error": {"code": status, "message": message, "status": gstatus}}
+                    self.wfile.write(f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             finally:
                 close = getattr(gen, "close", None)
                 if callable(close):

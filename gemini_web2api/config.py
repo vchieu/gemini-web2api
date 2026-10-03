@@ -12,6 +12,9 @@ DEFAULT_CONFIG = {
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
     "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+    # Refresh gemini_bl from gemini.google.com on startup. Set to false to pin
+    # the value above -- otherwise startup overwrites whatever you configured.
+    "auto_update_bl": True,
     "auth_user": None,
     "xsrf_token": None,
     "default_model": "gemini-3.6-flash",

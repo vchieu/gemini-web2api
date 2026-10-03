@@ -21,6 +21,18 @@ Gemini Web2API 是一个部署在 Cloudflare Workers 上的无服务器代理服
 - 在 WorkBuddy 等工具中作为 Gemini 模型的后端
 - 个人学习、研究和小型项目的 AI 能力接入
 
+### ⚠️ 与 Python 版的差异（best effort）
+
+Worker 追求单文件、零构建地跑在边缘节点，因此只是 Python 版的尽力
+（best effort）移植，不保证功能对等：
+
+- 不支持图片上传（Python 版走网页端上传接口，Worker 没有实现）。
+- Responses `/v1/responses` 只有非流式路径经过完整测试；流式及
+  `response_format` 等新参数以 Python 版为准。
+- 速率限制基于单个 isolate 的内存 `Map`，跨实例不共享，只能防单点突发。
+- `text.format`（Responses 结构化输出）、`max_output_tokens` 等以 Python 版
+  为准；如需完整行为请使用仓库根目录的 Python 服务。
+
 ---
 
 ## 🚀 快速部署

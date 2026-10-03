@@ -169,6 +169,7 @@ Create `config.json` in the same directory:
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
+  "auto_update_bl": true,
   "auth_user": null,
   "xsrf_token": null,
   "strict_models": false,
@@ -185,9 +186,14 @@ persisting conversations to the account history.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 
+Set `auto_update_bl` to `false` to pin `gemini_bl`: otherwise the startup
+refresh overwrites whatever you configured.
+
 > **Security**: the default `host` is `127.0.0.1` (loopback only). If you bind to
 > `0.0.0.0` **and** leave `api_keys` empty, anyone on the same network can use
-> your Google session. Always set `api_keys` when exposing the server.
+> your Google session. Always set `api_keys` when exposing the server. Since
+> this is easy to forget, the server now refuses a non-loopback `--host` with
+> no keys unless you pass `--allow-insecure`.
 
 Unknown model names silently fall back to `default_model` (and the response
 echoes the name the client sent), which keeps strict clients working. Set
@@ -198,8 +204,14 @@ echoes the name the client sent), which keeps strict clients working. Set
 ```bash
 cp config.example.json config.json
 docker build -t gemini-web2api .
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json gemini-web2api
+docker run -d --name gemini-web2api -p 127.0.0.1:8081:8081 -v ./config.json:/app/config.json gemini-web2api
 ```
+
+`docker-compose.local.yml` publishes `127.0.0.1:8081` for the same reason:
+without `api_keys`, publishing on every interface would expose your Google
+session to the whole LAN. Set `api_keys` in `config.json` and bind freely if
+you need remote access; a non-loopback `--host` with no keys refuses to start
+unless you pass `--allow-insecure`.
 
 Or use Docker Compose:
 
@@ -211,7 +223,7 @@ docker compose up -d
 To mount a cookie file:
 
 ```bash
-docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
+docker run -d --name gemini-web2api -p 127.0.0.1:8081:8081 -v ./config.json:/app/config.json -v ./cookie.txt:/app/cookie.txt gemini-web2api
 ```
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.

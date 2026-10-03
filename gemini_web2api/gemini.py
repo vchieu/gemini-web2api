@@ -9,6 +9,7 @@ import urllib.error
 import ssl
 import os
 import hashlib
+import threading
 
 try:
     import httpx
@@ -64,14 +65,36 @@ def fetch_latest_bl():
     return None
 
 
+# Refreshing the build label costs a network round-trip. Without coordination,
+# every request that hits a 405 would fetch the same page simultaneously.
+_bl_lock = threading.Lock()
+_bl_last_attempt = 0.0
+_BL_RETRY_INTERVAL = 60.0
+
+
 def update_bl_if_needed() -> bool:
-    """Fetch and update gemini_bl when a newer build label is available."""
-    new_bl = fetch_latest_bl()
-    if new_bl and new_bl != CONFIG["gemini_bl"]:
-        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
-        CONFIG["gemini_bl"] = new_bl
-        return True
-    return False
+    """Fetch and update gemini_bl when a newer build label is available.
+
+    Never blocks: if another thread is already fetching, or we fetched within
+    the last ``_BL_RETRY_INTERVAL`` seconds, this returns False immediately and
+    the caller reports its original error instead of queueing behind a fetch.
+    """
+    global _bl_last_attempt
+    if not _bl_lock.acquire(blocking=False):
+        return False
+    try:
+        if time.time() - _bl_last_attempt < _BL_RETRY_INTERVAL:
+            return False
+        # Stamp before fetching so a failing fetch cools down too.
+        _bl_last_attempt = time.time()
+        new_bl = fetch_latest_bl()
+        if new_bl and new_bl != CONFIG["gemini_bl"]:
+            log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+            CONFIG["gemini_bl"] = new_bl
+            return True
+        return False
+    finally:
+        _bl_lock.release()
 
 
 def _get_ssl_ctx():
@@ -211,6 +234,37 @@ def clean_text(text: str, strip: bool = True) -> str:
     return text.strip() if strip else text
 
 
+_SCAFFOLD_FENCE = re.compile(r"```\w*\?code_")
+_SCAFFOLD_LANGS = ("python", "javascript", "text")
+
+
+def _holds_scaffold(buf: str) -> bool:
+    """True while ``buf`` ends inside an open *upstream* scaffolding fence.
+
+    Upstream interleaves helper blocks such as
+    ```` ```python?code_reference&code_event_index=0 ... ``` ```` that
+    ``clean_text`` strips as a unit, so those must stay buffered until they
+    close. Ordinary code fences in the answer must not be buffered -- counting
+    backticks instead would hold an entire legitimate code block back until its
+    closing fence arrived, delivering it as one late lump.
+    """
+    if buf.count("```") % 2 == 0:
+        return False
+    open_at = buf.rfind("```")
+    rest = buf[open_at + 3:]
+    head, terminated, _ = rest.partition("\n")
+    if _SCAFFOLD_FENCE.match(buf[open_at:]):
+        return True                      # ```python?code_... arrived complete
+    if terminated:
+        return False                     # tag finished without ?code_ → normal fence
+    if "?" in head:
+        return True                      # tag still growing past '?'
+    # Language tag not terminated yet: hold only while it can still grow into
+    # one of the scaffolding tags (released as soon as a newline proves the
+    # fence is an ordinary one).
+    return any(lang.startswith(head) for lang in _SCAFFOLD_LANGS)
+
+
 def _extract_texts_from_line(line: str) -> list:
     """Parse a single wrb.fr line and return list of text strings found."""
     if '"wrb.fr"' not in line or len(line) < 200:
@@ -291,9 +345,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
     """Streaming generation via httpx with BL-aware retry.
 
-    Text is buffered while a Markdown code fence is open so that upstream
-    scaffolding blocks (````python?code_...````) are always stripped whole, even
-    when they straddle two network chunks.
+    Text is buffered only while an *upstream scaffolding* fence is open so that
+    blocks (````python?code_...````) are always stripped whole, even when they
+    straddle two network chunks. Ordinary code fences stream through
+    immediately.
     """
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
@@ -326,15 +381,32 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             )
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
-                        for t in _extract_texts_from_line(line):
+                        texts = _extract_texts_from_line(line)
+                        for index, t in enumerate(texts):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
-                            if not t.startswith(emitted_raw_text):
-                                raise RuntimeError("Gemini stream content changed during retry")
-                            clean_buf += t[len(emitted_raw_text):]
-                            emitted_raw_text = t
-                            if clean_buf.count("```") % 2 == 1:
-                                # Inside an open code fence: hold back until it closes.
+                            if t.startswith(emitted_raw_text):
+                                clean_buf += t[len(emitted_raw_text):]
+                                emitted_raw_text = t
+                            elif index:
+                                # Later text in the *same* line is a separate
+                                # block (thinking summary + answer), not a
+                                # cumulative echo of the earlier one: emit it
+                                # whole instead of dropping it.
+                                clean_buf += t
+                                emitted_raw_text = t
+                            else:
+                                # First text of the line disagrees with everything
+                                # emitted so far, i.e. upstream restarted. Keep the
+                                # stream alive rather than failing the request; the
+                                # sample lets a real payload be inspected later.
+                                log(f"Stream segment without prefix relation, "
+                                    f"skipping: {t[:120]!r}")
+                                continue
+                            if _holds_scaffold(clean_buf):
+                                # Inside an open upstream scaffolding block:
+                                # hold until it closes so clean_text can drop it
+                                # in one piece.
                                 continue
                             delta = clean_text(clean_buf, strip=False)
                             clean_buf = ""
