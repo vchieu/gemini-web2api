@@ -4,13 +4,14 @@ import os
 
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
-from .gemini import HAS_HTTPX
+from .gemini import HAS_HTTPX, fetch_latest_bl
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
 
 def main():
     parser = argparse.ArgumentParser(description="Gemini Web to OpenAI API")
+    parser.add_argument("--host", type=str, default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--config", type=str, default=None)
     parser.add_argument("--cookie-file", type=str, default=None)
@@ -22,6 +23,8 @@ def main():
     if config_path:
         load_config(config_path)
 
+    if args.host:
+        CONFIG["host"] = args.host
     if args.port:
         CONFIG["port"] = args.port
     if args.cookie_file:
@@ -29,15 +32,22 @@ def main():
     if args.proxy:
         CONFIG["proxy"] = args.proxy
 
+    # Refresh the Gemini build label; stale labels make every request fail.
+    new_bl = fetch_latest_bl()
+    if new_bl:
+        CONFIG["gemini_bl"] = new_bl
+
     port = CONFIG["port"]
-    server = ThreadedServer((CONFIG["host"], port), GeminiHandler)
+    host = CONFIG["host"]
+    server = ThreadedServer((host, port), GeminiHandler)
     print(f"gemini-web2api v{__version__}")
-    print(f"  Listening: http://0.0.0.0:{port}")
+    print(f"  Listening: http://{host}:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
+    print(f"  BL:        {CONFIG['gemini_bl']}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
     try:

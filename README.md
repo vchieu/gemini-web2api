@@ -6,7 +6,7 @@
 
 [中文文档](README_CN.md)
 
-Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, single file.
+Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, cross-platform, pure Python.
 
 ## Features
 
@@ -25,7 +25,7 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 
 ```bash
 pip install httpx
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Server starts at `http://localhost:8081/v1`.
@@ -111,7 +111,7 @@ gemini-3.5-flash-thinking@think=4   # shallowest
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### How to get cookies
@@ -163,14 +163,15 @@ Create `config.json` in the same directory:
 
 ```json
 {
+  "host": "127.0.0.1",
   "port": 8081,
-  "host": "0.0.0.0",
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
+  "strict_models": false,
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
@@ -183,6 +184,14 @@ Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
+
+> **Security**: the default `host` is `127.0.0.1` (loopback only). If you bind to
+> `0.0.0.0` **and** leave `api_keys` empty, anyone on the same network can use
+> your Google session. Always set `api_keys` when exposing the server.
+
+Unknown model names silently fall back to `default_model` (and the response
+echoes the name the client sent), which keeps strict clients working. Set
+`strict_models` to `true` to return `404 model_not_found` instead.
 
 ## Docker
 
@@ -207,7 +216,7 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
 
-> **Note**: If you get empty responses (`content: null`) with Docker's default bridge network, switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
+> **Note**: If upstream returns an empty body while using Docker's default bridge network, the request fails with HTTP 502 (`empty response from upstream`). Switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
 
 ## Proxy
 
@@ -215,7 +224,7 @@ If you cannot access `gemini.google.com` directly (connection timeout), configur
 
 **Method 1: CLI argument**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **Method 2: config.json**
@@ -226,7 +235,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **Method 3: Environment variable** (auto-detected)
 ```bash
 export HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
@@ -272,6 +281,7 @@ resp = client.chat.completions.create(
 - **Not real Pro/Ultra**: Without a paid subscription cookie, `gemini-3.1-pro` routes to the same Flash model. The "Pro" label is a UI preference, not a backend model switch.
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
+- **Token usage is an estimate**: `usage` is computed as `len(text) // 4`. This is a rough heuristic and can be noticeably off for Vietnamese/Chinese text and for code.
 
 ## Requirements
 

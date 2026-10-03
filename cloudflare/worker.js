@@ -169,7 +169,8 @@ var DEFAULT_CONFIG = {
   // 注意：CF Workers 免费版有 30 秒 CPU 时间限制
   // 流式请求的 CPU 时间在数据到达时重置，所以不受此严格限制
   // 但初始连接和第一个数据块必须在超时内到达
-  requestTimeoutSec: 28,
+  // 28 秒对 thinking 模型太短，上游尚未返回首包即被中止，故放宽到 180 秒
+  requestTimeoutSec: 180,
 
   // ---- Gemini 构建标签 ----
   // Gemini 前端的版本标识，用于 API 请求的 URL 参数
@@ -1415,14 +1416,29 @@ function extractResponseText(raw) {
  *   每个工具格式: { type: "function", function: { name, description, parameters } }
  * @returns {string} 转换后的提示文本
  */
-function messagesToPrompt(messages, tools) {
+function toolChoiceInstruction(toolChoice, toolDefs) {
+  if (!toolChoice || toolChoice === 'auto') return '';
+  if (toolChoice === 'none') {
+    return '\n\nIMPORTANT: Do NOT call any tools. Respond with text only.';
+  }
+  if (toolChoice === 'required') {
+    return '\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only.';
+  }
+  if (typeof toolChoice === 'object' && toolChoice.function && toolChoice.function.name) {
+    return '\n\nIMPORTANT: You MUST call the tool "' + toolChoice.function.name +
+      '". Do not call other tools.';
+  }
+  return '';
+}
+
+function messagesToPrompt(messages, tools, toolChoice) {
   // 存储各个消息段的数组
   var parts = [];
 
   // ================================================================
   // 第一步：如果提供了工具定义，在开头添加工具使用说明
   // ================================================================
-  if (tools && tools.length > 0) {
+  if (tools && tools.length > 0 && toolChoice !== 'none') {
     // 标准化工具定义格式
     // 兼容两种格式:
     //   1. { type: "function", function: { name, description, parameters } }
@@ -1431,6 +1447,7 @@ function messagesToPrompt(messages, tools) {
     for (var ti = 0; ti < tools.length; ti++) {
       var tool = tools[ti];
       var fn = (tool.type === 'function') ? (tool.function || tool) : tool;
+      if (!fn.name && !tool.name) continue;  // 没有函数名的工具直接跳过
       toolDefs.push({
         name: fn.name || tool.name || '',
         description: fn.description || tool.description || '',
@@ -1447,26 +1464,48 @@ function messagesToPrompt(messages, tools) {
       'To call a tool, respond with:\n' +
       '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n' +
       'Only use tool_call blocks when needed.\n\n' +
-      'Available tools:\n' + JSON.stringify(toolDefs, null, 2)
+      'Available tools:\n' + JSON.stringify(toolDefs, null, 2) +
+      toolChoiceInstruction(toolChoice, toolDefs)
     );
   }
 
   // ================================================================
-  // 第二步：逐条处理消息
+  // 第二步：建立 tool_call id → 函数名的映射
+  // ================================================================
+  // OpenAI 的 role:"tool" 消息只带 tool_call_id，不带 name；
+  // 不做映射的话模型无法判断某条结果属于哪个函数调用。
+  var idToName = {};
+  for (var ii = 0; ii < messages.length; ii++) {
+    var prior = messages[ii];
+    if (prior && prior.role === 'assistant' && Array.isArray(prior.tool_calls)) {
+      for (var ki = 0; ki < prior.tool_calls.length; ki++) {
+        var ptc = prior.tool_calls[ki];
+        if (ptc && ptc.id && ptc.function && ptc.function.name) {
+          idToName[ptc.id] = ptc.function.name;
+        }
+      }
+    }
+  }
+
+  // ================================================================
+  // 第三步：逐条处理消息
   // ================================================================
   for (var mi = 0; mi < messages.length; mi++) {
     var msg = messages[mi];
+    if (!msg || typeof msg !== 'object') continue;
     var role = msg.role || 'user';     // 角色，默认为 user
-    var content = msg.content || '';    // 消息内容
+    // 新版 OpenAI SDK / Codex CLI 使用 developer 角色，等同于 system
+    if (role === 'developer') role = 'system';
+    var content = (msg.content === undefined || msg.content === null) ? '' : msg.content;
 
     // 如果内容是数组（多模态消息），提取文本部分
     // 例如: [{ type: "text", text: "Hello" }, { type: "image_url", ... }]
-    // 只提取 type 为 "text" 或 "input_text" 的部分
+    // 只提取 type 为 "text"/"input_text"/"output_text" 的部分
     if (Array.isArray(content)) {
       var textParts = [];
       for (var ci = 0; ci < content.length; ci++) {
         var c = content[ci];
-        if (c.type === 'text' || c.type === 'input_text') {
+        if (c.type === 'text' || c.type === 'input_text' || c.type === 'output_text') {
           textParts.push(c.text || '');
         }
       }
@@ -1485,9 +1524,13 @@ function messagesToPrompt(messages, tools) {
         for (var tci = 0; tci < msg.tool_calls.length; tci++) {
           var tc = msg.tool_calls[tci];
           var fn = tc.function || {};
+          var args = fn.arguments || '{}';
+          if (typeof args !== 'string') args = JSON.stringify(args);
           tcStrs.push(
             '```tool_call\n' +
-            '{"name": "' + fn.name + '", "arguments": ' + (fn.arguments || '{}') + '}\n' +
+            '{"id": ' + JSON.stringify(tc.id || '') +
+            ', "name": ' + JSON.stringify(fn.name || '') +
+            ', "arguments": ' + args + '}\n' +
             '```'
           );
         }
@@ -1496,15 +1539,18 @@ function messagesToPrompt(messages, tools) {
         parts.push('[Assistant]: ' + content);
       }
     } else if (role === 'tool') {
-      // 工具响应：添加结果前缀和工具名称
-      parts.push('[Tool result for ' + (msg.name || 'unknown') + ']: ' + content);
+      // 工具响应：优先用 tool_call_id 反查函数名，附带 id 便于对照
+      var toolName = msg.name || idToName[msg.tool_call_id] || '';
+      parts.push(
+        '[Tool result for ' + toolName + ' (id=' + (msg.tool_call_id || '') + ')]: ' + content
+      );
     } else {
       // 用户消息：直接使用内容
       parts.push(content || '');
     }
   }
 
-  // 第三步：用双换行连接所有部分，过滤掉空字符串
+  // 第四步：用双换行连接所有部分，过滤掉空字符串
   return parts.filter(function (p) { return p; }).join('\n\n');
 }
 
@@ -1641,6 +1687,11 @@ function googleContentsToPrompt(req) {
 // 1. 支持任意类型的键（这里使用字符串）
 // 2. 有内置的 size 属性
 // 3. 迭代性能更好
+//
+// ⚠️ 注意：这只是单个 isolate 内的近似限流。
+// Cloudflare Workers 会把请求打散到多个 isolate，每个 isolate 各自持有
+// 独立的 Map，计数不共享，因此实际生效的阈值会高于配置值。
+// 需要强一致的限流请改用 Durable Objects 或 KV。
 var rateLimitStore = new Map();
 
 /**
@@ -1797,7 +1848,8 @@ function sendJSON(data, status) {
       'Content-Type': 'application/json; charset=utf-8',
       'Access-Control-Allow-Origin': '*',           // 允许所有域访问
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',  // 允许的 HTTP 方法
-      'Access-Control-Allow-Headers': '*',           // 允许所有请求头
+      // '*' 不包含 Authorization，显式列出以保证浏览器客户端可用
+      'Access-Control-Allow-Headers': 'Authorization, Content-Type, x-api-key, x-goog-api-key',
     },
   });
 }
@@ -1928,7 +1980,7 @@ async function handleChatCompletions(request, body, config) {
   var tools = body.tools || null;
 
   // ---- 第二步：转换消息为提示文本 ----
-  var prompt = messagesToPrompt(body.messages || [], tools);
+  var prompt = messagesToPrompt(body.messages || [], tools, body.tool_choice);
   if (!prompt.trim()) {
     return sendJSON({ error: { message: 'empty prompt' } }, 400);
   }
@@ -1970,21 +2022,39 @@ async function handleChatCompletions(request, body, config) {
       // 如果要求流式但有工具调用，以单块 SSE 的方式返回
       if (stream) {
         var encoder = new TextEncoder();
-        var nonStreamSSE = new ReadableStream({
+        var toolCallStream = new ReadableStream({
           start: function (controller) {
-            var chunk = {
-              id: chatId,
-              object: 'chat.completion.chunk',
-              created: timestamp(),
-              model: modelName,
-              choices: [{ index: 0, delta: msg, finish_reason: finishReason }],
+            var push = function (delta, finish) {
+              controller.enqueue(encoder.encode('data: ' + JSON.stringify({
+                id: chatId,
+                object: 'chat.completion.chunk',
+                created: timestamp(),
+                model: modelName,
+                choices: [{ index: 0, delta: delta, finish_reason: finish }],
+              }) + '\n\n'));
             };
-            controller.enqueue(encoder.encode('data: ' + JSON.stringify(chunk) + '\n\n'));
+            // 按 OpenAI 规范拆成多个 chunk：
+            // role 块 → 内容块 → 每个 tool_call 一个块（必须带 index）→ 结束块
+            push({ role: 'assistant' }, null);
+            if (text) push({ content: text }, null);
+            if (toolCalls) {
+              for (var tci = 0; tci < toolCalls.length; tci++) {
+                push({
+                  tool_calls: [{
+                    index: tci,
+                    id: toolCalls[tci].id,
+                    type: 'function',
+                    function: toolCalls[tci].function,
+                  }],
+                }, null);
+              }
+            }
+            push({}, finishReason);
             controller.enqueue(encoder.encode('data: [DONE]\n\n'));
             controller.close();
           },
         });
-        return sendSSE(nonStreamSSE);
+        return sendSSE(toolCallStream);
       }
 
       // 标准非流式 JSON 响应
@@ -2053,7 +2123,7 @@ async function handleChatCompletions(request, body, config) {
             choices: [{
               index: 0,
               delta: { content: "" },
-              finish_reason: reason || 'stop'
+              finish_reason: (reason === 'length' || reason === 'tool_calls') ? reason : 'stop'
             }],
           }) + '\n\n'));
           // 发送 [DONE] 标记（SSE 协议规定的流结束信号）
@@ -2306,14 +2376,36 @@ async function handleResponses(request, body, config) {
     if (typeof item === 'string') {
       // 简单字符串 → user 消息
       messages.push({ role: 'user', content: item });
+    } else if (item.type === 'function_call') {
+      // Codex 顶层 function_call item → assistant.tool_calls
+      // 之前落入 else 分支后 content 为空被丢弃，模型看不到自己的调用
+      var callId = item.call_id || item.id || ('call_' + generateShortId(8));
+      var call = {
+        id: callId,
+        type: 'function',
+        function: { name: item.name || '', arguments: item.arguments || '{}' },
+      };
+      var lastMsg = messages[messages.length - 1];
+      if (lastMsg && lastMsg.role === 'assistant' && Array.isArray(lastMsg.tool_calls)) {
+        lastMsg.tool_calls.push(call);
+      } else {
+        messages.push({ role: 'assistant', content: null, tool_calls: [call] });
+      }
     } else if (item.type === 'function_call_output') {
       // 函数调用输出 → tool 消息
-      messages.push({
-        role: 'tool',
-        tool_call_id: item.call_id,
-        name: item.name,
-        content: item.output,
-      });
+      // name 由 messagesToPrompt 通过 tool_call_id 反查
+      var out = item.output;
+      if (Array.isArray(out)) {
+        var outParts = [];
+        for (var oi = 0; oi < out.length; oi++) {
+          if (out[oi] && out[oi].type === 'output_text') outParts.push(out[oi].text || '');
+        }
+        out = outParts.join('\n');
+      }
+      messages.push({ role: 'tool', tool_call_id: item.call_id, content: out });
+    } else if (item.type === 'input_text') {
+      // 顶层 input_text（没有 content 字段），之前会被丢弃
+      messages.push({ role: 'user', content: item.text || '' });
     } else {
       // 其他格式的消息
       var content = item.content;
@@ -2321,11 +2413,15 @@ async function handleResponses(request, body, config) {
         var textParts = [];
         for (var j = 0; j < content.length; j++) {
           var c = content[j];
-          if (c.type === 'output_text') textParts.push(c.text || '');
+          if (c.type === 'output_text' || c.type === 'input_text' || c.type === 'text') {
+            textParts.push(c.text || '');
+          }
         }
         content = textParts.join(' ');
       }
-      messages.push({ role: item.role || 'user', content: content });
+      var respRole = item.role || 'user';
+      if (respRole === 'developer') respRole = 'system';
+      messages.push({ role: respRole, content: content });
     }
   }
 
@@ -2349,7 +2445,7 @@ async function handleResponses(request, body, config) {
   }
 
   // 转换消息为提示文本
-  var prompt = messagesToPrompt(messages, tools);
+  var prompt = messagesToPrompt(messages, tools, body.tool_choice);
   if (!prompt.trim()) {
     return sendJSON({ error: { message: 'empty input' } }, 400);
   }
@@ -2398,19 +2494,95 @@ async function handleResponses(request, body, config) {
       });
     }
 
-    return sendJSON({
+    var usage = {
+      input_tokens: estimateTokens(prompt),
+      output_tokens: estimateTokens(text),
+      total_tokens: estimateTokens(prompt + text),
+    };
+    var baseResponse = {
       id: responseId,
       object: 'response',
       created_at: timestamp(),
-      status: 'completed',
       model: modelName,
+    };
+
+    // Codex 请求 stream:true 时必须返回事件流；之前忽略该字段恒返回 JSON，
+    // 会导致 Codex 解析失败。
+    if (body.stream) {
+      var encoder = new TextEncoder();
+      var events = [];
+      var seq = 0;
+      var emit = function (type, fields) {
+        seq += 1;
+        var payload = { type: type, sequence_number: seq };
+        for (var k in fields) payload[k] = fields[k];
+        events.push('event: ' + type + '\ndata: ' + JSON.stringify(payload) + '\n\n');
+      };
+      var inProgress = Object.assign({}, baseResponse, {
+        status: 'in_progress', output: [], usage: null,
+      });
+      emit('response.created', { response: inProgress });
+      emit('response.in_progress', { response: inProgress });
+
+      for (var oi = 0; oi < output.length; oi++) {
+        var item = output[oi];
+        if (item.type === 'function_call') {
+          emit('response.output_item.added', {
+            output_index: oi,
+            item: {
+              type: 'function_call', id: item.id, call_id: item.call_id,
+              name: item.name, arguments: '', status: 'in_progress',
+            },
+          });
+          emit('response.function_call_arguments.delta', {
+            item_id: item.id, output_index: oi, delta: item.arguments,
+          });
+          emit('response.function_call_arguments.done', {
+            item_id: item.id, output_index: oi, arguments: item.arguments,
+          });
+          emit('response.output_item.done', { output_index: oi, item: item });
+        } else if (item.type === 'message') {
+          emit('response.output_item.added', {
+            output_index: oi,
+            item: { type: 'message', id: item.id, role: 'assistant', status: 'in_progress', content: [] },
+          });
+          for (var pi = 0; pi < item.content.length; pi++) {
+            var part = item.content[pi];
+            var fields = { item_id: item.id, output_index: oi, content_index: pi };
+            emit('response.content_part.added', Object.assign({}, fields, {
+              part: { type: 'output_text', text: '', annotations: [] },
+            }));
+            emit('response.output_text.delta', Object.assign({}, fields, { delta: part.text }));
+            emit('response.output_text.done', Object.assign({}, fields, { text: part.text }));
+            emit('response.content_part.done', Object.assign({}, fields, { part: part }));
+          }
+          emit('response.output_item.done', { output_index: oi, item: item });
+        }
+      }
+
+      emit('response.completed', {
+        response: Object.assign({}, baseResponse, {
+          status: 'completed', output: output, usage: usage,
+        }),
+      });
+
+      var eventsCopy = events;
+      var eventStream = new ReadableStream({
+        start: function (controller) {
+          for (var ei = 0; ei < eventsCopy.length; ei++) {
+            controller.enqueue(encoder.encode(eventsCopy[ei]));
+          }
+          controller.close();
+        },
+      });
+      return sendSSE(eventStream);
+    }
+
+    return sendJSON(Object.assign({}, baseResponse, {
+      status: 'completed',
       output: output,
-      usage: {
-        input_tokens: estimateTokens(prompt),
-        output_tokens: estimateTokens(text),
-        total_tokens: estimateTokens(prompt + text),
-      },
-    });
+      usage: usage,
+    }));
   } catch (error) {
     return sendJSON({ error: { message: 'upstream error: ' + error.message } }, 502);
   }
@@ -2525,12 +2697,16 @@ export default {
     // 必须返回正确的 CORS 头，否则浏览器会阻止实际请求。
     // 这个处理必须在所有其他逻辑之前完成。
     if (request.method === 'OPTIONS') {
+      var requestedHeaders = request.headers.get('Access-Control-Request-Headers');
       return new Response(null, {
         status: 204,  // No Content
         headers: {
           'Access-Control-Allow-Origin': '*',              // 允许所有域访问
           'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',  // 允许的 HTTP 方法
-          'Access-Control-Allow-Headers': '*',             // 允许所有自定义请求头
+          // '*' 按 fetch 规范不包含 Authorization，必须回显或显式列出，
+          // 否则 ChatBox web / NextChat web 等浏览器客户端的预检会失败
+          'Access-Control-Allow-Headers':
+            requestedHeaders || 'Authorization, Content-Type, x-api-key, x-goog-api-key',
           'Access-Control-Max-Age': '86400',               // 预检结果缓存 24 小时（秒）
         },
       });
@@ -2590,6 +2766,8 @@ export default {
           platform: 'Cloudflare Workers',
           models: Object.keys(MODELS),
           defaultModel: config.defaultModel,
+          hasCookie: !!config.cookieString,
+          hasSapisid: !!config.sapisid,
         });
       }
 
@@ -2667,15 +2845,26 @@ export default {
         return handleGoogleAPI(request, body, false, config);
       }
 
-      // ---- 万能兜底路由 ----
-      // 所有 /v1/ 下的未匹配 POST 请求都自动转为 chat 处理
-      // 兼容各种客户端的路径差异
-      if (path.indexOf('/v1/') === 0) {
+      // ---- 兼容别名（部分客户端省略 /v1 前缀） ----
+      // 只回退到语义明确等同于 chat/responses 的路径，
+      // 避免把 /v1/embeddings 等无关端点当成 chat 返回垃圾数据。
+      var tail = path.replace(/^\/v1/, '');
+      if (tail === '/chat/completions' || tail === '/completions' || tail === '/chat') {
         return handleChatCompletions(request, body, config);
       }
+      if (tail === '/responses') {
+        return handleResponses(request, body, config);
+      }
 
-      // 未匹配的 POST 请求
-      return sendJSON({ error: { message: 'not found' } }, 404);
+      // 未匹配的 POST 请求 → 标准 OpenAI 形状的 404
+      return sendJSON({
+        error: {
+          message: 'not found: ' + path,
+          type: 'invalid_request_error',
+          param: null,
+          code: null,
+        },
+      }, 404);
     }
 
     // ================================================================

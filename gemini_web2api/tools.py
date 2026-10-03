@@ -4,33 +4,11 @@ import re
 import uuid
 import base64
 import binascii
-import io
 from urllib.parse import unquote_to_bytes
 
-MAX_IMAGE_B64_SIZE = 50000  # ~37KB raw image
-
-
-def _compress_b64_if_needed(b64: str) -> str:
-    """Compress image if base64 is too large for text embedding."""
-    if len(b64) <= MAX_IMAGE_B64_SIZE:
-        return b64
-    try:
-        from PIL import Image
-        img_data = base64.b64decode(b64)
-        img = Image.open(io.BytesIO(img_data))
-        # Resize to max 256px on longest side
-        max_dim = 256
-        ratio = min(max_dim / img.width, max_dim / img.height)
-        if ratio < 1:
-            img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-        # Convert to JPEG with quality reduction
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=60)
-        compressed = base64.b64encode(buf.getvalue()).decode()
-        return compressed
-    except Exception:
-        # If PIL not available, truncate (model will get partial data)
-        return b64[:MAX_IMAGE_B64_SIZE]
+# Upper bound for the generated prompt. Keeps large tool lists / long histories
+# from being rejected by the upstream web endpoint.
+PROMPT_MAX_BYTES = 60000
 
 
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
@@ -101,6 +79,38 @@ def _image_from_part(part: dict):
     return None
 
 
+def _stringify_content(content) -> str:
+    """Flatten OpenAI message content (str or list of parts) into plain text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for c in content:
+            if isinstance(c, dict):
+                if c.get("type") in ("text", "input_text", "output_text"):
+                    out.append(c.get("text", ""))
+                elif isinstance(c.get("text"), str):
+                    out.append(c["text"])
+            elif isinstance(c, str):
+                out.append(c)
+        return "\n".join(p for p in out if p)
+    return str(content)
+
+
+def tool_names(tools) -> set:
+    """Collect declared function names from an OpenAI tools list."""
+    names = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        if isinstance(fn, dict) and fn.get("name"):
+            names.add(fn["name"])
+    return names
+
+
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
     """Convert OpenAI messages to (prompt_str, images_list).
 
@@ -112,38 +122,70 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     if tools and tool_choice != "none":
         tool_defs = []
         for tool in tools:
+            if not isinstance(tool, dict):
+                continue
             fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+            if not isinstance(fn, dict):
+                continue
+            name = fn.get("name", tool.get("name", ""))
+            if not name:
+                continue
             tool_defs.append({
-                "name": fn.get("name", tool.get("name", "")),
+                "name": name,
                 "description": fn.get("description", tool.get("description", "")),
                 "parameters": fn.get("parameters", tool.get("parameters", {})),
             })
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
+            tools_json = json.dumps(tool_defs, indent=2, ensure_ascii=False)
+            if len(tools_json.encode("utf-8")) > PROMPT_MAX_BYTES // 2:
+                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
+                tools_json = json.dumps(slim_defs, indent=2, ensure_ascii=False)
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
                 "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
+                f"Available tools:\n{tools_json}"
                 f"{constraint}"
             )
 
+    # Map tool_call ids -> function names so tool results can be labelled correctly.
+    id_to_name = {}
     for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    tcid = tc.get("id")
+                    fn = tc.get("function") or {}
+                    if tcid and isinstance(fn, dict) and fn.get("name"):
+                        id_to_name[tcid] = fn["name"]
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
         role = msg.get("role", "user")
+        if role == "developer":
+            role = "system"
         content = msg.get("content", "")
 
         if isinstance(content, list):
             text_parts = []
             for c in content:
-                if c.get("type") in ("text", "input_text"):
+                if not isinstance(c, dict):
+                    if isinstance(c, str):
+                        text_parts.append(c)
+                    continue
+                if c.get("type") in ("text", "input_text", "output_text"):
                     text_parts.append(c.get("text", ""))
-                else:
-                    image = _image_from_part(c)
-                    if image:
-                        images.append(image)
-                        text_parts.append("[Image attached]")
-            content = " ".join(text_parts)
+                    continue
+                image = _image_from_part(c)
+                if image:
+                    images.append(image)
+                    text_parts.append("[Image attached]")
+                elif isinstance(c.get("text"), str):
+                    text_parts.append(c["text"])
+            content = " ".join(p for p in text_parts if p)
 
         if role == "system":
             parts.append(f"[System instruction]: {content}")
@@ -151,47 +193,104 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             if msg.get("tool_calls"):
                 tc_strs = []
                 for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {})
+                    fn = tc.get("function") or {}
+                    name = json.dumps(fn.get("name", ""), ensure_ascii=False)
+                    args = fn.get("arguments", "{}")
+                    if not isinstance(args, str):
+                        args = json.dumps(args, ensure_ascii=False)
                     tc_strs.append(
-                        f'```tool_call\n{{"name": "{fn.get("name")}", '
-                        f'"arguments": {fn.get("arguments", "{}")}}}\n```'
+                        f'```tool_call\n{{"id": {json.dumps(tc.get("id", ""))}, '
+                        f'"name": {name}, "arguments": {args}}}\n```'
                     )
                 parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
             else:
                 parts.append(f"[Assistant]: {content}")
         elif role == "tool":
-            parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+            tcid = msg.get("tool_call_id", "")
+            name = msg.get("name") or id_to_name.get(tcid, "")
+            body = _stringify_content(content)
+            parts.append(f"[Tool result for {name} (id={tcid})]: {body}")
         else:
-            parts.append(content if content else "")
+            parts.append(_stringify_content(content))
 
     prompt = "\n\n".join(p for p in parts if p)
+    if len(prompt.encode("utf-8")) > PROMPT_MAX_BYTES:
+        from .gemini import log
+        log(f"Prompt truncated to {PROMPT_MAX_BYTES} bytes")
+        prompt = prompt.encode("utf-8")[:PROMPT_MAX_BYTES].decode("utf-8", errors="ignore")
     return prompt, images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+def parse_tool_calls(text: str, allowed_names=None) -> tuple:
+    """Extract tool_call blocks. Returns (clean_text, tool_calls_list).
+
+    ``allowed_names`` optionally restricts accepted function names. Blocks that
+    fail to parse, or that name an undeclared function, are left in the text so
+    that no content is silently lost.
+    """
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
+    pattern = r'```tool_call[ \t]*\n?(.*?)\n?```'
     clean_parts = []
     last_end = 0
     for m in re.finditer(pattern, text, re.DOTALL):
+        body = m.group(1).strip()
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        parsed = None
+        if isinstance(data, dict):
+            name = data.get("name")
+            if name and (allowed_names is None or name in allowed_names):
+                args = data.get("arguments", data.get("args", {}))
+                args_str = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+                parsed = {
+                    "id": f"call_{uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {"name": name, "arguments": args_str},
+                }
+        if parsed is None:
+            continue
         clean_parts.append(text[last_end:m.start()])
         last_end = m.end()
-        try:
-            data = json.loads(m.group(1).strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
-            pass
+        tool_calls.append(parsed)
     clean_parts.append(text[last_end:])
     clean = "".join(clean_parts).strip()
     return clean, tool_calls
+
+
+def build_response_format_instruction(response_format) -> str:
+    """Build a prompt instruction from an OpenAI ``response_format`` value."""
+    if not isinstance(response_format, dict):
+        return ""
+    rf_type = response_format.get("type")
+    if rf_type == "json_object":
+        return (
+            "\n\nIMPORTANT: Respond with a single valid JSON object only. "
+            "Do not include prose, explanations or Markdown code fences."
+        )
+    if rf_type == "json_schema":
+        schema = response_format.get("json_schema", {})
+        if isinstance(schema, dict) and "schema" in schema:
+            schema = schema["schema"]
+        return (
+            "\n\nIMPORTANT: Respond with a single valid JSON value that strictly "
+            "conforms to the following JSON Schema. Do not include prose, "
+            "explanations or Markdown code fences.\n"
+            f"JSON Schema:\n{json.dumps(schema, ensure_ascii=False)}"
+        )
+    return ""
+
+
+def strip_code_fence(text: str) -> str:
+    """Remove a single wrapping Markdown code fence (e.g. ```json ... ```)."""
+    if not text:
+        return text
+    stripped = text.strip()
+    m = re.match(r'^```[a-zA-Z0-9_-]*[ \t]*\n?(.*?)\n?```$', stripped, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text
 
 
 # ─── Google Native API helpers ─────────────────────────────────────────────────

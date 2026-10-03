@@ -25,7 +25,7 @@
 
 ```bash
 pip install httpx
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 服务启动在 `http://localhost:8081/v1`.
@@ -101,7 +101,7 @@ gemini-3.5-flash-thinking@think=4   # 最浅
 匿名访问对所有模型有效, 但 `gemini-3.1-pro` 在无认证时会路由到 Flash. 要获得真正的 Pro 路由, 需要 **Gemini Advanced (付费订阅)** 账号的 cookie:
 
 ```bash
-python gemini_web2api.py --cookie-file cookie.txt
+python -m gemini_web2api --cookie-file cookie.txt
 ```
 
 ### 如何获取 Cookie
@@ -153,14 +153,15 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 
 ```json
 {
+  "host": "127.0.0.1",
   "port": 8081,
-  "host": "0.0.0.0",
   "retry_attempts": 3,
   "retry_delay_sec": 2,
   "request_timeout_sec": 180,
   "gemini_bl": "boq_assistant-bard-web-server_20260716.08_p0",
   "auth_user": null,
   "xsrf_token": null,
+  "strict_models": false,
   "api_keys": ["sk-your-key"],
   "cookie_file": null,
   "proxy": null,
@@ -173,6 +174,10 @@ Pro 路由需要 **Gemini Advanced** (付费订阅). 免费 Google 账号的 coo
 不会将对话保存在账号历史记录中。
 
 `api_keys` 为空数组 `[]` 时不校验密钥；填入一个或多个密钥后, `/v1/*` 接口需要 `Authorization: Bearer <key>` 或 `x-api-key: <key>`.
+
+> **安全提示**: 默认 `host` 为 `127.0.0.1`（仅本机）。如果绑定到 `0.0.0.0` 且 `api_keys` 为空，同网络内任何人都可以使用你的 Google 会话。对外暴露时务必设置 `api_keys`。
+
+未知模型名会静默回退到 `default_model`（响应会回显客户端发送的模型名），以兼容严格的客户端；将 `strict_models` 设为 `true` 可改为返回 `404 model_not_found`。
 
 ## Docker 部署
 
@@ -205,7 +210,7 @@ docker run -d --name gemini-web2api -p 8081:8081 -v ./config.json:/app/config.js
 
 **方式 1: 命令行参数**
 ```bash
-python gemini_web2api.py --proxy http://127.0.0.1:7890
+python -m gemini_web2api --proxy http://127.0.0.1:7890
 ```
 
 **方式 2: config.json**
@@ -216,7 +221,7 @@ python gemini_web2api.py --proxy http://127.0.0.1:7890
 **方式 3: 环境变量** (自动检测)
 ```bash
 set HTTPS_PROXY=http://127.0.0.1:7890
-python gemini_web2api.py
+python -m gemini_web2api
 ```
 
 支持 Clash, V2Ray, Shadowsocks 等任何 HTTP 代理.

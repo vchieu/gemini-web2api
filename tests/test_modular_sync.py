@@ -9,7 +9,7 @@ from urllib.parse import parse_qs
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
 from gemini_web2api.gemini import _build_payload
 from gemini_web2api.server import GeminiHandler, ThreadedServer
-from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt
+from gemini_web2api.tools import google_contents_to_prompt, messages_to_prompt, parse_tool_calls
 
 
 def _decode_payload(payload):
@@ -439,6 +439,259 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[3][1]["delta"], '{"city":"Shanghai"}')
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
+
+
+    @mock.patch("gemini_web2api.server.parse_tool_calls")
+    @mock.patch("gemini_web2api.server.generate", return_value="get_weather")
+    def test_chat_stream_with_tools_emits_indexed_tool_calls(self, _generate, parse_tool_calls):
+        parse_tool_calls.return_value = (
+            "",
+            [{
+                "id": "call_test",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city":"Shanghai"}'},
+            }],
+        )
+
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "description": "Get weather",
+                        "parameters": {"type": "object"},
+                    },
+                }],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        tool_chunks = [c for c in chunks if c["choices"][0]["delta"].get("tool_calls")]
+        self.assertTrue(tool_chunks)
+        self.assertEqual(tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["index"], 0)
+        self.assertEqual(
+            tool_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "get_weather",
+        )
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "tool_calls")
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate_stream", side_effect=RuntimeError("boom"))
+    def test_chat_stream_error_before_start_returns_json_502(self, _generate_stream):
+        status, headers, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        self.assertIn("error", json.loads(body))
+
+    def test_chat_stream_midstream_error_emits_error_event_and_done(self):
+        def flaky_stream(*args, **kwargs):
+            yield "partial"
+            raise RuntimeError("boom")
+
+        with mock.patch("gemini_web2api.server.generate_stream", side_effect=flaky_stream):
+            status, headers, body = self.post_json(
+                "/v1/chat/completions",
+                {
+                    "model": "gemini-3.6-flash",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "stream": True,
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn('"error"', body)
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate", return_value="")
+    def test_chat_empty_upstream_returns_502(self, _generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(json.loads(body)["error"]["type"], "api_error")
+
+    def test_models_endpoint_ignores_query_string(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", "/v1/models?x=1")
+        response = connection.getresponse()
+        body = response.read().decode()
+        connection.close()
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(body)["object"], "list")
+
+    def test_options_preflight_allows_authorization_header(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("OPTIONS", "/v1/chat/completions")
+        response = connection.getresponse()
+        headers = dict(response.getheaders())
+        response.read()
+        connection.close()
+
+        self.assertEqual(response.status, 204)
+        self.assertIn("Authorization", headers["Access-Control-Allow-Headers"])
+
+    @mock.patch("gemini_web2api.server.generate", return_value="22 Celsius")
+    def test_tool_message_links_call_id_to_function_name(self, generate):
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [
+                    {"role": "user", "content": "weather in Shanghai?"},
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "call_abc", "type": "function",
+                         "function": {"name": "get_weather",
+                                      "arguments": '{"city":"Shanghai"}'}},
+                    ]},
+                    {"role": "tool", "tool_call_id": "call_abc", "content": "22C"},
+                ],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        prompt = generate.call_args.args[0]
+        self.assertIn("[Tool result for get_weather", prompt)
+        self.assertIn("id=call_abc", prompt)
+        self.assertIn("22C", prompt)
+
+    @mock.patch("gemini_web2api.server.generate", return_value="done")
+    def test_responses_function_call_and_output_are_included(self, generate):
+        status, _, _ = self.post_json(
+            "/v1/responses",
+            {
+                "model": "gemini-3.6-flash",
+                "input": [
+                    {"type": "message", "role": "user",
+                     "content": [{"type": "input_text", "text": "weather?"}]},
+                    {"type": "function_call", "call_id": "call_1",
+                     "name": "get_weather", "arguments": '{"city":"Shanghai"}'},
+                    {"type": "function_call_output", "call_id": "call_1", "output": "22C"},
+                ],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        prompt = generate.call_args.args[0]
+        self.assertIn("get_weather", prompt)
+        self.assertIn("22C", prompt)
+
+    @mock.patch("gemini_web2api.server.generate", return_value="hi")
+    def test_null_model_falls_back_without_error(self, _generate):
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {"model": None, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        self.assertEqual(status, 200)
+
+    @mock.patch("gemini_web2api.server.generate", return_value="hi")
+    def test_unknown_model_echoes_requested_name(self, _generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["model"], "gpt-4o")
+
+    @mock.patch("gemini_web2api.server.generate", return_value='```json\n{"a": 1}\n```')
+    def test_response_format_json_strips_code_fence(self, generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "give json"}],
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertIn("JSON", generate.call_args.args[0])
+        self.assertEqual(json.loads(body)["choices"][0]["message"]["content"], '{"a": 1}')
+
+    @mock.patch("gemini_web2api.server.generate", return_value="hi")
+    def test_n_greater_than_one_returns_400(self, _generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": 2,
+            },
+        )
+
+        self.assertEqual(status, 400)
+        self.assertEqual(json.loads(body)["error"]["type"], "invalid_request_error")
+
+    def test_404_error_uses_openai_shape(self):
+        status, _, body = self.post_json("/v1/nonexistent", {"x": 1})
+
+        self.assertEqual(status, 404)
+        error = json.loads(body)["error"]
+        self.assertIsInstance(error, dict)
+        for key in ("message", "type", "param", "code"):
+            self.assertIn(key, error)
+
+class ToolParsingTests(unittest.TestCase):
+    def test_parse_tool_calls_handles_single_line_block(self):
+        clean, calls = parse_tool_calls(
+            '```tool_call {"name": "foo", "arguments": {"x": 1}}```')
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "foo")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"x": 1}')
+        self.assertEqual(clean, "")
+
+    def test_parse_tool_calls_rejects_undeclared_function(self):
+        clean, calls = parse_tool_calls(
+            '```tool_call\n{"name": "bogus", "arguments": {}}\n```', allowed_names={"real"})
+
+        self.assertEqual(calls, [])
+        self.assertIn("bogus", clean)
+
+    def test_parse_tool_calls_keeps_unparsable_block(self):
+        text = "before\n```tool_call\nnot json\n```\nafter"
+
+        clean, calls = parse_tool_calls(text, allowed_names={"known"})
+
+        self.assertEqual(calls, [])
+        self.assertIn("not json", clean)
+        self.assertIn("before", clean)
+        self.assertIn("after", clean)
+
+    def test_parse_tool_calls_passes_through_string_arguments(self):
+        _, calls = parse_tool_calls(
+            '```tool_call\n{"name": "foo", "arguments": "{\\"a\\": 1}"}\n```',
+            allowed_names={"foo"},
+        )
+
+        self.assertEqual(calls[0]["function"]["arguments"], '{"a": 1}')
 
 
 if __name__ == "__main__":

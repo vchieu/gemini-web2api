@@ -3,21 +3,94 @@ import json
 import time
 import uuid
 import re
+import hmac
+import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
 from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .tools import (
+    messages_to_prompt,
+    parse_tool_calls,
+    google_contents_to_prompt,
+    parse_google_function_calls,
+    build_response_format_instruction,
+    strip_code_fence,
+    tool_names,
+)
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
 
+ERR_INVALID_REQUEST = "invalid_request_error"
+ERR_RATE_LIMIT = "rate_limit_error"
+ERR_API = "api_error"
+
+_MISSING = object()
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(text or "") // 4
+
+
 def _usage(prompt: str, text: str) -> dict:
-    p = len(prompt) // 4
-    c = len(text or "") // 4
+    p = _estimate_tokens(prompt)
+    c = _estimate_tokens(text)
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _normalize_stop(stop) -> list:
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        return [stop] if stop else []
+    if isinstance(stop, list):
+        return [s for s in stop if isinstance(s, str) and s]
+    return []
+
+
+def _apply_stop(text: str, stops: list) -> str:
+    if not text or not stops:
+        return text
+    cut = None
+    for s in stops:
+        idx = text.find(s)
+        if idx != -1 and (cut is None or idx < cut):
+            cut = idx
+    return text[:cut] if cut is not None else text
+
+
+def _apply_max_tokens(text: str, max_tokens) -> tuple:
+    """Return (text, truncated) after applying an estimated token budget."""
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        return text, False
+    limit = max_tokens * 4
+    if len(text) > limit:
+        return text[:limit], True
+    return text, False
+
+
+def _map_upstream_error(e) -> tuple:
+    """Map an upstream exception to (status, message, type, code)."""
+    status = getattr(e, "status", None)
+    if status is None:
+        status = getattr(e, "code", None)
+    if status is None:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+    if status == 429:
+        return 429, f"upstream rate limited: {e}", ERR_RATE_LIMIT, "rate_limit_exceeded"
+    if status:
+        return 502, f"upstream error ({status}): {e}", ERR_API, None
+    return 502, f"upstream error: {e}", ERR_API, None
+
+
+def _map_google_error(e) -> tuple:
+    """Map an upstream exception to (status, message, google_status)."""
+    status, message, _type, _code = _map_upstream_error(e)
+    gstatus = "RESOURCE_EXHAUSTED" if status == 429 else "UNAVAILABLE"
+    return status, message, gstatus
 
 
 def _upload_images(images: list) -> list:
@@ -42,11 +115,12 @@ def _upload_images(images: list) -> list:
             raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
 
-
 class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
+
+    # ─── response helpers ─────────────────────────────────────────────────────
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
@@ -57,6 +131,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_api_error(self, status, message, type_=ERR_API, code=None):
+        """Send an OpenAI-shaped error body."""
+        self.send_json(
+            {"error": {"message": message, "type": type_, "param": None, "code": code}},
+            status,
+        )
+
+    def send_google_error(self, status, message, gstatus="UNKNOWN"):
+        """Send a Google Gemini-shaped error body."""
+        self.send_json({"error": {"code": status, "message": message, "status": gstatus}}, status)
+
     def _start_sse(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -64,7 +149,41 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
 
-    def _parse_body(self, body: bytes) -> dict:
+    def _sse_chunk(self, cid, model, delta, finish_reason):
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
+    def _sse_usage(self, cid, model, prompt, text):
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [],
+            "usage": _usage(prompt, text),
+        }
+        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
+    def _sse_event_error(self, status, message, type_=ERR_API, code=None):
+        payload = {"error": {"message": message, "type": type_, "param": None, "code": code}}
+        self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
+    def _sse_done(self):
+        self.wfile.write(b"data: [DONE]\n\n")
+        self.wfile.flush()
+
+# ─── request parsing / auth / routing ─────────────────────────────────────
+
+    def _parse_body(self, body: bytes):
         try:
             return json.loads(body)
         except (json.JSONDecodeError, ValueError):
@@ -96,243 +215,451 @@ class GeminiHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         return self.rfile.read(length) if length else b""
 
+    def _route_path(self) -> str:
+        """Return the request path without query string / trailing slash."""
+        return urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
     def _authorized(self):
         keys = CONFIG.get("api_keys") or []
         if not keys:
             return True
-        # Authorization: Bearer <key>
+        provided = []
         auth = self.headers.get("Authorization", "")
-        if auth.startswith("Bearer ") and auth[7:] in keys:
-            return True
-        # header keys (OpenAI x-api-key / Google x-goog-api-key)
-        for h in ("x-api-key", "x-goog-api-key"):
-            if self.headers.get(h, "") in keys:
-                return True
-        # query param ?key= (Gemini CLI native style)
-        if "?" in self.path:
-            for pair in self.path.split("?", 1)[1].split("&"):
-                if pair.startswith("key=") and pair[4:] in keys:
+        if auth.startswith("Bearer "):
+            provided.append(auth[7:])
+        for header in ("x-api-key", "x-goog-api-key"):
+            value = self.headers.get(header)
+            if value:
+                provided.append(value)
+        query = urllib.parse.urlparse(self.path).query
+        for pair in query.split("&"):
+            if pair.startswith("key="):
+                provided.append(urllib.parse.unquote(pair[4:]))
+        for value in provided:
+            for key in keys:
+                if isinstance(key, str) and hmac.compare_digest(value.encode(), key.encode()):
                     return True
         return False
 
+    def _needs_auth(self, path: str) -> bool:
+        return path not in ("/", "/health")
+
     def do_OPTIONS(self):
+        requested = self.headers.get("Access-Control-Request-Headers")
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "*")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            requested or "Authorization, Content-Type, x-api-key, x-goog-api-key",
+        )
+        self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
-                self.send_json({"error": {"message": "invalid api key"}}, 401)
+            path = self._route_path()
+            if self._needs_auth(path) and not self._authorized():
+                self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST, "invalid_api_key")
                 return
-            if self.path == "/v1/models":
+            if path in ("/v1/models", "/models"):
                 self.send_json({"object": "list", "data": [
                     {"id": n, "object": "model", "created": 1700000000,
                      "owned_by": "google", "description": c["desc"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path.startswith("/v1/models/") or path.startswith("/models/"):
+                model_id = path.rsplit("/", 1)[-1]
+                cfg = MODELS.get(model_id)
+                if cfg:
+                    self.send_json({"id": model_id, "object": "model", "created": 1700000000,
+                                    "owned_by": "google", "description": cfg["desc"]})
+                else:
+                    self.send_api_error(404, f"model '{model_id}' not found",
+                                        ERR_INVALID_REQUEST, "model_not_found")
+            elif path.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
-                self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
+            elif path in ("/", "/health"):
+                self.send_json({"status": "ok", "version": __version__,
+                                "models": list(MODELS.keys())})
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _resolve_request_model(self, req):
+        """Resolve the requested model. Returns a tuple or None (error sent)."""
+        raw = req.get("model")
+        base = raw.split("@think=")[0] if isinstance(raw, str) else raw
+        if CONFIG.get("strict_models") and isinstance(base, str) and base and base not in MODELS:
+            self.send_api_error(404, f"model '{raw}' not found",
+                                ERR_INVALID_REQUEST, "model_not_found")
+            return None
+        model_name, model_id, think_mode, err, extra = resolve_model(
+            raw or CONFIG["default_model"])
+        if err:
+            self.send_api_error(400, err, ERR_INVALID_REQUEST)
+            return None
+        echo = raw if isinstance(raw, str) and raw else model_name
+        return echo, model_name, model_id, think_mode, extra
+
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
-                self.send_json({"error": {"message": "invalid api key"}}, 401)
+            path = self._route_path()
+            if self._needs_auth(path) and not self._authorized():
+                self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST, "invalid_api_key")
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path in ("/v1/responses", "/responses"):
                 self._handle_responses(body)
-            elif ":streamGenerateContent" in self.path:
+            elif ":streamGenerateContent" in path:
                 self._handle_google_generate(body, stream=True)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path:
                 self._handle_google_generate(body, stream=False)
             else:
-                self.send_json({"error": "not found"}, 404)
+                self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
             log(f"POST error: {e}")
             try:
-                self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+                self.send_api_error(500, str(e), ERR_API)
+            except Exception:
                 pass
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
     def _handle_chat(self, body: bytes):
         req = self._parse_body(body)
-        if req is None:
-            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+        if not isinstance(req, dict):
+            self.send_api_error(400, "invalid JSON body", ERR_INVALID_REQUEST)
             return
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
-        if err:
-            self.send_json({"error": {"message": err}}, 400)
+        resolved = self._resolve_request_model(req)
+        if resolved is None:
+            return
+        echo_model, model_name, model_id, think_mode, extra = resolved
+
+        n = req.get("n", 1)
+        if isinstance(n, int) and n > 1:
+            self.send_api_error(400, "n>1 is not supported", ERR_INVALID_REQUEST, "unsupported_value")
             return
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
-        prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
+        messages = req.get("messages", [])
+        if not isinstance(messages, list):
+            self.send_api_error(400, "messages must be a list", ERR_INVALID_REQUEST)
+            return
+        prompt, images = messages_to_prompt(messages, tools, tool_choice)
+
+        rf_instruction = build_response_format_instruction(req.get("response_format"))
+        if rf_instruction:
+            prompt = prompt + rf_instruction
         if not prompt.strip():
-            self.send_json({"error": {"message": "empty prompt"}}, 400)
+            self.send_api_error(400, "empty prompt", ERR_INVALID_REQUEST)
             return
 
-        stream = req.get("stream", False)
+        stream = bool(req.get("stream", False))
+        stop_strings = _normalize_stop(req.get("stop"))
+        max_tokens = req.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = req.get("max_completion_tokens")
+        include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_api_error(502, f"upstream error: {e}", ERR_API)
             return
 
+        allowed_names = tool_names(tools) or None
+
+        # Pure streaming (no tools): stream tokens straight through.
         if stream and (not tools or tool_choice == "none"):
+            self._stream_chat(cid, echo_model, prompt, model_id, think_mode, file_refs,
+                              extra, stop_strings, max_tokens, include_usage)
+            return
+
+        # Tool calls need the full text. Retry once when a tool was required.
+        required_tool = tool_choice == "required" or (
+            isinstance(tool_choice, dict) and bool(tool_choice.get("function")))
+        attempts = 2 if (required_tool and not stream) else 1
+
+        text, tool_calls = "", None
+        for attempt in range(attempts):
+            call_prompt = prompt
+            if attempt > 0:
+                call_prompt = prompt + "\n\nIMPORTANT: Respond with a tool_call block ONLY."
             try:
-                self._start_sse()
-                first_chunk = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                        "finish_reason": None,
-                    }],
-                }
-                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-                    self.wfile.flush()
-                end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                text = generate(call_prompt, model_id, think_mode, file_refs, extra)
             except Exception as e:
-                log(f"Stream error: {e}")
+                if attempt + 1 < attempts:
+                    log(f"Tool retry after upstream error: {e}")
+                    continue
+                self.send_api_error(*_map_upstream_error(e))
+                return
+            tool_calls = None
+            if tools and text and tool_choice != "none":
+                text, tool_calls = parse_tool_calls(text, allowed_names)
+            if tool_calls or not required_tool:
+                break
+
+        if rf_instruction and text:
+            text = strip_code_fence(text)
+        text = _apply_stop(text, stop_strings)
+        text, truncated = _apply_max_tokens(text, max_tokens)
+
+        if not text and not tool_calls:
+            self.send_api_error(502, "empty response from upstream", ERR_API)
             return
 
-        try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
-        except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
-
-        tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
-        finish = "tool_calls" if tool_calls else "stop"
+        finish = "tool_calls" if tool_calls else ("length" if truncated else "stop")
 
         if stream:
-            self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
-            self.send_json({
-                "id": cid, "object": "chat.completion", "created": int(time.time()),
-                "model": model_name,
-                "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
-            })
+            try:
+                self._start_sse()
+                self._sse_chunk(cid, echo_model, {"role": "assistant"}, None)
+                if text:
+                    self._sse_chunk(cid, echo_model, {"content": text}, None)
+                for index, tc in enumerate(tool_calls or []):
+                    self._sse_chunk(cid, echo_model, {"tool_calls": [{"index": index, **tc}]}, None)
+                self._sse_chunk(cid, echo_model, {}, finish)
+                if include_usage:
+                    self._sse_usage(cid, echo_model, prompt, text)
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
 
-    # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
+        self.send_json({
+            "id": cid, "object": "chat.completion", "created": int(time.time()),
+            "model": echo_model,
+            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            "usage": _usage(prompt, text),
+        })
+
+    @staticmethod
+    def _iter_with_first(first, gen):
+        yield first
+        for delta in gen:
+            yield delta
+
+    def _stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
+                     extra, stop_strings, max_tokens, include_usage):
+        try:
+            gen = generate_stream(prompt, model_id, think_mode, file_refs, extra)
+            first = next(gen, _MISSING)
+        except Exception as e:
+            self.send_api_error(*_map_upstream_error(e))
+            return
+        if first is _MISSING:
+            self.send_api_error(502, "empty response from upstream", ERR_API)
+            return
+
+        self._start_sse()
+        self._sse_chunk(cid, model, {"role": "assistant"}, None)
+        full_text = ""
+        finish = "stop"
+        hold = max((len(s) for s in stop_strings), default=0)
+        buf = ""
+        try:
+            for raw in self._iter_with_first(first, gen):
+                if not raw:
+                    continue
+                buf += raw
+                hit = None
+                for s in stop_strings:
+                    idx = buf.find(s)
+                    if idx != -1 and (hit is None or idx < hit):
+                        hit = idx
+                if hit is not None:
+                    piece = buf[:hit]
+                    if piece:
+                        full_text += piece
+                        self._sse_chunk(cid, model, {"content": piece}, None)
+                    buf = ""
+                    break
+                if max_tokens and (len(full_text) + len(buf)) >= max_tokens * 4:
+                    allowed = max(0, max_tokens * 4 - len(full_text))
+                    piece = buf[:allowed]
+                    if piece:
+                        full_text += piece
+                        self._sse_chunk(cid, model, {"content": piece}, None)
+                    buf = ""
+                    finish = "length"
+                    break
+                if len(buf) > hold:
+                    piece = buf[:len(buf) - hold] if hold else buf
+                    buf = buf[-hold:] if hold else ""
+                    if piece:
+                        full_text += piece
+                        self._sse_chunk(cid, model, {"content": piece}, None)
+            else:
+                if buf:
+                    full_text += buf
+                    self._sse_chunk(cid, model, {"content": buf}, None)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as e:
+            log(f"Stream error: {e}")
+            try:
+                self._sse_event_error(*_map_upstream_error(e))
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        finally:
+            close = getattr(gen, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        self._sse_chunk(cid, model, {}, finish)
+        if include_usage:
+            self._sse_usage(cid, model, prompt, full_text)
+        self._sse_done()
+
+# ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
+
+    def _normalize_responses_tools(self, tools):
+        if not tools:
+            return None
+        normalized = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function":
+                fn = tool.get("function", tool)
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if not name:
+                    log("Responses: ignoring function tool without a name")
+                    continue
+                normalized.append({"type": "function", "function": {
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }})
+            else:
+                log(f"Responses: ignoring unsupported tool type '{tool.get('type')}'")
+        return normalized or None
+
+    def _responses_messages(self, input_items, instructions):
+        messages = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+        if isinstance(input_items, str):
+            messages.append({"role": "user", "content": input_items})
+            return messages
+        if not isinstance(input_items, list):
+            return messages
+        for item in input_items:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "function_call_output":
+                output = item.get("output", "")
+                if isinstance(output, list):
+                    output = "\n".join(
+                        c.get("text", "") for c in output
+                        if isinstance(c, dict) and c.get("type") in ("output_text", "text")
+                    )
+                messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
+                                 "content": output})
+            elif itype == "function_call":
+                call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                call = {"id": call_id, "type": "function",
+                        "function": {"name": item.get("name", ""),
+                                     "arguments": item.get("arguments", "")}}
+                if messages and messages[-1].get("role") == "assistant" \
+                        and messages[-1].get("tool_calls"):
+                    messages[-1]["tool_calls"].append(call)
+                else:
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+            elif itype in ("input_text", "input_image", "image"):
+                messages.append({"role": "user", "content": [item]})
+            elif item.get("role") == "assistant":
+                content_parts = item.get("content", [])
+                text_acc, tc_list = "", []
+                if isinstance(content_parts, list):
+                    for c in content_parts:
+                        if isinstance(c, dict):
+                            if c.get("type") == "output_text":
+                                text_acc += c.get("text", "")
+                            elif c.get("type") == "function_call":
+                                tc_list.append(c)
+                elif isinstance(content_parts, str):
+                    text_acc = content_parts
+                message = {"role": "assistant", "content": text_acc or None}
+                if tc_list:
+                    message["tool_calls"] = [
+                        {"id": tc.get("call_id", f"call_{i}"), "type": "function",
+                         "function": {"name": tc.get("name", ""),
+                                      "arguments": tc.get("arguments", "{}")}}
+                        for i, tc in enumerate(tc_list)
+                    ]
+                messages.append(message)
+            else:
+                role = item.get("role", "user")
+                if role == "developer":
+                    role = "system"
+                messages.append({"role": role, "content": item.get("content", "")})
+        return messages
 
     def _handle_responses(self, body: bytes):
         req = self._parse_body(body)
-        if req is None:
-            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+        if not isinstance(req, dict):
+            self.send_api_error(400, "invalid JSON body", ERR_INVALID_REQUEST)
             return
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(
-            req.get("model", CONFIG["default_model"]))
-        if err:
-            self.send_json({"error": {"message": err}}, 400)
+        resolved = self._resolve_request_model(req)
+        if resolved is None:
             return
+        echo_model, model_name, model_id, think_mode, extra = resolved
 
-        input_items = req.get("input", [])
-        tools = req.get("tools")
-        messages = []
-        if req.get("instructions"):
-            messages.append({"role": "system", "content": req["instructions"]})
-        if isinstance(input_items, str):
-            messages.append({"role": "user", "content": input_items})
-        elif isinstance(input_items, list):
-            for item in input_items:
-                if isinstance(item, str):
-                    messages.append({"role": "user", "content": item})
-                elif isinstance(item, dict):
-                    if item.get("type") == "function_call_output":
-                        messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
-                                         "name": item.get("name", ""), "content": item.get("output", "")})
-                    elif item.get("type") in ("input_text", "input_image", "image"):
-                        messages.append({"role": "user", "content": [item]})
-                    elif item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant"):
-                        cp = item.get("content", [])
-                        text_acc, tc_list = "", []
-                        if isinstance(cp, list):
-                            for c in cp:
-                                if isinstance(c, dict):
-                                    if c.get("type") == "output_text":
-                                        text_acc += c.get("text", "")
-                                    elif c.get("type") == "function_call":
-                                        tc_list.append(c)
-                        elif isinstance(cp, str):
-                            text_acc = cp
-                        m = {"role": "assistant", "content": text_acc or None}
-                        if tc_list:
-                            m["tool_calls"] = [{"id": tc.get("call_id", f"call_{i}"), "type": "function",
-                                                "function": {"name": tc.get("name",""), "arguments": tc.get("arguments","{}")}}
-                                               for i, tc in enumerate(tc_list)]
-                        messages.append(m)
-                    else:
-                        role = item.get("role", "user")
-                        messages.append({"role": role, "content": item.get("content", "")})
-
-        if tools:
-            tools = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("parameters", {})}}
-                     if t.get("type") == "function" and "function" not in t else t for t in tools]
-
+        tools = self._normalize_responses_tools(req.get("tools"))
+        messages = self._responses_messages(req.get("input", []), req.get("instructions"))
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
+
+        rf_instruction = build_response_format_instruction(req.get("response_format"))
+        if rf_instruction:
+            prompt = prompt + rf_instruction
         if not prompt.strip():
-            self.send_json({"error": {"message": "empty input"}}, 400)
+            self.send_api_error(400, "empty input", ERR_INVALID_REQUEST)
             return
 
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_api_error(*_map_upstream_error(e))
             return
 
+        allowed_names = tool_names(tools) or None
         tool_calls = None
         if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+            text, tool_calls = parse_tool_calls(text, allowed_names)
+        if rf_instruction and text:
+            text = strip_code_fence(text)
+        if not text and not tool_calls:
+            self.send_api_error(502, "empty response from upstream", ERR_API)
+            return
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -340,10 +667,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if tool_calls:
             for tc in tool_calls:
                 output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
-                               "name": tc["function"]["name"], "arguments": tc["function"]["arguments"], "status": "completed"})
+                               "name": tc["function"]["name"],
+                               "arguments": tc["function"]["arguments"], "status": "completed"})
         if text or not tool_calls:
-            output.append({"type": "message", "id": mid, "role": "assistant", "status": "completed",
-                           "content": [{"type": "output_text", "text": text or "", "annotations": []}]})
+            output.append({"type": "message", "id": mid, "role": "assistant",
+                           "status": "completed",
+                           "content": [{"type": "output_text", "text": text or "",
+                                        "annotations": []}]})
 
         if req.get("stream"):
             self._start_sse()
@@ -352,14 +682,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             def emit(event_type, **fields):
                 nonlocal sequence_number
                 sequence_number += 1
-                event = {
-                    "type": event_type,
-                    "sequence_number": sequence_number,
-                    **fields,
-                }
-                self.wfile.write(
-                    f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode()
-                )
+                event = {"type": event_type, "sequence_number": sequence_number, **fields}
+                self.wfile.write(f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode())
 
             usage = {
                 "input_tokens": len(prompt) // 4,
@@ -367,136 +691,66 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "total_tokens": (len(prompt) + len(text or "")) // 4,
             }
             base_response = {
-                "id": rid,
-                "object": "response",
-                "created_at": int(time.time()),
-                "model": model_name,
+                "id": rid, "object": "response",
+                "created_at": int(time.time()), "model": echo_model,
             }
-            emit(
-                "response.created",
-                response={
-                    **base_response,
-                    "status": "in_progress",
-                    "output": [],
-                    "usage": None,
-                },
-            )
-            emit(
-                "response.in_progress",
-                response={
-                    **base_response,
-                    "status": "in_progress",
-                    "output": [],
-                    "usage": None,
-                },
-            )
+            emit("response.created", response={
+                **base_response, "status": "in_progress", "output": [], "usage": None})
+            emit("response.in_progress", response={
+                **base_response, "status": "in_progress", "output": [], "usage": None})
             for output_index, item in enumerate(output):
                 if item["type"] == "function_call":
                     pending_item = {
-                        "type": "function_call",
-                        "id": item["id"],
-                        "call_id": item["call_id"],
-                        "name": item["name"],
-                        "arguments": "",
-                        "status": "in_progress",
+                        "type": "function_call", "id": item["id"], "call_id": item["call_id"],
+                        "name": item["name"], "arguments": "", "status": "in_progress",
                     }
-                    emit(
-                        "response.output_item.added",
-                        output_index=output_index,
-                        item=pending_item,
-                    )
-                    emit(
-                        "response.function_call_arguments.delta",
-                        item_id=item["id"],
-                        output_index=output_index,
-                        delta=item["arguments"],
-                    )
-                    emit(
-                        "response.function_call_arguments.done",
-                        item_id=item["id"],
-                        output_index=output_index,
-                        arguments=item["arguments"],
-                    )
-                    emit(
-                        "response.output_item.done",
-                        output_index=output_index,
-                        item=item,
-                    )
+                    emit("response.output_item.added", output_index=output_index, item=pending_item)
+                    emit("response.function_call_arguments.delta", item_id=item["id"],
+                         output_index=output_index, delta=item["arguments"])
+                    emit("response.function_call_arguments.done", item_id=item["id"],
+                         output_index=output_index, arguments=item["arguments"])
+                    emit("response.output_item.done", output_index=output_index, item=item)
                 elif item["type"] == "message":
                     pending_item = {
-                        "type": "message",
-                        "id": item["id"],
-                        "role": "assistant",
-                        "status": "in_progress",
-                        "content": [],
+                        "type": "message", "id": item["id"], "role": "assistant",
+                        "status": "in_progress", "content": [],
                     }
-                    emit(
-                        "response.output_item.added",
-                        output_index=output_index,
-                        item=pending_item,
-                    )
+                    emit("response.output_item.added", output_index=output_index, item=pending_item)
                     for content_index, content_part in enumerate(item["content"]):
-                        event_fields = {
-                            "item_id": item["id"],
-                            "output_index": output_index,
-                            "content_index": content_index,
-                        }
-                        emit(
-                            "response.content_part.added",
-                            **event_fields,
-                            part={
-                                "type": "output_text",
-                                "text": "",
-                                "annotations": [],
-                            },
-                        )
-                        emit(
-                            "response.output_text.delta",
-                            **event_fields,
-                            delta=content_part["text"],
-                        )
-                        emit(
-                            "response.output_text.done",
-                            **event_fields,
-                            text=content_part["text"],
-                        )
-                        emit(
-                            "response.content_part.done",
-                            **event_fields,
-                            part=content_part,
-                        )
-                    emit(
-                        "response.output_item.done",
-                        output_index=output_index,
-                        item=item,
-                    )
-            emit(
-                "response.completed",
-                response={
-                    **base_response,
-                    "status": "completed",
-                    "output": output,
-                    "usage": usage,
-                },
-            )
+                        event_fields = {"item_id": item["id"], "output_index": output_index,
+                                        "content_index": content_index}
+                        emit("response.content_part.added", **event_fields, part={
+                            "type": "output_text", "text": "", "annotations": []})
+                        emit("response.output_text.delta", **event_fields,
+                             delta=content_part["text"])
+                        emit("response.output_text.done", **event_fields,
+                             text=content_part["text"])
+                        emit("response.content_part.done", **event_fields, part=content_part)
+                    emit("response.output_item.done", output_index=output_index, item=item)
+            emit("response.completed", response={
+                **base_response, "status": "completed", "output": output, "usage": usage})
             self.wfile.flush()
         else:
-            self.send_json({"id": rid, "object": "response", "created_at": int(time.time()), "status": "completed",
-                            "model": model_name, "output": output,
-                            "usage": {"input_tokens": len(prompt)//4, "output_tokens": len(text or "")//4, "total_tokens": (len(prompt)+len(text or ""))//4}})
+            self.send_json({
+                "id": rid, "object": "response", "created_at": int(time.time()),
+                "status": "completed", "model": echo_model, "output": output,
+                "usage": {"input_tokens": len(prompt) // 4,
+                          "output_tokens": len(text or "") // 4,
+                          "total_tokens": (len(prompt) + len(text or "")) // 4},
+            })
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 
     def _handle_google_generate(self, body: bytes, stream: bool):
         req = self._parse_body(body)
-        if req is None:
-            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+        if not isinstance(req, dict):
+            self.send_google_error(400, "invalid JSON", "INVALID_ARGUMENT")
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err, extra_fields = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra = resolve_model(model_name)
         if err:
-            self.send_json({"error": {"message": err}}, 400)
+            self.send_google_error(400, err, "INVALID_ARGUMENT")
             return
 
         tool_config = req.get("toolConfig", {})
@@ -504,29 +758,40 @@ class GeminiHandler(BaseHTTPRequestHandler):
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
         prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
-            self.send_json({"error": {"message": "empty content"}}, 400)
+            self.send_google_error(400, "empty content", "INVALID_ARGUMENT")
             return
 
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_google_error(502, f"upstream error: {e}", "UNAVAILABLE")
             return
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
 
         if stream and not has_tools:
             try:
+                gen = generate_stream(prompt, model_id, think_mode, file_refs, extra)
+                first = next(gen, _MISSING)
+            except Exception as e:
+                self.send_google_error(*_map_google_error(e))
+                return
+            if first is _MISSING:
+                self.send_google_error(502, "empty response from upstream", "UNAVAILABLE")
+                return
+            try:
                 self._start_sse()
                 full_text = ""
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
+                for delta in self._iter_with_first(first, gen):
                     if not delta:
                         continue
                     full_text += delta
                     chunk_obj = {
-                        "candidates": [{"content": {"parts": [{"text": delta}], "role": "model"}, "index": 0}],
+                        "candidates": [{"content": {"parts": [{"text": delta}],
+                                                    "role": "model"}, "index": 0}],
                         "modelVersion": model_name,
                     }
-                    self.wfile.write(f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.write(
+                        f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
                     self.wfile.flush()
                 final_chunk = {
                     "candidates": [{"finishReason": "STOP", "index": 0}],
@@ -543,19 +808,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 log(f"Google stream error: {e}")
+            finally:
+                close = getattr(gen, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            text = generate(prompt, model_id, think_mode, file_refs, extra)
         except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+            self.send_google_error(*_map_google_error(e))
             return
 
         if not text:
-            log("Warning: empty response from Gemini")
+            self.send_google_error(502, "empty response from upstream", "UNAVAILABLE")
+            return
 
         response_parts = []
-        if has_tools and text:
+        if has_tools:
             clean_text, function_calls = parse_google_function_calls(text)
             if function_calls:
                 if clean_text:
@@ -565,7 +838,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             else:
                 response_parts.append({"text": text})
         else:
-            response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
+            response_parts.append({"text": text})
 
         candidate = {
             "content": {"parts": response_parts, "role": "model"},
@@ -574,8 +847,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         }
         usage = {
             "promptTokenCount": len(prompt) // 4,
-            "candidatesTokenCount": len(text or "") // 4,
-            "totalTokenCount": (len(prompt) + len(text or "")) // 4,
+            "candidatesTokenCount": len(text) // 4,
+            "totalTokenCount": (len(prompt) + len(text)) // 4,
         }
         response_obj = {
             "candidates": [candidate],

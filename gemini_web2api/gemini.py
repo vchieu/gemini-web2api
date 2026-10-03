@@ -5,6 +5,7 @@ import uuid
 import re
 import urllib.request
 import urllib.parse
+import urllib.error
 import ssl
 import os
 import hashlib
@@ -27,6 +28,50 @@ def log(msg: str):
         import sys
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
+
+
+class GeminiError(Exception):
+    """Upstream error carrying an optional HTTP status code."""
+
+    def __init__(self, message: str, status: int = None):
+        super().__init__(message)
+        self.status = status
+
+
+def fetch_latest_bl():
+    """Fetch the latest gemini_bl build label from gemini.google.com."""
+    try:
+        req = urllib.request.Request(
+            "https://gemini.google.com/app",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        ctx = _get_ssl_ctx()
+        proxy = CONFIG.get("proxy")
+        if proxy:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
+                urllib.request.HTTPSHandler(context=ctx),
+            )
+            resp = opener.open(req, timeout=15)
+        else:
+            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
+        html = resp.read().decode("utf-8", errors="replace")
+        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        if m:
+            return m.group(1)
+    except Exception as e:
+        log(f"BL auto-update fetch failed: {e}")
+    return None
+
+
+def update_bl_if_needed() -> bool:
+    """Fetch and update gemini_bl when a newer build label is available."""
+    new_bl = fetch_latest_bl()
+    if new_bl and new_bl != CONFIG["gemini_bl"]:
+        log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
+        CONFIG["gemini_bl"] = new_bl
+        return True
+    return False
 
 
 def _get_ssl_ctx():
@@ -203,15 +248,16 @@ def extract_response_text(raw: str) -> str:
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
-    """Non-streaming generation with retry."""
+    """Non-streaming generation with BL-aware retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
-    url = _get_url()
-    headers = _build_headers()
     ctx = _get_ssl_ctx()
     proxy = CONFIG.get("proxy")
 
     last_err = None
+    bl_refreshed = False
     for attempt in range(CONFIG["retry_attempts"]):
+        url = _get_url()
+        headers = _build_headers()
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -224,16 +270,31 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
+        except urllib.error.HTTPError as e:
+            last_err = GeminiError(f"HTTP {e.code} from Gemini upstream", status=e.code)
+            # A stale BL build label manifests as 405/404: refresh and retry once.
+            if e.code in (404, 405) and not bl_refreshed and update_bl_if_needed():
+                bl_refreshed = True
+                log("BL updated after upstream error, retrying")
+                continue
+            # Client errors will not succeed on retry.
+            if e.code in (400, 401, 403, 404, 405):
+                break
         except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            last_err = GeminiError(str(e))
+        if attempt < CONFIG["retry_attempts"] - 1:
+            log(f"Retry {attempt + 1}/{CONFIG['retry_attempts']}: {last_err}")
+            time.sleep(CONFIG["retry_delay_sec"])
     raise last_err
 
 
 def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
-    """Streaming generation via httpx with retry on connection failure."""
+    """Streaming generation via httpx with BL-aware retry.
+
+    Text is buffered while a Markdown code fence is open so that upstream
+    scaffolding blocks (````python?code_...````) are always stripped whole, even
+    when they straddle two network chunks.
+    """
     if not HAS_HTTPX:
         text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         if text:
@@ -241,13 +302,16 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         return
 
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields)
-    url = _get_url()
-    headers = _build_headers()
     client = _get_httpx_client()
 
     last_err = None
-    emitted_raw_text = ""
+    bl_refreshed = False
     for attempt in range(CONFIG["retry_attempts"]):
+        url = _get_url()
+        headers = _build_headers()
+        emitted_raw_text = ""
+        clean_buf = ""
+        emitted_any = False
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
@@ -267,14 +331,36 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 continue
                             if not t.startswith(emitted_raw_text):
                                 raise RuntimeError("Gemini stream content changed during retry")
-                            delta = clean_text(t[len(emitted_raw_text):], strip=False)
+                            clean_buf += t[len(emitted_raw_text):]
                             emitted_raw_text = t
+                            if clean_buf.count("```") % 2 == 1:
+                                # Inside an open code fence: hold back until it closes.
+                                continue
+                            delta = clean_text(clean_buf, strip=False)
+                            clean_buf = ""
                             if delta:
+                                emitted_any = True
                                 yield delta
+            if clean_buf:
+                delta = clean_text(clean_buf, strip=False)
+                if delta:
+                    yield delta
             return
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code if e.response is not None else None
+            last_err = GeminiError(f"HTTP {status} from Gemini upstream", status=status)
+            if status in (404, 405) and not bl_refreshed and update_bl_if_needed():
+                bl_refreshed = True
+                log("BL updated after upstream error, retrying stream")
+                continue
+            if status in (400, 401, 403, 404, 405):
+                raise last_err
         except Exception as e:
-            last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {e}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            last_err = GeminiError(str(e))
+            # Never retry once partial content has been sent to the client.
+            if emitted_any:
+                raise last_err
+        if attempt < CONFIG["retry_attempts"] - 1:
+            log(f"Stream retry {attempt + 1}/{CONFIG['retry_attempts']}: {last_err}")
+            time.sleep(CONFIG["retry_delay_sec"])
     raise last_err

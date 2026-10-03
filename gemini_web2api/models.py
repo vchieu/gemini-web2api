@@ -50,6 +50,8 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
     since upstream clients may request arbitrary model identifiers.
     """
     think_override = None
+    if not isinstance(model_name, str) or not model_name:
+        model_name = default
     if "@think=" in model_name:
         model_name, think_str = model_name.rsplit("@think=", 1)
         try:

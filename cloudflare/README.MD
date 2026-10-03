@@ -154,7 +154,7 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 |--------|------|--------|
 | `RETRY_ATTEMPTS` | 重试次数 | `3` |
 | `RETRY_DELAY_SEC` | 重试间隔（秒） | `2` |
-| `REQUEST_TIMEOUT_SEC` | 请求超时（秒） | `28` |
+| `REQUEST_TIMEOUT_SEC` | 请求超时（秒） | `180` |
 | `FINGERPRINT_JITTER_MS` | 随机延迟最大值（毫秒） | `1500` |
 | `RATE_LIMIT_MAX` | 速率限制最大请求数 | `3000` |
 | `RATE_LIMIT_WINDOW` | 速率限制时间窗口（秒） | `60` |
