@@ -8,3 +8,6 @@ cookie.json
 .idea
 .DS_Store
 gemini-auth.json
+
+# Local working plan -- documentation for the fix, not part of the source.
+KE_HOACH_SUA_TOOL_CALLING.md
