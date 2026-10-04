@@ -938,7 +938,10 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(generate.call_count, 2)
-        self.assertIn("tool_call block ONLY", generate.call_args_list[1].args[0])
+        # Conditional, not "block ONLY": this is a heuristic retry, so a
+        # finished answer must still be allowed to stand as prose.
+        self.assertIn("Do not describe a tool call",
+                      generate.call_args_list[1].args[0])
         choice = json.loads(body)["choices"][0]
         self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "read")
         self.assertEqual(choice["finish_reason"], "tool_calls")
@@ -1428,6 +1431,44 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(calls, [])
         self.assertIn('"read"', clean)
 
+    def test_a_literal_newline_inside_a_string_argument_survives(self):
+        """``write`` payloads are file bodies, and files are multi-line.
+
+        Strict JSON rejects a raw control character inside a string, so the
+        whole block used to be reported as "not valid JSON" and the call
+        silently turned into prose. The value handed on must come back escaped.
+        """
+        text = (
+            '```tool_call\n'
+            '{"name": "write", "arguments": '
+            '{"path": "a.md", "content": "# Test\n- one\n- two"}}'
+            '\n```'
+        )
+
+        clean, calls = parse_tool_calls(text, allowed_names={"write"})
+
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("tool_call", clean)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["content"], "# Test\n- one\n- two")
+
+    def test_a_literal_newline_inside_a_string_arguments_value_survives(self):
+        """The same, one level down: ``arguments`` handed over as a string."""
+        text = (
+            '```tool_call\n'
+            '{"name": "write", "arguments": '
+            '"{\\"path\\": \\"a.md\\", \\"content\\": \\"x\ny\\"}"}'
+            '\n```'
+        )
+
+        _, calls = parse_tool_calls(text, allowed_names={"write"})
+
+        self.assertEqual(len(calls), 1)
+        # Re-serialised, so the client gets valid JSON rather than the raw
+        # newline it would choke on.
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["content"], "x\ny")
+
 
 class MissedToolCallDetectionTests(unittest.TestCase):
     """Giai đoạn 4 heuristics: when is prose a stalled first turn?"""
@@ -1547,6 +1588,61 @@ class PendingToolRequestTests(unittest.TestCase):
                     "name": "glob",
                     "arguments": '{"path": "src", "pattern": "**/*"}'}}]},
             {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+        ]))
+
+    def test_runtime_names_are_not_mistaken_for_files(self):
+        """`Node.js` matches the ``.js`` pattern but no tool ever opens it.
+
+        Without the exclusion, every turn that mentions a runtime would be
+        reported as owed a read that can never happen, and each of those turns
+        would be retried.
+        """
+        for msg in ("Cai dat Node.js roi chay du an.",
+                    "Du an nay dung Next.js va Vue.js.",
+                    "Minh da dung Express.js truoc do."):
+            with self.subTest(msg=msg):
+                self.assertIsNone(pending_tool_request([{"role": "user",
+                                                         "content": msg}]))
+
+    def test_the_same_file_spelled_differently_counts_as_read(self):
+        """Users type ``readme.md``; ``read`` is handed ``README.md``.
+
+        The two name one file -- on Windows, literally -- so a case-sensitive
+        difference must not look like an unread request. The turn ends on a
+        user message so the tool-call guard cannot answer this by itself.
+        """
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "Doc readme.md truoc."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "read",
+                             "arguments": '{"path": "README.md"}'}}]},
+            {"role": "tool", "content": "# README ...", "tool_call_id": "c1"},
+            {"role": "user", "content": "Doc readme.md roi tong ket nhe."},
+        ]))
+
+    def test_a_tool_call_this_turn_ends_the_check(self):
+        """After the model has acted, whatever it writes is a real answer.
+
+        Even if it names a file that call did not spell out -- the summary of
+        a review legitimately mentions files it never listed -- chasing it
+        would replace a finished answer with the retry's output.
+        """
+        self.assertIsNone(pending_tool_request([
+            {"role": "user",
+             "content": "Review README.md va server.py trong du an."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "read",
+                             "arguments": '{"path": "README.md"}'}}]},
+            {"role": "tool", "content": "# README ...", "tool_call_id": "c1"},
+            {"role": "user", "content": "Tiep tuc review server.py di."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c2", "type": "function",
+                "function": {"name": "glob",
+                             "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "server.py\nmodels.py",
+             "tool_call_id": "c2"},
         ]))
 
     def test_plain_chitchat_and_empty_input_report_nothing(self):

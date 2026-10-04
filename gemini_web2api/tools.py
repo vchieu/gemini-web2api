@@ -502,12 +502,24 @@ def _arguments_json(args) -> tuple:
         text = args.strip()
         if not text:
             return "{}", "empty string"
+        parsed = _NOTHING
+        strict_ok = True
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, ValueError):
-            parsed = _NOTHING
+            strict_ok = False
+            # Same leniency as _iter_tool_blocks: a string argument holding a
+            # file body can contain a literal newline. It is re-serialised
+            # below because the original text would reach the client with the
+            # newline still unescaped, i.e. as invalid JSON.
+            try:
+                parsed = json.loads(text, strict=False)
+            except (json.JSONDecodeError, ValueError):
+                parsed = _NOTHING
         if isinstance(parsed, dict):
-            return text, None
+            if strict_ok:
+                return text, None
+            return json.dumps(parsed, ensure_ascii=False), None
         # Models occasionally hand back a Python literal instead of JSON.
         try:
             recovered = ast.literal_eval(text)
@@ -530,7 +542,7 @@ def _arguments_dict(data: dict) -> dict:
         return args
     text, _ = _arguments_json(args)
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(text, strict=False)
     except (json.JSONDecodeError, ValueError):
         parsed = None
     return parsed if isinstance(parsed, dict) else {}
@@ -573,8 +585,15 @@ def _iter_tool_blocks(text: str):
     ``data`` is ``_NOTHING`` for a block that declares a tool-call fence but
     whose body is not valid JSON; it is yielded anyway so the caller can log the
     drop rather than silently leaving it in the text.
+
+    The decoder runs non-strict: ``write``/``edit`` payloads carry the body of
+    a file, and a model that pastes a multi-line string writes the newline
+    itself instead of escaping it. Strict JSON rejects that, so the whole call
+    would be reported as "not valid JSON" -- the tool call silently becomes
+    prose. ``json.dumps`` re-escapes the string on the way out, so what is
+    handed to the client is well-formed again.
     """
-    dec = json.JSONDecoder()
+    dec = json.JSONDecoder(strict=False)
     pos = 0
     while True:
         m = _FENCE_OPEN.search(text, pos)
@@ -780,6 +799,16 @@ _FILE_REF_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Names that end in a source extension but are runtimes, frameworks or
+# libraries rather than files. `Node.js` and friends would otherwise look like
+# an unread file for every turn that mentions them -- no tool call ever
+# "opens" them, so the request would be retried until the conversation ends.
+_NON_FILE_NAMES = frozenset({
+    "node.js", "node.mjs", "node.cjs", "next.js", "nuxt.js", "vue.js",
+    "react.js", "react-dom.js", "express.js", "jquery.js", "d3.js",
+    "three.js", "ember.js", "backbone.js", "socket.js", "deno.js",
+})
+
 # "dùng tool", "đọc file", "review source", "use the tool", ... -- whitespace
 # is stripped before matching because folding Vietnamese silently glues words
 # together ("sử dụng" -> "sudung") while other clients leave the space.
@@ -800,28 +829,21 @@ def _files_in(*chunks) -> set:
     return {m.group(0) for m in _FILE_REF_RE.finditer(blob)}
 
 
-def _conversation_tool_use(messages) -> tuple:
-    """``(file names any tool call touched, whether any tool call happened)``.
-
-    These are deliberately separate: ``glob {"pattern": "**/*"}`` proves the
-    model is acting but names no file, so answering "no tool call ever touched
-    README.md" must not be confused with "the model has not used a tool".
-    """
+def _conversation_called_files(messages) -> set:
+    """Every file name any tool call in this conversation has touched."""
     called = set()
-    used_any = False
     for msg in messages or []:
         if not isinstance(msg, dict):
             continue
         for tc in (msg.get("tool_calls") or []):
             if not isinstance(tc, dict):
                 continue
-            used_any = True
             fn = tc.get("function") or {}
             args = fn.get("arguments")
             if not isinstance(args, str):
                 args = json.dumps(args, ensure_ascii=False)
             called |= _files_in(str(fn.get("name") or ""), args)
-    return called, used_any
+    return called
 
 
 def pending_tool_request(messages) -> str:
@@ -831,13 +853,22 @@ def pending_tool_request(messages) -> str:
     where the user asks about ``README.md`` and the model replies as if it had
     opened it, without ever emitting a block. The reply contains no fence, no
     refusal and nothing grammatically wrong, so the response-side heuristic
-    above never fires; the only thing that is provably false is that no tool
-    call in the whole conversation has touched the file being discussed.
+    above never fires; the only thing provably false is that no tool call in
+    the whole conversation has touched the file being discussed.
 
     Two independent shapes are reported: a file the newest user turn names
-    that nothing has read, and a turn that demands tool use while the
-    conversation contains no tool call at all (the second covers requests
-    with no file to name -- "review source code", say).
+    that nothing has read, and a turn that demands tool use without one
+    (covering requests with no file to name -- "review source code", say).
+
+    Two guards keep this from burning a call on every finished answer:
+
+    * a tool call made *this turn* ends the search. The text that follows is
+      built on a real result, even when it names a file the call did not spell
+      out, and replacing a completed summary with the retry's output is how a
+      valid answer turns into a tool call nobody asked for;
+    * names are compared case-insensitively, because ``readme.md`` typed by
+      the user and ``README.md`` passed to ``read`` are the same file -- and
+      on Windows they usually are literally.
 
     Opencode treats such a reply as the final answer and stops, so one turn of
     this ends the session with an answer invented from the filename alone.
@@ -845,21 +876,31 @@ def pending_tool_request(messages) -> str:
     if not isinstance(messages, list):
         return None
 
+    last_user_idx = -1
     last_user = None
-    for msg in messages:
+    for i, msg in enumerate(messages):
         if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user_idx = i
             last_user = _stringify_content(msg.get("content", ""))
 
-    called, used_any_tool = _conversation_tool_use(messages)
-    if last_user:
-        uncovered = _files_in(last_user) - called
-        if uncovered:
-            return "requested file(s) never read: " + ", ".join(sorted(uncovered))
+    # A tool call after the newest user message means this turn already acted.
+    if any(isinstance(msg, dict) and msg.get("tool_calls")
+           for msg in messages[last_user_idx + 1:]):
+        return None
+    if not last_user:
+        return None
 
-    if last_user and not used_any_tool:
-        folded = _fold_diacritics(last_user).replace(" ", "").replace("\n", "")
-        if _TOOL_DEMAND_RE.search(folded):
-            return "user demanded tool use and none happened"
+    called_lower = {f.lower() for f in _conversation_called_files(messages)}
+    uncovered = sorted(
+        f for f in _files_in(last_user)
+        if f.lower() not in called_lower and f.lower() not in _NON_FILE_NAMES
+    )
+    if uncovered:
+        return "requested file(s) never read: " + ", ".join(uncovered)
+
+    folded = _fold_diacritics(last_user).replace(" ", "").replace("\n", "")
+    if _TOOL_DEMAND_RE.search(folded):
+        return "user demanded tool use and none happened"
     return None
 
 

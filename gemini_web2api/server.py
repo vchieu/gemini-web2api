@@ -536,7 +536,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         for attempt in range(attempts):
             call_prompt = prompt
             if attempt > 0:
-                call_prompt = prompt + "\n\nIMPORTANT: Respond with a tool_call block ONLY."
+                # "tool_call block ONLY" is right when the client demands a
+                # call, but on a heuristic retry it would rewrite a finished
+                # summary into a call nobody asked for -- and an agent happily
+                # runs that, then asks again. Conditional wording still pushes
+                # an acting model to act while letting a genuine answer stand.
+                call_prompt = prompt + "\n\n" + (
+                    "IMPORTANT: Respond with a tool_call block ONLY."
+                    if required_tool else
+                    "IMPORTANT: Do not describe a tool call -- make it. If "
+                    "answering requires reading or changing something, call "
+                    "the tool now; otherwise give your final answer."
+                )
             try:
                 raw = generate(call_prompt, model_id, think_mode, file_refs, extra)
             except Exception as e:
