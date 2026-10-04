@@ -49,6 +49,25 @@ class GeminiError(Exception):
         self.status = status
 
 
+def _dump_raw(raw: str):
+    """Write one unfiltered upstream response to ``debug_raw_file``.
+
+    ``generate()`` only ever hands back the extracted text, so the shape of the
+    raw payload (how many elements ``inner[4]`` holds, which one is thinking vs
+    answer vs tool call) is invisible from the logs. Enabled by
+    ``CONFIG["debug_raw"]``; failures are silent because this is diagnostics.
+    """
+    path = CONFIG.get("debug_raw_file") or "gemini-raw.log"
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] "
+                     f"{len(raw)} bytes =====\n")
+            fh.write(raw)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
 def fetch_latest_bl():
     """Fetch the latest gemini_bl build label from gemini.google.com."""
     try:
@@ -333,6 +352,8 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             else:
                 resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
+            if CONFIG.get("debug_raw"):
+                _dump_raw(raw)
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
             last_err = GeminiError(f"HTTP {e.code} from Gemini upstream", status=e.code)

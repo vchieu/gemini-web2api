@@ -15,9 +15,13 @@ from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
     google_contents_to_prompt,
+    is_required_tool_choice,
+    looks_like_missed_tool_call,
+    looks_like_upstream_error,
     messages_to_prompt,
     parse_google_function_calls,
     parse_tool_calls,
+    pending_tool_request,
 )
 
 
@@ -899,6 +903,262 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(response.status, 500)
         self.assertEqual(json.loads(body)["error"]["type"], "api_error")
 
+    # ── Giai đoạn 4: retry when the model talks instead of acting ──
+
+    _READ_TOOL = [{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}},
+                           "required": ["path"]},
+        },
+    }]
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_retries_when_model_announces_a_tool_it_never_calls(self, generate):
+        """A reply that says "let me read..." and stops is not an answer.
+
+        The client sees prose with no tool_calls and treats the turn as final,
+        so the session dies after one step. One retry with a hard instruction
+        is enough to recover it.
+        """
+        generate.side_effect = [
+            "Dung tool read de minh doc file README:",
+            '```tool_call\n{"name": "read", "arguments": {"path": "README.md"}}\n```',
+        ]
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "doc README"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("tool_call block ONLY", generate.call_args_list[1].args[0])
+        choice = json.loads(body)["choices"][0]
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "read")
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+
+    @mock.patch("gemini_web2api.server.generate",
+                return_value="Da tao file xong, ban can gi nua khong?")
+    def test_chat_does_not_retry_an_ordinary_short_answer(self, generate):
+        """A genuine short reply must not cost a second upstream call."""
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "tao file"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(json.loads(body)["choices"][0]["finish_reason"], "stop")
+
+    @mock.patch("gemini_web2api.server.generate",
+                return_value="Dung tool read de minh doc file:")
+    def test_chat_retry_can_be_switched_off(self, generate):
+        CONFIG["tool_retry_on_miss"] = False
+
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "doc README"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 1)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_retries_when_the_model_answers_about_an_unread_file(self, generate):
+        """A fluent reply about a file nothing ever opened is a fabrication.
+
+        No fence, no refusal, no awkward phrasing -- the response-side
+        heuristic misses it completely (the text is longer than its length
+        guard too). The only thing that is provably false is that no tool call
+        in the conversation ever touched ``README.md``, and Opencode would
+        otherwise stop here and end the session on the invention.
+        """
+        fabricated = (
+            "Duoi day la 3 diem chinh thuong co trong tai lieu `README.md` cua "
+            "cac du an dang Gemini Web2API. " * 10)
+        generate.side_effect = [
+            fabricated,
+            '```tool_call\n{"name": "read", "arguments": {"path": "README.md"}}\n```',
+        ]
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user",
+                           "content": "Doc README.md va ke 3 diem chinh."}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        # Long enough that the response-side length guard rules it out: this
+        # turn is retried purely because the file was never read.
+        self.assertGreater(len(fabricated), 600)
+        self.assertEqual(generate.call_count, 2)
+        choice = json.loads(body)["choices"][0]
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "read")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_does_not_retry_once_the_file_was_read(self, generate):
+        """Summarising something already read is a real answer, not a miss."""
+        generate.return_value = "Tong ket: README.md noi du an nay lam gi."
+
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [
+                 {"role": "user", "content": "Doc README.md roi tong ket."},
+                 {"role": "assistant", "content": "", "tool_calls": [{
+                     "id": "c1", "type": "function",
+                     "function": {"name": "read",
+                                  "arguments": '{"path": "README.md"}'}}]},
+                 {"role": "tool", "content": "# README ...",
+                  "tool_call_id": "c1"},
+                 {"role": "user", "content": "Doc README.md roi tong ket nua."},
+             ],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 1)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_retries_an_empty_upstream_response(self, generate):
+        """A body that never arrived is not an answer -- nor "all done" either.
+
+        A connection dropped mid-generation leaves ``""`` behind; returning
+        that as 200 tells Opencode the turn finished with nothing to do, so it
+        stops instead of letting the model try again.
+        """
+        generate.side_effect = [
+            "",
+            '```tool_call\n{"name": "read", "arguments": {"path": "README.md"}}\n```',
+        ]
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "doc README"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 2)
+        choice = json.loads(body)["choices"][0]
+        self.assertEqual(choice["message"]["tool_calls"][0]["function"]["name"], "read")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_empty_response_without_tools_is_reported_not_retried(self, generate):
+        """With no tools there is no block to chase, so a blank reply is a 502."""
+        generate.return_value = ""
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "xin chao"}]},
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(generate.call_count, 1)
+        self.assertIn("empty response", body)
+
+    @mock.patch("gemini_web2api.server.generate",
+                return_value="I encountered an error doing what you asked. "
+                             "Could you try again?")
+    def test_upstream_error_placeholder_is_retried_then_reported(self, generate):
+        """Gemini's canned failure sentence must never reach the client as 200.
+
+        It reads as a finished answer, so the operator sees "the model replied
+        with an error" instead of a failure they can act on.
+        """
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "doc README"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 502)
+        self.assertEqual(generate.call_count, 2)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["type"], "api_error")
+        self.assertIn("placeholder", error["message"])
+
+    # ── Giai đoạn 6: /v1/responses has to behave like /v1/chat/completions ──
+
+    _RESPONSES_READ_TOOL = [{
+        "type": "function",
+        "name": "read",
+        "description": "Read a file",
+        "parameters": {"type": "object",
+                       "properties": {"path": {"type": "string"}},
+                       "required": ["path"]},
+    }]
+
+    @mock.patch("gemini_web2api.server.generate",
+                return_value='```tool_call\n{"arguments": {"path": "README.md"}}\n```')
+    def test_responses_infers_a_missing_tool_name(self, generate):
+        """The Responses path passed no schemas, so an unnamed call was dropped.
+
+        The model omits ``name`` often enough that losing the schemas cost real
+        calls on this endpoint while the Chat Completions path recovered them.
+        """
+        status, _, body = self.post_json(
+            "/v1/responses",
+            {"model": "gemini-3.6-flash", "input": "doc README",
+             "tools": self._RESPONSES_READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        calls = [o for o in json.loads(body)["output"] if o["type"] == "function_call"]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["name"], "read")
+        self.assertEqual(json.loads(calls[0]["arguments"]), {"path": "README.md"})
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_responses_retries_when_model_announces_a_tool_it_never_calls(self, generate):
+        generate.side_effect = [
+            "Dung tool read de minh doc file:",
+            '```tool_call\n{"name": "read", "arguments": {"path": "README.md"}}\n```',
+        ]
+
+        status, _, body = self.post_json(
+            "/v1/responses",
+            {"model": "gemini-3.6-flash", "input": "doc README",
+             "tools": self._RESPONSES_READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 2)
+        calls = [o for o in json.loads(body)["output"] if o["type"] == "function_call"]
+        self.assertEqual(calls[0]["name"], "read")
+
+    @mock.patch("gemini_web2api.server.generate", return_value="plain text, no call")
+    def test_responses_flattened_tool_choice_still_requires_a_call(self, generate):
+        """The Responses API names the target without nesting it under ``function``.
+
+        Reading only ``tool_choice["function"]`` made this shape look like plain
+        ``auto``, so the required-tool retry never ran for Responses clients.
+        """
+        status, _, _ = self.post_json(
+            "/v1/responses",
+            {"model": "gemini-3.6-flash", "input": "doc README",
+             "tools": self._RESPONSES_READ_TOOL,
+             "tool_choice": {"type": "function", "name": "read"}},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 2)
+
 
 class GenerateStreamTests(unittest.TestCase):
     """Upstream line framing for generate_stream (scaffolding vs real code)."""
@@ -1095,6 +1355,205 @@ class ToolParsingTests(unittest.TestCase):
 
         self.assertEqual(calls, [])
         self.assertIn("commands", clean)
+
+    # ── Giai đoạn 1: fences the old non-greedy regex could not survive ──
+
+    def test_parse_tool_calls_survives_fence_inside_arguments(self):
+        """A ``write`` call whose content is Markdown/code must not be cut.
+
+        The payload contains ``` inside a JSON string; a regex that stops at
+        the first fence halved the JSON, ``json.loads`` failed, and the whole
+        call was silently dropped -- leaving the client with prose and no tool.
+        """
+        payload = json.dumps({
+            "name": "write",
+            "arguments": {"path": "notes.md",
+                          "content": "# Title\n```python\nprint(1)\n```\nafter"},
+        })
+        clean, calls = parse_tool_calls(f"```tool_call\n{payload}\n```",
+                                        allowed_names={"write"})
+
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertIn("```python", args["content"])
+        self.assertTrue(args["content"].endswith("after"))
+        self.assertEqual(clean, "")
+
+    def test_parse_tool_calls_accepts_function_call_fence(self):
+        clean, calls = parse_tool_calls(
+            '```function_call\n{"name": "read", "args": {"path": "a.py"}}\n```',
+            allowed_names={"read"},
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read")
+        self.assertEqual(calls[0]["function"]["arguments"], '{"path": "a.py"}')
+        self.assertEqual(clean, "")
+
+    def test_parse_tool_calls_accepts_json_fence_for_declared_tool(self):
+        clean, calls = parse_tool_calls(
+            '```json\n{"name": "read", "arguments": {"path": "a.py"}}\n```',
+            allowed_names={"read"},
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "read")
+        self.assertEqual(clean, "")
+
+    def test_parse_tool_calls_keeps_json_fence_for_undeclared_tool(self):
+        """A JSON block naming a tool the client never declared is prose."""
+        clean, calls = parse_tool_calls(
+            '```json\n{"name": "bogus", "arguments": {}}\n```',
+            allowed_names={"read"},
+        )
+
+        self.assertEqual(calls, [])
+        self.assertIn("bogus", clean)
+
+    def test_parse_tool_calls_leaves_plain_json_example_alone(self):
+        """JSON quoted while explaining something must never become a call."""
+        text = 'Here is the config:\n```json\n{"port": 8081}\n```\nDone.'
+
+        clean, calls = parse_tool_calls(text, allowed_names={"read", "write"})
+
+        self.assertEqual(calls, [])
+        self.assertIn('{"port": 8081}', clean)
+
+    def test_parse_tool_calls_ignores_unfenced_json(self):
+        """Bare JSON with no fence is not a call -- the format needs a fence."""
+        text = '{"name": "read", "arguments": {"path": "a.py"}}'
+
+        clean, calls = parse_tool_calls(text, allowed_names={"read"})
+
+        self.assertEqual(calls, [])
+        self.assertIn('"read"', clean)
+
+
+class MissedToolCallDetectionTests(unittest.TestCase):
+    """Giai đoạn 4 heuristics: when is prose a stalled first turn?"""
+
+    def test_announcement_before_a_colon_is_a_miss(self):
+        self.assertTrue(looks_like_missed_tool_call("Dung tool read de doc file:"))
+
+    def test_refusal_and_let_me_read_phrases_are_misses(self):
+        for text in (
+            "I cannot access the filesystem from here.",
+            "Let me read the README first.",
+            "De minh doc file README truoc.",
+            "Để mình đọc file README trước.",
+            "Ban khong co quyen truy cap thu muc nay.",
+            "Bạn không có quyền truy cập thư mục này.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(looks_like_missed_tool_call(text))
+
+    def test_long_answer_is_never_a_miss(self):
+        text = "Let me read " + "noi dung rat dai. " * 60
+        self.assertGreater(len(text), 600)
+        self.assertFalse(looks_like_missed_tool_call(text))
+
+    def test_response_with_a_tool_fence_is_not_a_miss(self):
+        self.assertFalse(looks_like_missed_tool_call(
+            'Da doc xong.\n```tool_call\n{"name":"read"}\n```'))
+
+    def test_ordinary_short_completion_is_not_a_miss(self):
+        self.assertFalse(looks_like_missed_tool_call("Da tao file xong."))
+        self.assertFalse(looks_like_missed_tool_call(""))
+
+    def test_upstream_placeholder_is_recognised(self):
+        self.assertTrue(looks_like_upstream_error(
+            "I encountered an error doing what you asked. Could you try again?"))
+        self.assertFalse(looks_like_upstream_error(
+            "I encountered an error while writing the docs about how errors work."))
+        self.assertFalse(looks_like_upstream_error(""))
+
+    def test_required_tool_choice_recognises_both_api_shapes(self):
+        self.assertTrue(is_required_tool_choice("required"))
+        self.assertTrue(is_required_tool_choice(
+            {"type": "function", "function": {"name": "read"}}))
+        self.assertTrue(is_required_tool_choice(
+            {"type": "function", "name": "read"}))
+        self.assertFalse(is_required_tool_choice("auto"))
+        self.assertFalse(is_required_tool_choice("none"))
+        self.assertFalse(is_required_tool_choice({"type": "auto"}))
+        self.assertFalse(is_required_tool_choice(None))
+
+
+class PendingToolRequestTests(unittest.TestCase):
+    """A fabricated answer about an unread file is provably wrong.
+
+    The reply itself reads perfectly -- no fence, no refusal -- so the only
+    signal is that no tool call in the conversation ever opened the file being
+    discussed. Opencode then stops, ending the session on an invention.
+    """
+
+    @staticmethod
+    def _read_readme():
+        return [
+            {"role": "user", "content": "Doc README.md roi tong ket."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "read", "arguments": '{"path": "README.md"}'}}]},
+            {"role": "tool", "content": "# README ...", "tool_call_id": "c1"},
+            {"role": "user", "content": "Doc README.md nua di."},
+        ]
+
+    def test_unread_file_requested_by_the_user_is_reported(self):
+        reason = pending_tool_request(
+            [{"role": "user", "content": "Doc README.md va ke 3 diem chinh."}])
+        self.assertIn("README.md", reason)
+
+    def test_a_file_already_read_is_not_reported(self):
+        self.assertIsNone(pending_tool_request(self._read_readme()))
+
+    def test_sub_path_still_counts_as_a_read_of_the_basename(self):
+        messages = [
+            {"role": "user", "content": "Doc gemini_web2api/server.py"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "gemini_web2api/server.py"}'}}]},
+            {"role": "tool", "content": "...", "tool_call_id": "c1"},
+            {"role": "user", "content": "Doc gemini_web2api/server.py nua."},
+        ]
+        self.assertIsNone(pending_tool_request(messages))
+
+    def test_tool_demand_with_no_call_at_all_is_reported(self):
+        reason = pending_tool_request(
+            [{"role": "user", "content": "Hay dung tool de xem ket qua."}])
+        self.assertIn("demanded", reason)
+
+    def test_tool_demand_is_ignored_once_a_call_happened(self):
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "Hay dung tool de xem ket qua."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "read", "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "...", "tool_call_id": "c1"},
+        ]))
+
+    def test_a_call_that_names_no_file_still_counts_as_tool_use(self):
+        """``glob {"pattern": "**/*"}`` proves the model is acting.
+
+        Its arguments contain no file-shaped token, so keying "tool use
+        happened" off the file names would report a phantom demand and burn
+        a retry on a turn that is already doing what the user asked.
+        """
+        self.assertIsNone(pending_tool_request([
+            {"role": "user",
+             "content": "Review source code thu muc. Bat buoc dung tool."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "glob",
+                    "arguments": '{"path": "src", "pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+        ]))
+
+    def test_plain_chitchat_and_empty_input_report_nothing(self):
+        self.assertIsNone(pending_tool_request(
+            [{"role": "user", "content": "Cam on ban nhieu nhe."}]))
+        self.assertIsNone(pending_tool_request([]))
+        self.assertIsNone(pending_tool_request(None))
 
     def test_parse_google_function_calls_accepts_flattened_args(self):
         clean, calls = parse_google_function_calls(

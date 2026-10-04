@@ -38,6 +38,16 @@ DEFAULT_CONFIG = {
     # eat unbounded RAM while the server reads it.
     "max_body_bytes": 32 * 1024 * 1024,
     "temporary_chats": False,
+    # Retry once when a response with tools offered looks like the model talked
+    # about acting instead of acting (or came back as the upstream's canned
+    # failure sentence). One extra upstream call at most, and off entirely if
+    # the heuristic proves noisy.
+    "tool_retry_on_miss": True,
+    # Diagnostics: dump every raw upstream response to debug_raw_file so the
+    # payload shape (thinking vs answer vs tool call) can be inspected. Off by
+    # default -- raw responses can be large and carry conversation content.
+    "debug_raw": False,
+    "debug_raw_file": "gemini-raw.log",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

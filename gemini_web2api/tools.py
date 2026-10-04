@@ -5,6 +5,7 @@ import re
 import uuid
 import base64
 import binascii
+import unicodedata
 from urllib.parse import unquote_to_bytes
 
 # Upper bound for the generated prompt. Keeps large tool lists / long histories
@@ -142,7 +143,7 @@ def tool_parameters(tools) -> dict:
 _TRUNCATION_MARKER = "[...truncated...]"
 
 
-def _join_prompt_parts(parts: list, max_bytes: int) -> str:
+def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> str:
     """Join message parts into a prompt, dropping the *middle* when too long.
 
     Slicing the assembled prompt from the front (the obvious way) keeps the
@@ -150,21 +151,48 @@ def _join_prompt_parts(parts: list, max_bytes: int) -> str:
     user message -- i.e. exactly the question that needs answering. Instead we
     keep the leading block (tool definitions / system instruction) and as many
     of the newest messages as fit, and mark the gap.
+
+    ``pinned_head`` is reserved *before* anything else is allocated. Without it
+    the newest messages (a large tool result, say) can fill the budget on their
+    own, leaving nothing for the leading block -- and a prompt with no tool
+    definitions makes the model answer in prose instead of calling a tool,
+    which is indistinguishable from the model simply refusing to act.
     """
     items = [p for p in parts if p]
 
     def nbytes(text: str) -> int:
         return len(text.encode("utf-8"))
 
-    full = "\n\n".join(items)
+    # Cap the pin so a pathological tool list cannot consume the budget on its
+    # own; ~40% leaves the majority for the history and the pending question.
+    pinned = ""
+    if pinned_head:
+        cap = max_bytes * 2 // 5
+        pinned = (pinned_head if nbytes(pinned_head) <= cap
+                  else pinned_head.encode("utf-8")[:cap].decode("utf-8", errors="ignore"))
+        pinned = pinned.strip()
+        if not pinned:
+            pinned = ""
+
+    full = "\n\n".join(([pinned] if pinned else []) + items)
     if nbytes(full) <= max_bytes:
         return full
 
     from .gemini import log
     log(f"Prompt truncated to {max_bytes} bytes")
+    if pinned:
+        log(f"Tool block pinned: {nbytes(pinned)} bytes "
+            f"({100 * nbytes(pinned) // max_bytes}% of budget)")
 
     # Two separators around the marker.
     budget = max_bytes - nbytes(_TRUNCATION_MARKER) - 4
+    if pinned:
+        budget -= nbytes(pinned) + 2
+    if budget <= 0:
+        # Degenerate budget (tiny max_bytes): give up on pinning rather than
+        # drop the question entirely.
+        pinned = ""
+        budget = max_bytes - nbytes(_TRUNCATION_MARKER) - 4
     if budget <= 0:
         return full.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
@@ -203,9 +231,71 @@ def _join_prompt_parts(parts: list, max_bytes: int) -> str:
         head.append(part)
         head_used += cost
 
-    if head:
-        return "\n\n".join(head + [_TRUNCATION_MARKER] + tail)
+    blocks = ([pinned] if pinned else []) + head
+    if blocks:
+        return "\n\n".join(blocks + [_TRUNCATION_MARKER] + tail)
     return "\n\n".join([_TRUNCATION_MARKER] + tail)
+
+
+def _compact_tool(t: dict, desc_max: int = 300) -> str:
+    """One line per tool: name, parameter names, types and which are required.
+
+    Used when the full JSON schema no longer fits. Dropping the schemas
+    outright (the previous behaviour) leaves the model calling a tool whose
+    parameters it can no longer see, which produces calls that fail
+    validation -- so signatures are always kept and only prose is shortened.
+    """
+    p = t.get("parameters") or {}
+    props = p.get("properties") if isinstance(p, dict) else None
+    props = props if isinstance(props, dict) else {}
+    required = set(p.get("required", [])) if isinstance(p, dict) else set()
+    args = ", ".join(
+        f'{k}{"" if k in required else "?"}: '
+        f'{(v or {}).get("type", "any") if isinstance(v, dict) else "any"}'
+        for k, v in props.items()
+    )
+    return f'- {t["name"]}({args}): {(t.get("description") or "")[:desc_max]}'
+
+
+# Appended after the last message whenever tools are offered. It has to be the
+# final thing the model reads: in a long conversation the original instruction
+# to *use* the tools sits far back, and the model reverts to answering from
+# memory -- which looks exactly like a successful answer with no tool call.
+_TOOL_REMINDER = ("\n\n[Reminder: you have working tools. To know what a file "
+                  "contains or what a command produced, call the tool -- do not "
+                  "answer from memory and do not claim to have read or run "
+                  "anything you have not.]")
+
+
+def _tool_use_block(tools_json: str, constraint: str) -> str:
+    """The ``# Tool Use`` header the model must always be able to see.
+
+    Pinned by ``_join_prompt_parts``: without it a large tool result can fill
+    the prompt budget on its own and evict the tool definitions entirely, after
+    which the model has no idea any tool exists.
+    """
+    return (
+        "# Tool Use\n\n"
+        "The tools below are connected to the user's machine and execute for "
+        "real the moment you call them. You have full access to them.\n\n"
+        "Call format (use this exact format):\n"
+        '```tool_call\n'
+        '{"name": "func_name", "arguments": {"param": "value"}}\n'
+        "```\n\n"
+        "When calling tools:\n"
+        "- Output ONLY tool_call block(s): no prose, explanation or apology "
+        "before or after them.\n"
+        '- Every parameter belongs inside the "arguments" object, keyed exactly '
+        'like the "parameters" properties below -- never beside "name".\n'
+        "- Emit several blocks in one turn when the calls are independent.\n"
+        "- Never state that you have read a file, run a command or inspected "
+        "the code unless a [Tool result for ...] message proves it. Knowing a "
+        "file's contents or a command's output requires calling the tool.\n"
+        "- Never claim the tools are unavailable, restricted, or that you lack "
+        "permission: they are connected and will run.\n\n"
+        f"Available tools:\n{tools_json}"
+        f"{constraint}"
+    )
 
 
 def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> tuple:
@@ -217,6 +307,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
 
     parts = []
     images = []
+    tool_block = None
 
     if tools and tool_choice != "none":
         tool_defs = []
@@ -239,25 +330,22 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             # Use compact JSON by default to save space
             tools_json = json.dumps(tool_defs, ensure_ascii=False)
             tool_bytes = len(tools_json.encode("utf-8"))
-            # If still too large, slim down by removing parameters
+            # If still too large, trade description prose for space while
+            # keeping every name, parameter, type and required flag: a model
+            # that cannot see a parameter calls the tool with the wrong shape.
             if tool_bytes > PROMPT_MAX_BYTES // 3:
-                slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
-                tools_json = json.dumps(slim_defs, ensure_ascii=False)
-                log(f"Tool definitions slimmed to names+descriptions "
-                    f"({tool_bytes} -> {len(tools_json.encode('utf-8'))} bytes): "
-                    "parameter schemas dropped")
+                for desc_max in (300, 150, 80):
+                    tools_json = "\n".join(_compact_tool(t, desc_max)
+                                           for t in tool_defs)
+                    tool_bytes = len(tools_json.encode("utf-8"))
+                    if tool_bytes <= PROMPT_MAX_BYTES // 3:
+                        break
+                log(f"Tool definitions compacted to signatures "
+                    f"(descriptions cut to {desc_max} chars, {tool_bytes} bytes): "
+                    "parameter names and types kept")
             else:
                 log(f"Tool definitions: {len(tool_defs)} tools, {tool_bytes} bytes")
-            parts.append(
-                "# Tool Use\n\n"
-                "You can call the following tools. Call format:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {"param": "value"}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s). "
-                'Every parameter belongs inside the "arguments" object, keyed exactly like '
-                'the "parameters" properties below -- never beside "name".\n\n'
-                f"Available tools:\n{tools_json}"
-                f"{constraint}"
-            )
+            tool_block = _tool_use_block(tools_json, constraint)
 
     # Map tool_call ids -> function names so tool results can be labelled correctly.
     id_to_name = {}
@@ -360,7 +448,9 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         else:
             parts.append(_stringify_content(content))
 
-    return _join_prompt_parts(parts, PROMPT_MAX_BYTES), images
+    if tool_block:
+        parts.append(_TOOL_REMINDER)
+    return _join_prompt_parts(parts, PROMPT_MAX_BYTES, pinned_head=tool_block), images
 
 
 # Keys that describe the call itself rather than its parameters. Models emit
@@ -463,6 +553,80 @@ def _infer_tool_name(data: dict, tool_schemas) -> str:
     return matches[0] if len(matches) == 1 else None
 
 
+# Fences that may wrap a tool call. ``json`` is listed too because models reach
+# for it routinely, but it is validated far more strictly below: an ordinary
+# JSON example in prose must never be mistaken for a real call.
+_FENCE_OPEN = re.compile(r'```(tool_call|function_call|tool_code|json)'
+                         r'(?![A-Za-z0-9_])[ \t]*\n?')
+_FENCE_CLOSE = re.compile(r'\s*```')
+
+
+def _iter_tool_blocks(text: str):
+    """Yield ``(start, end, data, kind)`` for each tool-call-shaped fenced block.
+
+    The payload is located with ``JSONDecoder.raw_decode`` starting right after
+    the opening fence, so a ``` that appears *inside* a string argument (the
+    normal shape of a ``write`` call whose content is Markdown or code)
+    terminates neither the payload nor the block. A non-greedy regex instead
+    stops at the very first fence, cuts the JSON in half, and the call is lost.
+
+    ``data`` is ``_NOTHING`` for a block that declares a tool-call fence but
+    whose body is not valid JSON; it is yielded anyway so the caller can log the
+    drop rather than silently leaving it in the text.
+    """
+    dec = json.JSONDecoder()
+    pos = 0
+    while True:
+        m = _FENCE_OPEN.search(text, pos)
+        if not m:
+            return
+        kind = m.group(1)
+        j = m.end()
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        try:
+            data, end = dec.raw_decode(text, j)
+        except ValueError:
+            if kind == "json":
+                # Not a call attempt, just JSON prose we cannot read: skip it
+                # without a log line so ordinary answers stay quiet.
+                pos = m.end()
+                continue
+            # Bound the reported body by the closing fence so the log shows what
+            # the model actually wrote.
+            close = text.find("```", m.end())
+            span_end = close if close != -1 else m.end()
+            yield m.start(), (close + 3 if close != -1 else m.end()), _NOTHING, kind
+            pos = span_end if close != -1 else m.end()
+            continue
+        c = _FENCE_CLOSE.match(text, end)
+        if c:
+            end = c.end()
+        yield m.start(), end, data, kind
+        pos = end
+
+
+def _is_declared_call(data, allowed_names, tool_schemas) -> bool:
+    """True only for a ```json block that is unmistakably a declared tool call.
+
+    Requires a name the client actually declared *and* a recognisable argument
+    payload -- either one of the ``arguments``/``args``/``input`` aliases or
+    flattened parameter keys that all belong to that tool's schema. Anything
+    looser would swallow JSON examples the model quotes while explaining
+    something to the user.
+    """
+    if not isinstance(data, dict) or not allowed_names:
+        return False
+    name = data.get("name")
+    if name not in allowed_names:
+        return False
+    if any(k in data for k in _ARGUMENT_KEYS):
+        return True
+    keys = set(data) - _CALL_META_KEYS
+    props = (tool_schemas or {}).get(name)
+    return bool(keys) and bool(props) and keys <= props
+
+
 def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
     """Extract tool_call blocks. Returns (clean_text, tool_calls_list).
 
@@ -475,16 +639,13 @@ def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
     from .gemini import log
 
     tool_calls = []
-    pattern = r'```tool_call[ \t]*\n?(.*?)\n?```'
     clean_parts = []
     last_end = 0
-    for m in re.finditer(pattern, text, re.DOTALL):
-        body = m.group(1).strip()
+    for start, end, data, kind in _iter_tool_blocks(text):
+        if kind == "json" and not _is_declared_call(data, allowed_names, tool_schemas):
+            # Ordinary JSON in prose: leave it untouched and do not log it.
+            continue
         reason = ""
-        try:
-            data = json.loads(body)
-        except (json.JSONDecodeError, ValueError):
-            data, reason = None, "body is not valid JSON"
         parsed = None
         if isinstance(data, dict):
             name = data.get("name")
@@ -506,15 +667,200 @@ def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
                     "type": "function",
                     "function": {"name": name, "arguments": args},
                 }
+        elif data is _NOTHING:
+            reason = "body is not valid JSON"
+        else:
+            reason = "unrecognised payload"
         if parsed is None:
-            log(f"Dropping tool_call block: {reason or 'unrecognised payload'}: {body[:300]}")
+            log(f"Dropping tool_call block: {reason}: {text[start:end][:300]}")
             continue
-        clean_parts.append(text[last_end:m.start()])
-        last_end = m.end()
+        clean_parts.append(text[last_end:start])
+        last_end = end
         tool_calls.append(parsed)
     clean_parts.append(text[last_end:])
     clean = "".join(clean_parts).strip()
     return clean, tool_calls
+
+
+# Gemini's own generation step failing produces this canned sentence rather
+# than an answer. It reaches the client as a normal 200, so the caller reads it
+# as "the model replied" and stops -- when in fact nothing was generated and a
+# single retry almost always succeeds.
+#
+# Both detectors below match against ``_fold_diacritics`` output, so their
+# patterns are written in plain ASCII and recognise Vietnamese typed with or
+# without accents.
+_UPSTREAM_ERROR_RE = re.compile(
+    r"^\s*(?:i encountered an error doing what you asked\.?\s*"
+    r"could you try again\?*"
+    r"|sorry, something went wrong\.?"
+    r"|da co loi xay ra\.?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Phrases that mean "I am about to look at that" or "I cannot reach that" --
+# i.e. the model announced an action it never performed because it never
+# emitted the tool call.
+_MISSED_TOOL_RE = re.compile(
+    r"(khong\s+the\s+truy\s+cap|khong\s+co\s+quyen|khong\s+duoc\s+truy\s+cap"
+    r"|khong\s+tim\s+thay|khong\s+the\s+doc"
+    r"|cannot\s+access|can'?t\s+access"
+    r"|don'?t\s+have\s+access|do\s+not\s+have\s+access"
+    r"|no\s+(?:file\s+|tool\s+)?access"
+    r"|not\s+(?:permitted|allowed)\s+to\s+read"
+    r"|de\s+minh\s+doc|de\s+minh\s+kiem\s+tra"
+    r"|let\s+me\s+(?:read|check|look|see|examine|inspect)"
+    r"|i(?:'ll|\s+will)\s+(?:read|check|look|see|examine|inspect))",
+    re.IGNORECASE,
+)
+
+# Anything at or above this is a real answer rather than a stalled first turn.
+_MAX_MISSED_TOOL_CHARS = 600
+
+
+def _fold_diacritics(text: str) -> str:
+    """Strip accents so patterns match Vietnamese typed with or without them.
+
+    ``đ``/``Đ`` have no canonical decomposition, so they are folded explicitly.
+    """
+    decomposed = unicodedata.normalize("NFD", text)
+    stripped = "".join(c for c in decomposed if not unicodedata.combining(c))
+    return stripped.replace("đ", "d").replace("Đ", "D")
+
+
+def is_required_tool_choice(tool_choice) -> bool:
+    """True when the client demands a tool call rather than allowing one.
+
+    Chat Completions nests the target under ``function``; the Responses API
+    drops that nesting and names it directly, so both shapes have to count --
+    recognising only the nested one silently disabled the required-tool path
+    for every Responses client.
+    """
+    if tool_choice == "required":
+        return True
+    if isinstance(tool_choice, dict):
+        return bool(tool_choice.get("function") or tool_choice.get("name"))
+    return False
+
+
+def looks_like_upstream_error(text: str) -> bool:
+    """True when the response is the upstream's canned failure, not an answer."""
+    if not text:
+        return False
+    return bool(_UPSTREAM_ERROR_RE.match(_fold_diacritics(text)))
+
+
+def looks_like_missed_tool_call(text: str) -> bool:
+    """True when a response *intended* to use a tool but never emitted a block.
+
+    All three conditions must hold: the text announces or refuses an action,
+    it is short enough to be a stalled first turn rather than a real answer,
+    and it carries no tool fence (a fence means the model did try). Returning
+    True costs one extra upstream call; returning True for a genuine answer
+    would make every short reply do double duty, hence the length guard.
+    """
+    if not text or len(text) >= _MAX_MISSED_TOOL_CHARS:
+        return False
+    if "```tool_call" in text or "```function_call" in text:
+        return False
+    folded = _fold_diacritics(text)
+    if folded.rstrip().endswith(":"):
+        return True
+    return bool(_MISSED_TOOL_RE.search(folded))
+
+
+# File-shaped tokens a sentence can point at: `README.md`, `server.py`,
+# `gemini-web2api.log`. Used on both sides of the check below.
+_FILE_REF_RE = re.compile(
+    r"(?<![\w.-])[\w][\w.-]*\.(?:"
+    r"md|py|pyi|js|jsx|ts|tsx|json|jsonc|txt|ya?ml|toml|cfg|conf|ini|env|"
+    r"java|kt|c|cc|cpp|h|hpp|go|rs|rb|php|html|css|scss|less|sql|sh|bash|ps1|"
+    r"xml|csv|lock|log|rst|bat|cmd|vue|svelte|proto|gradle|properties"
+    r")(?![\w-])",
+    re.IGNORECASE,
+)
+
+# "dùng tool", "đọc file", "review source", "use the tool", ... -- whitespace
+# is stripped before matching because folding Vietnamese silently glues words
+# together ("sử dụng" -> "sudung") while other clients leave the space.
+_TOOL_DEMAND_RE = re.compile(
+    r"(?:dung|sudung|haydung|phaidung|batbuocdung|vanphaidung|phairadung)"
+    r"(?:la)?(?:tool|tools|congcu|caccongcu)"
+    r"|(?:doc|kiemtra|xem|mo)(?:rai)?(?:file|tep|thumuc|cacfile)"
+    r"|(?:review|kiemtra|doc)(?:la)?(?:source|code|masnguon|cacfile)"
+    r"|(?:use|call|run|invoke)(?:the)?s?(?:tool|tools)"
+    r"|(?:read|open|view|check|inspect)(?:the)?s?(?:file|files)",
+    re.IGNORECASE,
+)
+
+
+def _files_in(*chunks) -> set:
+    """File-shaped names mentioned anywhere in ``chunks`` (strings or JSON)."""
+    blob = " ".join(c for c in chunks if isinstance(c, str))
+    return {m.group(0) for m in _FILE_REF_RE.finditer(blob)}
+
+
+def _conversation_tool_use(messages) -> tuple:
+    """``(file names any tool call touched, whether any tool call happened)``.
+
+    These are deliberately separate: ``glob {"pattern": "**/*"}`` proves the
+    model is acting but names no file, so answering "no tool call ever touched
+    README.md" must not be confused with "the model has not used a tool".
+    """
+    called = set()
+    used_any = False
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        for tc in (msg.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            used_any = True
+            fn = tc.get("function") or {}
+            args = fn.get("arguments")
+            if not isinstance(args, str):
+                args = json.dumps(args, ensure_ascii=False)
+            called |= _files_in(str(fn.get("name") or ""), args)
+    return called, used_any
+
+
+def pending_tool_request(messages) -> str:
+    """Why the newest user turn still owes the model a tool call, else ``None``.
+
+    This is the check that catches a *fabricated* answer -- the failure mode
+    where the user asks about ``README.md`` and the model replies as if it had
+    opened it, without ever emitting a block. The reply contains no fence, no
+    refusal and nothing grammatically wrong, so the response-side heuristic
+    above never fires; the only thing that is provably false is that no tool
+    call in the whole conversation has touched the file being discussed.
+
+    Two independent shapes are reported: a file the newest user turn names
+    that nothing has read, and a turn that demands tool use while the
+    conversation contains no tool call at all (the second covers requests
+    with no file to name -- "review source code", say).
+
+    Opencode treats such a reply as the final answer and stops, so one turn of
+    this ends the session with an answer invented from the filename alone.
+    """
+    if not isinstance(messages, list):
+        return None
+
+    last_user = None
+    for msg in messages:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = _stringify_content(msg.get("content", ""))
+
+    called, used_any_tool = _conversation_tool_use(messages)
+    if last_user:
+        uncovered = _files_in(last_user) - called
+        if uncovered:
+            return "requested file(s) never read: " + ", ".join(sorted(uncovered))
+
+    if last_user and not used_any_tool:
+        folded = _fold_diacritics(last_user).replace(" ", "").replace("\n", "")
+        if _TOOL_DEMAND_RE.search(folded):
+            return "user demanded tool use and none happened"
+    return None
 
 
 def build_response_format_instruction(response_format) -> str:

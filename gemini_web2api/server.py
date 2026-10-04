@@ -10,7 +10,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import generate, generate_stream, log, GeminiError
 from .tools import (
     messages_to_prompt,
     parse_tool_calls,
@@ -20,6 +20,10 @@ from .tools import (
     strip_code_fence,
     tool_names,
     tool_parameters,
+    is_required_tool_choice,
+    looks_like_missed_tool_call,
+    looks_like_upstream_error,
+    pending_tool_request,
 )
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -154,6 +158,15 @@ def _log_tool_trace(raw_text: str, tool_calls) -> None:
         log("tool_call marker(s) present but no tool call was parsed")
     if tool_calls:
         log(f"parsed tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
+    if not tool_calls:
+        # With tools offered and nothing parsed, the raw text is the only place
+        # that distinguishes "model answered in prose" from "model used a fence
+        # we do not recognise" (```json / ```function_call / bare JSON) -- both
+        # look identical in the marker count above.
+        fences = sorted({(m.group(1) or "bare").lower()
+                         for m in re.finditer(r"```([A-Za-z0-9_+-]*)", raw_text)})
+        log(f"no tool_call parsed; fences seen: {', '.join(fences) or 'none'}")
+        log(f"no tool_call parsed; text head: {raw_text[:400]!r}")
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
@@ -489,6 +502,86 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _generate_with_tool_retry(self, prompt, model_id, think_mode, file_refs,
+                                  extra, tools_active, allowed_names,
+                                  tool_schemas, required_tool, messages=None):
+        """Run ``generate()``, retrying once when the reply did not use a tool.
+
+        Five shapes all arrive as a normal HTTP 200 yet leave the client
+        believing the turn is over:
+
+        * an empty body -- a connection that died mid-generation leaves
+          nothing to answer with, and 200-with-no-content reads as "done";
+        * the upstream's canned failure sentence ("I encountered an error doing
+          what you asked...") -- nothing was generated, a retry usually works,
+          and passing it on reads as a finished answer;
+        * the model announcing an action ("let me read...") without ever
+          emitting the block;
+        * the model *fabricating* an answer about a file no tool call has
+          opened -- the reply is fluent and complete, so nothing in the text
+          itself looks wrong (see ``pending_tool_request``);
+        * ``tool_choice: "required"`` with no block at all.
+
+        The retry appends a hard instruction. Raises once attempts are
+        exhausted (or if ``generate`` itself fails on the final attempt) so the
+        caller decides how the failure is reported -- both endpoints map it
+        through ``_map_upstream_error``.
+        """
+        retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
+        attempts = 2 if (required_tool or (tools_active and retry_on_miss)) else 1
+        # Computed once: it inspects the whole conversation, not the reply.
+        owed = pending_tool_request(messages) if tools_active else None
+
+        text, tool_calls = "", None
+        for attempt in range(attempts):
+            call_prompt = prompt
+            if attempt > 0:
+                call_prompt = prompt + "\n\nIMPORTANT: Respond with a tool_call block ONLY."
+            try:
+                raw = generate(call_prompt, model_id, think_mode, file_refs, extra)
+            except Exception as e:
+                if attempt + 1 < attempts:
+                    log(f"Tool retry after upstream error: {e}")
+                    continue
+                raise
+            text, tool_calls = raw, None
+            if tools_active and text:
+                text, tool_calls = parse_tool_calls(text, allowed_names, tool_schemas)
+                _log_tool_trace(raw, tool_calls)
+            if tool_calls:
+                break
+            if required_tool:
+                continue
+            if attempt + 1 >= attempts:
+                break
+            if not (text or "").strip():
+                # An upstream that produced nothing (observed once as an empty
+                # body after a dropped connection) is never a usable answer:
+                # handing it to the client as 200 says "finished, nothing to
+                # do" and Opencode stops the turn there.
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
+                    "returned an empty response")
+                continue
+            if looks_like_upstream_error(text):
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
+                    "returned its canned error placeholder instead of a response")
+                continue
+            if retry_on_miss and owed:
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
+                continue
+            if retry_on_miss and tools_active and looks_like_missed_tool_call(text):
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): response "
+                    f"looks like a missed tool call ({len(text)} chars)")
+                continue
+            break
+
+        # The canned sentence is an upstream failure, not something the model
+        # said. Handing it to the client as 200 says "answered" when it was not.
+        if not tool_calls and looks_like_upstream_error(text):
+            raise GeminiError("upstream returned an error placeholder instead "
+                              "of a response; please retry")
+        return text, tool_calls
+
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
     def _handle_chat(self, body: bytes):
@@ -546,30 +639,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                               extra, stop_strings, max_tokens, include_usage)
             return
 
-        # Tool calls need the full text. Retry once when a tool was required.
-        required_tool = tool_choice == "required" or (
-            isinstance(tool_choice, dict) and bool(tool_choice.get("function")))
-        attempts = 2 if (required_tool and not stream) else 1
-
-        text, tool_calls = "", None
-        for attempt in range(attempts):
-            call_prompt = prompt
-            if attempt > 0:
-                call_prompt = prompt + "\n\nIMPORTANT: Respond with a tool_call block ONLY."
-            try:
-                raw = generate(call_prompt, model_id, think_mode, file_refs, extra)
-            except Exception as e:
-                if attempt + 1 < attempts:
-                    log(f"Tool retry after upstream error: {e}")
-                    continue
-                self.send_api_error(*_map_upstream_error(e))
-                return
-            text, tool_calls = raw, None
-            if tools and text and tool_choice != "none":
-                text, tool_calls = parse_tool_calls(text, allowed_names, tool_schemas)
-                _log_tool_trace(raw, tool_calls)
-            if tool_calls or not required_tool:
-                break
+        # Tool calls need the full text; retry once when the reply did not use
+        # one (see _generate_with_tool_retry).
+        required_tool = is_required_tool_choice(tool_choice)
+        tools_active = bool(tools) and tool_choice != "none"
+        try:
+            text, tool_calls = self._generate_with_tool_retry(
+                prompt, model_id, think_mode, file_refs, extra,
+                tools_active, allowed_names, tool_schemas, required_tool,
+                messages=messages)
+        except Exception as e:
+            self.send_api_error(*_map_upstream_error(e))
+            return
 
         if rf_instruction and text:
             text = strip_code_fence(text)
@@ -814,17 +895,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         stop_strings = _normalize_stop(req.get("stop"))
         max_tokens = req.get("max_output_tokens")
 
+        allowed_names = tool_names(tools) or None
+        tool_schemas = tool_parameters(tools) or None
+        required_tool = is_required_tool_choice(tool_choice)
+        tools_active = bool(tools) and tool_choice != "none"
+
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra)
+            text, tool_calls = self._generate_with_tool_retry(
+                prompt, model_id, think_mode, file_refs, extra,
+                tools_active, allowed_names, tool_schemas, required_tool,
+                messages=messages)
         except Exception as e:
             self.send_api_error(*_map_upstream_error(e))
             return
-
-        allowed_names = tool_names(tools) or None
-        tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text, allowed_names)
         if rf_instruction and text:
             text = strip_code_fence(text)
         text = _apply_stop(text, stop_strings)
