@@ -1,4 +1,5 @@
 """Tool calling and multimodal message parsing."""
+import ast
 import json
 import re
 import uuid
@@ -116,6 +117,26 @@ def tool_names(tools) -> set:
     return names
 
 
+def tool_parameters(tools) -> dict:
+    """Map tool name -> set of top-level parameter names from a tools list.
+
+    Used to recover a call whose model omitted ``name``: the parameter keys are
+    matched against these sets, so a guess is only ever made when exactly one
+    declared tool could have produced them.
+    """
+    schemas = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        params = fn.get("parameters") or tool.get("parameters") or {}
+        props = params.get("properties") if isinstance(params, dict) else None
+        schemas[fn["name"]] = set(props) if isinstance(props, dict) else set()
+    return schemas
+
+
 # Sits between the dropped leading block and the kept tail so the model can see
 # that history was removed rather than silently wondering what it missed.
 _TRUNCATION_MARKER = "[...truncated...]"
@@ -192,6 +213,8 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
 
     Returns (prompt, images) where images is a list of (bytes, mime_type) tuples.
     """
+    from .gemini import log
+
     parts = []
     images = []
 
@@ -215,15 +238,23 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
             # Use compact JSON by default to save space
             tools_json = json.dumps(tool_defs, ensure_ascii=False)
+            tool_bytes = len(tools_json.encode("utf-8"))
             # If still too large, slim down by removing parameters
-            if len(tools_json.encode("utf-8")) > PROMPT_MAX_BYTES // 3:
+            if tool_bytes > PROMPT_MAX_BYTES // 3:
                 slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
                 tools_json = json.dumps(slim_defs, ensure_ascii=False)
+                log(f"Tool definitions slimmed to names+descriptions "
+                    f"({tool_bytes} -> {len(tools_json.encode('utf-8'))} bytes): "
+                    "parameter schemas dropped")
+            else:
+                log(f"Tool definitions: {len(tool_defs)} tools, {tool_bytes} bytes")
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
-                '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s).\n\n"
+                '```tool_call\n{"name": "func_name", "arguments": {"param": "value"}}\n```\n'
+                "When calling tools, output ONLY the tool_call block(s). "
+                'Every parameter belongs inside the "arguments" object, keyed exactly like '
+                'the "parameters" properties below -- never beside "name".\n\n'
                 f"Available tools:\n{tools_json}"
                 f"{constraint}"
             )
@@ -332,35 +363,151 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     return _join_prompt_parts(parts, PROMPT_MAX_BYTES), images
 
 
-def parse_tool_calls(text: str, allowed_names=None) -> tuple:
+# Keys that describe the call itself rather than its parameters. Models emit
+# flattened payloads (`{"name": "run_commands", "commands": [...]}`) as readily
+# as the canonical nested one, so every other key counts as a parameter.
+_CALL_META_KEYS = {"name", "id", "type", "description", "tool", "tool_name"}
+
+# Aliases used for the nested parameter object.
+_ARGUMENT_KEYS = ("arguments", "args", "input")
+
+_NOTHING = object()
+
+
+def extract_arguments(data: dict):
+    """Pull a tool call's parameters out of a parsed payload.
+
+    Handles the canonical ``{"name": ..., "arguments": {...}}`` shape and the
+    variants models actually emit: ``args`` / ``input`` aliases, a
+    ``parameters`` wrapper, and the flattened form where the parameters sit
+    beside ``name``. Returns ``{}`` only when the payload carries none.
+    """
+    for key in _ARGUMENT_KEYS:
+        value = data.get(key)
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            return value
+    rest = {k: v for k, v in data.items() if k not in _CALL_META_KEYS}
+    if len(rest) == 1:
+        key, value = next(iter(rest.items()))
+        if key in ("parameters", "params") and isinstance(value, dict):
+            return value
+    return rest or {}
+
+
+def _arguments_json(args) -> tuple:
+    """Serialise a tool call's arguments into a JSON object string.
+
+    Returns ``(json_text, degradation)``; ``degradation`` is None when the
+    arguments were usable. ``function.arguments`` has to parse as JSON -- and
+    for every OpenAI-style client it has to be an object -- otherwise the
+    client rejects the call with a bare "Invalid input" that tells the model
+    nothing. A payload that cannot be salvaged therefore degrades to ``{}``,
+    a well-formed call the model can retry after seeing the client's error.
+    """
+    if isinstance(args, dict):
+        return json.dumps(args, ensure_ascii=False), None
+    if isinstance(args, str):
+        text = args.strip()
+        if not text:
+            return "{}", "empty string"
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            parsed = _NOTHING
+        if isinstance(parsed, dict):
+            return text, None
+        # Models occasionally hand back a Python literal instead of JSON.
+        try:
+            recovered = ast.literal_eval(text)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            recovered = _NOTHING
+        if isinstance(recovered, dict):
+            return json.dumps(recovered, ensure_ascii=False), None
+        return "{}", "not a JSON object"
+    if args is None:
+        return "{}", "missing"
+    if isinstance(args, (list, int, float, bool)):
+        return json.dumps(args, ensure_ascii=False), None
+    return "{}", f"unsupported type {type(args).__name__}"
+
+
+def _arguments_dict(data: dict) -> dict:
+    """``extract_arguments`` for callers that need a JSON object, always."""
+    args = extract_arguments(data)
+    if isinstance(args, dict):
+        return args
+    text, _ = _arguments_json(args)
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        parsed = None
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _infer_tool_name(data: dict, tool_schemas) -> str:
+    """Recover the tool name when the model leaves it out.
+
+    The payload's parameter keys are matched against the declared schemas and a
+    name is returned only when exactly one tool declares all of them -- an
+    ambiguous shape is dropped rather than routed to the wrong tool.
+    """
+    if not tool_schemas:
+        return None
+    keys = set(_arguments_dict(data))
+    if not keys:
+        return None
+    matches = [name for name, props in tool_schemas.items()
+               if props and keys <= props]
+    return matches[0] if len(matches) == 1 else None
+
+
+def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
     """Extract tool_call blocks. Returns (clean_text, tool_calls_list).
 
-    ``allowed_names`` optionally restricts accepted function names. Blocks that
-    fail to parse, or that name an undeclared function, are left in the text so
-    that no content is silently lost.
+    ``allowed_names`` optionally restricts accepted function names.
+    ``tool_schemas`` maps each declared name to its parameter names; when the
+    model omits ``name`` a call is recovered only if its parameters point at
+    exactly one declared tool. Blocks that fail to parse, or that end up
+    unnamed, are left in the text so that no content is silently lost.
     """
+    from .gemini import log
+
     tool_calls = []
     pattern = r'```tool_call[ \t]*\n?(.*?)\n?```'
     clean_parts = []
     last_end = 0
     for m in re.finditer(pattern, text, re.DOTALL):
         body = m.group(1).strip()
+        reason = ""
         try:
             data = json.loads(body)
         except (json.JSONDecodeError, ValueError):
-            data = None
+            data, reason = None, "body is not valid JSON"
         parsed = None
         if isinstance(data, dict):
             name = data.get("name")
-            if name and (allowed_names is None or name in allowed_names):
-                args = data.get("arguments", data.get("args", {}))
-                args_str = args if isinstance(args, str) else json.dumps(args, ensure_ascii=False)
+            if not name:
+                name = _infer_tool_name(data, tool_schemas)
+                if name:
+                    log(f"Inferred missing tool name '{name}' from its parameters")
+            if not name:
+                reason = "no tool name"
+            elif allowed_names is not None and name not in allowed_names:
+                reason = f"undeclared tool '{name}'"
+            else:
+                args, degraded = _arguments_json(extract_arguments(data))
+                if degraded:
+                    log(f"tool_call '{name}': arguments unusable ({degraded}), "
+                        "sending an empty object so the client can report it")
                 parsed = {
                     "id": f"call_{uuid.uuid4().hex[:8]}",
                     "type": "function",
-                    "function": {"name": name, "arguments": args_str},
+                    "function": {"name": name, "arguments": args},
                 }
         if parsed is None:
+            log(f"Dropping tool_call block: {reason or 'unrecognised payload'}: {body[:300]}")
             continue
         clean_parts.append(text[last_end:m.start()])
         last_end = m.end()
@@ -532,23 +679,23 @@ def parse_google_function_calls(text: str) -> tuple:
         for match in re.findall(pattern, clean, re.DOTALL):
             try:
                 data = json.loads(match.strip())
-                if "name" in data:
-                    function_calls.append({
-                        "name": data["name"],
-                        "args": data.get("args", data.get("arguments", {})),
-                    })
-            except (json.JSONDecodeError, KeyError):
-                pass
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(data, dict) and data.get("name"):
+                function_calls.append({
+                    "name": data["name"],
+                    "args": _arguments_dict(data),
+                })
         clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
     if not function_calls and clean.strip().startswith("{"):
         try:
             data = json.loads(clean.strip())
-            if "name" in data and ("args" in data or "arguments" in data):
-                function_calls.append({
-                    "name": data["name"],
-                    "args": data.get("args", data.get("arguments", {})),
-                })
-                clean = ""
-        except (json.JSONDecodeError, KeyError):
-            pass
+        except (json.JSONDecodeError, ValueError):
+            data = None
+        if isinstance(data, dict) and data.get("name"):
+            function_calls.append({
+                "name": data["name"],
+                "args": _arguments_dict(data),
+            })
+            clean = ""
     return clean, function_calls

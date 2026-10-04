@@ -16,6 +16,7 @@ from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
     google_contents_to_prompt,
     messages_to_prompt,
+    parse_google_function_calls,
     parse_tool_calls,
 )
 
@@ -1030,6 +1031,96 @@ class ToolParsingTests(unittest.TestCase):
         )
 
         self.assertEqual(calls[0]["function"]["arguments"], '{"a": 1}')
+
+    def test_parse_tool_calls_accepts_flattened_arguments(self):
+        """The observed production shape: parameters beside ``name``, not nested.
+
+        Gemini writes ``{"name": "run_commands", "commands": [...]}`` often
+        enough; reading only ``arguments``/``args`` silently turned every such
+        call into ``{}``, which clients reject with "Invalid input".
+        """
+        clean, calls = parse_tool_calls(
+            '```tool_call\n{"name": "run_commands", "commands": ["npm test"]}\n```',
+            allowed_names={"run_commands"},
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["arguments"], '{"commands": ["npm test"]}')
+        self.assertEqual(clean, "")
+
+    def test_parse_tool_calls_accepts_argument_aliases(self):
+        for alias, payload in (
+            ("args", '{"name": "foo", "args": {"x": 1}}'),
+            ("input", '{"name": "foo", "input": {"x": 1}}'),
+            ("parameters", '{"name": "foo", "parameters": {"x": 1}}'),
+        ):
+            with self.subTest(alias=alias):
+                _, calls = parse_tool_calls(
+                    f"```tool_call\n{payload}\n```", allowed_names={"foo"})
+
+                self.assertEqual(calls[0]["function"]["arguments"], '{"x": 1}')
+
+    def test_parse_tool_calls_keeps_name_only_meta_keys_out_of_arguments(self):
+        _, calls = parse_tool_calls(
+            '```tool_call\n{"name": "foo", "description": "run it", "x": 1}\n```',
+            allowed_names={"foo"},
+        )
+
+        self.assertEqual(calls[0]["function"]["arguments"], '{"x": 1}')
+
+    def test_parse_tool_calls_recovers_python_literal_arguments(self):
+        _, calls = parse_tool_calls(
+            "```tool_call\n{\"name\": \"foo\", \"arguments\": \"{'x': 1}\"}\n```",
+            allowed_names={"foo"},
+        )
+
+        self.assertEqual(calls[0]["function"]["arguments"], '{"x": 1}')
+
+    def test_parse_tool_calls_degrades_unusable_string_to_empty_object(self):
+        """`function.arguments` must always parse as JSON.
+
+        Passing a non-JSON string through made every client fail before it
+        could even report which parameter was missing.
+        """
+        _, calls = parse_tool_calls(
+            '```tool_call\n{"name": "foo", "arguments": "npm test"}\n```',
+            allowed_names={"foo"},
+        )
+
+        self.assertEqual(calls[0]["function"]["arguments"], "{}")
+
+    def test_parse_tool_calls_drops_call_without_name(self):
+        clean, calls = parse_tool_calls(
+            '```tool_call\n{"commands": ["npm test"]}\n```', allowed_names={"foo"})
+
+        self.assertEqual(calls, [])
+        self.assertIn("commands", clean)
+
+    def test_parse_google_function_calls_accepts_flattened_args(self):
+        clean, calls = parse_google_function_calls(
+            '```function_call\n{"name": "run_commands", "commands": ["dir"]}\n```')
+
+        self.assertEqual(calls, [{"name": "run_commands", "args": {"commands": ["dir"]}}])
+        self.assertNotIn("function_call", clean)
+
+    def test_parse_google_function_calls_always_returns_object_args(self):
+        _, calls = parse_google_function_calls(
+            '```function_call\n{"name": "foo", "arguments": "broken"}\n```')
+
+        self.assertEqual(calls, [{"name": "foo", "args": {}}])
+
+    def test_messages_to_prompt_states_arguments_nesting(self):
+        prompt, _ = messages_to_prompt(
+            [{"role": "user", "content": "hi"}],
+            tools=[{"type": "function", "function": {
+                "name": "run_commands", "description": "run",
+                "parameters": {"type": "object", "properties": {
+                    "commands": {"type": "array"}}}}}],
+        )
+
+        self.assertIn('{"name": "func_name", "arguments": {"param": "value"}}', prompt)
+        self.assertIn('never beside "name"', prompt)
+        self.assertIn('"commands"', prompt)
 
 
 if __name__ == "__main__":

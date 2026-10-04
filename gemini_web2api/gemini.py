@@ -27,8 +27,18 @@ _httpx_client = None
 def log(msg: str):
     if CONFIG["log_requests"]:
         import sys
-        sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+        line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+        sys.stderr.write(line + "\n")
         sys.stderr.flush()
+        # A file sink keeps a trail when stderr is swallowed by a launcher
+        # (Start-Process, nohup, systemd without journal capture).
+        path = CONFIG.get("log_file")
+        if path:
+            try:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
 
 
 class GeminiError(Exception):

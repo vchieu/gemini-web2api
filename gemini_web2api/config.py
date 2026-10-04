@@ -22,6 +22,9 @@ DEFAULT_CONFIG = {
     # default_model. When True they return 404 model_not_found.
     "strict_models": False,
     "log_requests": True,
+    # Optional file sink for the same lines `log()` prints on stderr. Relative
+    # paths resolve against the server's working directory.
+    "log_file": None,
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],

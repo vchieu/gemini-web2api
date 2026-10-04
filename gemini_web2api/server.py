@@ -19,6 +19,7 @@ from .tools import (
     build_response_format_instruction,
     strip_code_fence,
     tool_names,
+    tool_parameters,
 )
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -136,6 +137,24 @@ def _upload_images(images: list) -> list:
         except Exception as e:
             raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
+
+def _log_tool_trace(raw_text: str, tool_calls) -> None:
+    """Log what the model emitted and what was parsed out of it.
+
+    A tool call that reaches the client with missing or unusable arguments is
+    indistinguishable, from the client's side, from a model that simply wrote
+    ``{"arguments": {}}``. The raw block is the only place that shows whether
+    the model or the parser is at fault, so log it whenever tools are involved.
+    """
+    blocks = raw_text.count("```tool_call")
+    log(f"upstream: {len(raw_text)} chars, {blocks} tool_call marker(s)")
+    for m in re.finditer(r"```tool_call[ \t]*\n?(.*?)\n?```", raw_text, re.DOTALL):
+        log(f"tool_call block: {m.group(1).strip()[:500]}")
+    if blocks and not tool_calls:
+        log("tool_call marker(s) present but no tool call was parsed")
+    if tool_calls:
+        log(f"parsed tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
+
 
 class GeminiHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
@@ -517,6 +536,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         allowed_names = tool_names(tools) or None
+        tool_schemas = tool_parameters(tools) or None
 
         # Pure streaming (no tools, no post-processing): stream tokens straight through.
         # When response_format is set the text still has to be defenced and
@@ -537,16 +557,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if attempt > 0:
                 call_prompt = prompt + "\n\nIMPORTANT: Respond with a tool_call block ONLY."
             try:
-                text = generate(call_prompt, model_id, think_mode, file_refs, extra)
+                raw = generate(call_prompt, model_id, think_mode, file_refs, extra)
             except Exception as e:
                 if attempt + 1 < attempts:
                     log(f"Tool retry after upstream error: {e}")
                     continue
                 self.send_api_error(*_map_upstream_error(e))
                 return
-            tool_calls = None
+            text, tool_calls = raw, None
             if tools and text and tool_choice != "none":
-                text, tool_calls = parse_tool_calls(text, allowed_names)
+                text, tool_calls = parse_tool_calls(text, allowed_names, tool_schemas)
+                _log_tool_trace(raw, tool_calls)
             if tool_calls or not required_tool:
                 break
 
