@@ -946,12 +946,17 @@ class StartupGuardTests(unittest.TestCase):
         CONFIG.clear()
         CONFIG.update(self.original_config)
 
-    def test_refuses_non_loopback_without_keys(self):
+    def test_auto_generates_key_for_non_loopback_without_keys(self):
         CONFIG["api_keys"] = []
 
         with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit):
-                _guard_bind("0.0.0.0", allow_insecure=False)
+            _guard_bind("0.0.0.0", allow_insecure=False)
+
+        # Auto-generated key is required for every request
+        self.assertTrue(CONFIG.get("api_keys"))
+        self.assertEqual(len(CONFIG["api_keys"]), 1)
+        self.assertIsInstance(CONFIG["api_keys"][0], str)
+        self.assertEqual(len(CONFIG["api_keys"][0]), 64)
 
     def test_allows_non_loopback_with_keys(self):
         CONFIG["api_keys"] = ["secret"]

@@ -154,7 +154,9 @@ def _join_prompt_parts(parts: list, max_bytes: int) -> str:
     for part in reversed(items):
         if not tail:
             if nbytes(part) > budget:
-                part = part.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
+                # Keep the tail (end) of oversized messages, not the head (beginning)
+                # This preserves questions at the end of user messages
+                part = part.encode("utf-8")[-budget:].decode("utf-8", errors="ignore")
                 tail.append(part)
                 used = budget
                 break
@@ -211,10 +213,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             })
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
-            tools_json = json.dumps(tool_defs, indent=2, ensure_ascii=False)
-            if len(tools_json.encode("utf-8")) > PROMPT_MAX_BYTES // 2:
+            # Use compact JSON by default to save space
+            tools_json = json.dumps(tool_defs, ensure_ascii=False)
+            # If still too large, slim down by removing parameters
+            if len(tools_json.encode("utf-8")) > PROMPT_MAX_BYTES // 3:
                 slim_defs = [{"name": t["name"], "description": t["description"]} for t in tool_defs]
-                tools_json = json.dumps(slim_defs, indent=2, ensure_ascii=False)
+                tools_json = json.dumps(slim_defs, ensure_ascii=False)
             parts.append(
                 "# Tool Use\n\n"
                 "You can call the following tools. Call format:\n"
@@ -235,7 +239,10 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                     if tcid and isinstance(fn, dict) and fn.get("name"):
                         id_to_name[tcid] = fn["name"]
 
-    for msg in messages:
+    # Track which tool result messages have been combined with their assistant tool_call
+    combined_tool_result_ids = set()
+    
+    for i, msg in enumerate(messages):
         if not isinstance(msg, dict):
             continue
         role = msg.get("role", "user")
@@ -277,11 +284,45 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                         f'```tool_call\n{{"id": {json.dumps(tc.get("id", ""))}, '
                         f'"name": {name}, "arguments": {args}}}\n```'
                     )
-                parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
+                # Combine with subsequent tool results to keep them together
+                combined = f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs)
+                for j in range(i + 1, len(messages)):
+                    next_msg = messages[j]
+                    if not isinstance(next_msg, dict):
+                        break
+                    if next_msg.get("role") != "tool":
+                        break
+                    tcid = next_msg.get("tool_call_id", "")
+                    combined_tool_result_ids.add(tcid)
+                    next_content = next_msg.get("content", "")
+                    if isinstance(next_content, list):
+                        text_parts = []
+                        for c in next_content:
+                            if not isinstance(c, dict):
+                                if isinstance(c, str):
+                                    text_parts.append(c)
+                                continue
+                            if c.get("type") in ("text", "input_text", "output_text"):
+                                text_parts.append(c.get("text", ""))
+                                continue
+                            image = _image_from_part(c)
+                            if image:
+                                images.append(image)
+                                text_parts.append("[Image attached]")
+                            elif isinstance(c.get("text"), str):
+                                text_parts.append(c["text"])
+                        next_content = " ".join(p for p in text_parts if p)
+                    name = next_msg.get("name") or id_to_name.get(tcid, "")
+                    body = _stringify_content(next_content)
+                    combined += f"\n[Tool result for {name} (id={tcid})]: {body}"
+                parts.append(combined)
             else:
                 parts.append(f"[Assistant]: {content}")
         elif role == "tool":
             tcid = msg.get("tool_call_id", "")
+            # Skip if already combined with assistant tool_call
+            if tcid in combined_tool_result_ids:
+                continue
             name = msg.get("name") or id_to_name.get(tcid, "")
             body = _stringify_content(content)
             parts.append(f"[Tool result for {name} (id={tcid})]: {body}")

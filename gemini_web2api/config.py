@@ -25,6 +25,15 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
+    # CORS origins allowed to read the response. Empty list means no CORS
+    # headers are emitted at all, which is the safe default when api_keys is
+    # also empty -- a malicious page could otherwise fetch the local server.
+    # Set to ["*"] explicitly when you have api_keys configured and want to
+    # allow any browser origin.
+    "cors_origins": [],
+    # Hard cap on a single request body. A large base64 image can otherwise
+    # eat unbounded RAM while the server reads it.
+    "max_body_bytes": 32 * 1024 * 1024,
     "temporary_chats": False,
 }
 

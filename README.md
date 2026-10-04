@@ -18,7 +18,9 @@ Convert Google Gemini's web interface into an OpenAI-compatible API. Zero cost, 
 - **Web Search**: Built-in internet access (Gemini's native search)
 - **Cross-Platform**: Pure Python, single optional dependency (`httpx` for streaming)
 - **Streaming**: SSE streaming support via `httpx`
-- **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration
+- **Codex CLI**: Responses API (`/v1/responses`) for OpenAI Codex integration (uses
+  non-streaming generation internally; fans out the complete answer as a full
+  SSE event sequence)
 - **Gemini CLI**: Google native API (`/v1beta/models`) for Gemini CLI compatibility
 
 ## Quick Start
@@ -251,6 +253,61 @@ python -m gemini_web2api
 ```
 
 Works with Clash, V2Ray, Shadowsocks, or any HTTP proxy.
+
+## Responses API (`/v1/responses`)
+
+The Responses API is designed for OpenAI Codex CLI integration. It accepts the
+same `input` array and `instructions` fields as the OpenAI Responses API, but
+**always uses non-streaming generation internally** -- even when the client
+requests `stream: true`. The server still emits the full SSE event sequence
+(`response.created`, `response.output_item.added`, `response.output_text.delta`,
+`response.completed`) so clients that expect streaming get the same wire format
+as a real streaming response.
+
+This is a deliberate trade-off: the underlying Gemini web endpoint does not
+expose a true token-by-token streaming mode, so the server generates the full
+answer first and then fans it out as a complete event stream. For most Codex
+use cases this is indistinguishable from real streaming.
+
+### Non-streaming behavior
+
+When `stream` is omitted or `false`, the endpoint returns a single JSON object
+with the full response, including `output` items and `usage`:
+
+```json
+{
+  "id": "resp_abc123",
+  "object": "response",
+  "status": "completed",
+  "model": "gemini-3.5-flash",
+  "output": [
+    {
+      "type": "message",
+      "id": "msg_xyz",
+      "role": "assistant",
+      "status": "completed",
+      "content": [{"type": "output_text", "text": "Hello!", "annotations": []}]
+    }
+  ],
+  "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}
+}
+```
+
+### Tool calling in Responses API
+
+Function calls are emitted as `function_call` output items with `call_id` and
+`arguments` fields:
+
+```json
+{
+  "type": "function_call",
+  "id": "fc_001",
+  "call_id": "fc_001",
+  "name": "get_weather",
+  "arguments": "{\"city\": \"Tokyo\"}",
+  "status": "completed"
+}
+```
 
 ## Tool Calling
 

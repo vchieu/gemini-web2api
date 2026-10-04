@@ -385,15 +385,20 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                         for index, t in enumerate(texts):
                             if t == emitted_raw_text or emitted_raw_text.startswith(t):
                                 continue
+                            if index:
+                                # Later text in the *same* line is a separate
+                                # block (thinking summary), not a cumulative
+                                # echo of the earlier one: emit it immediately.
+                                # Keep the primary cumulative text tracking
+                                # intact so the next line still has a prefix
+                                # relation and does not log spurious warnings.
+                                block = clean_text(t, strip=False)
+                                if block:
+                                    emitted_any = True
+                                    yield block
+                                continue
                             if t.startswith(emitted_raw_text):
                                 clean_buf += t[len(emitted_raw_text):]
-                                emitted_raw_text = t
-                            elif index:
-                                # Later text in the *same* line is a separate
-                                # block (thinking summary + answer), not a
-                                # cumulative echo of the earlier one: emit it
-                                # whole instead of dropping it.
-                                clean_buf += t
                                 emitted_raw_text = t
                             else:
                                 # First text of the line disagrees with everything
@@ -414,6 +419,10 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 emitted_any = True
                                 yield delta
             if clean_buf:
+                # If the stream ended inside an open scaffolding fence, strip it
+                if _holds_scaffold(clean_buf):
+                    open_at = clean_buf.rfind("```")
+                    clean_buf = clean_buf[:open_at]
                 delta = clean_text(clean_buf, strip=False)
                 if delta:
                     yield delta

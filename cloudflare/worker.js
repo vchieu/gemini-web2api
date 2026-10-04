@@ -2189,7 +2189,7 @@ async function handleChatCompletions(request, body, config) {
             choices: [{
               index: 0,
               delta: { content: "" },
-              finish_reason: (reason === 'length' || reason === 'tool_calls') ? reason : 'stop'
+              finish_reason: (reason === 'length' || reason === 'tool_calls' || reason === 'error') ? reason : 'stop'
             }],
           }) + '\n\n'));
           // 发送 [DONE] 标记（SSE 协议规定的流结束信号）
@@ -2517,16 +2517,33 @@ async function handleResponses(request, body, config) {
   }
 
   try {
-    // 调用 Gemini API
-    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
-    var text = extractResponseText(raw);
+    // tool_choice 为 required / 指定函数时：没有解析出调用就强制再试一次
+    var requiredTool = body.tool_choice === 'required' ||
+      (body.tool_choice && typeof body.tool_choice === 'object' &&
+        !!((body.tool_choice.function && body.tool_choice.function.name) ||
+           body.tool_choice.name));
+    var allowedNames = declaredFunctionNames(tools);
+    var attempts = requiredTool ? 2 : 1;
+    var text = '';
     var toolCalls = null;
 
-    // 解析工具调用（只接受已声明的函数名）
-    if (tools && text && body.tool_choice !== 'none') {
-      var parsed = parseToolCalls(text, declaredFunctionNames(tools));
-      text = parsed.cleanText;
-      toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
+    for (var attempt = 0; attempt < attempts; attempt++) {
+      // 调用 Gemini API
+      var callPrompt = (attempt > 0)
+        ? prompt + '\n\nIMPORTANT: Respond with a tool_call block ONLY.'
+        : prompt;
+      var raw = await geminiStreamGenerate(callPrompt, modelId, thinkMode, config);
+      var text = extractResponseText(raw);
+      var parsed = null;
+
+      // 解析工具调用（只接受已声明的函数名）
+      if (tools && text && body.tool_choice !== 'none') {
+        parsed = parseToolCalls(text, allowedNames);
+        text = parsed.cleanText;
+        toolCalls = parsed.toolCalls.length > 0 ? parsed.toolCalls : null;
+      }
+
+      if (toolCalls || !requiredTool) break;
     }
 
     // 构建 Responses API 格式的输出

@@ -142,13 +142,82 @@ class GeminiHandler(BaseHTTPRequestHandler):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
 
+    # ─── CORS / security helpers ──────────────────────────────────────────────
+
+    def _cors_origin(self) -> str:
+        """Return the Access-Control-Allow-Origin value, or '' to omit.
+
+        When api_keys is empty the server is unauthenticated; sending
+        ``*`` would let any malicious page read the response.  We only
+        emit the header when the operator explicitly configured
+        ``cors_origins``.
+        """
+        origins = CONFIG.get("cors_origins") or []
+        if not origins:
+            return ""
+        if "*" in origins:
+            return "*"
+        # Echo back the requesting origin if it is in the whitelist.
+        origin = self.headers.get("Origin", "")
+        if origin in origins:
+            return origin
+        return ""
+
+    def _send_cors_headers(self):
+        """Send CORS headers if applicable."""
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, x-api-key, x-goog-api-key",
+            )
+
+    def _check_host(self) -> bool:
+        """Reject requests whose Host header is not a loopback / configured host.
+
+        This blocks DNS-rebinding attacks where an attacker's domain resolves
+        to 127.0.0.1 but the browser sends ``Host: attacker.com``.
+        """
+        host = self.headers.get("Host", "")
+        if not host:
+            return True  # No Host header: allow (non-HTTP/1.1 edge case)
+        # Strip port
+        host_only = host.rsplit(":", 1)[0].lower()
+        allowed = {"localhost", "127.0.0.1", "::1"}
+        # Also allow the configured bind host
+        bind_host = (CONFIG.get("host") or "").lower()
+        if bind_host:
+            allowed.add(bind_host)
+        return host_only in allowed
+
+    def _check_origin(self) -> bool:
+        """Reject cross-origin requests when no API key is configured.
+
+        A malicious page can issue a ``text/plain`` POST (simple request, no
+        preflight) to our endpoint.  Without an API key we cannot distinguish
+        a legitimate local client from an attacker's page, so we reject any
+        request that carries an ``Origin`` header not in the whitelist.
+        """
+        keys = CONFIG.get("api_keys") or []
+        if keys:
+            return True  # Authenticated: origin check is not needed
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True  # No Origin: likely a non-browser client
+        origins = CONFIG.get("cors_origins") or []
+        if "*" in origins:
+            return True
+        return origin in origins
+
     # ─── response helpers ─────────────────────────────────────────────────────
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -168,7 +237,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._send_cors_headers()
         self.end_headers()
 
     def _sse_chunk(self, cid, model, delta, finish_reason):
@@ -215,6 +284,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         transfer_encoding = self.headers.get("Transfer-Encoding", "")
         if "chunked" in transfer_encoding.lower():
             chunks = []
+            total = 0
+            limit = CONFIG.get("max_body_bytes", 32 * 1024 * 1024)
             while True:
                 size_line = self.rfile.readline()
                 if not size_line:
@@ -230,11 +301,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         if trailer in (b"\r\n", b"\n", b""):
                             break
                     break
+                total += size
+                if total > limit:
+                    raise ValueError("request body too large")
                 chunks.append(self.rfile.read(size))
                 self.rfile.read(2)
             return b"".join(chunks)
 
-        length = int(self.headers.get("Content-Length", 0))
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            return b""
+        try:
+            length = int(raw_len)
+        except (ValueError, TypeError):
+            raise ValueError("invalid Content-Length header")
+        if length < 0:
+            raise ValueError("invalid Content-Length header")
+        if length > CONFIG.get("max_body_bytes", 32 * 1024 * 1024):
+            raise ValueError("request body too large")
         return self.rfile.read(length) if length else b""
 
     def _route_path(self) -> str:
@@ -269,8 +353,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         requested = self.headers.get("Access-Control-Request-Headers")
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self._send_cors_headers()
         self.send_header(
             "Access-Control-Allow-Headers",
             requested or "Authorization, Content-Type, x-api-key, x-goog-api-key",
@@ -321,6 +404,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _check_security(self) -> str:
+        """Run Host / Origin / Content-Type checks. Returns '' or an error message."""
+        if not self._check_host():
+            return "forbidden host"
+        if not self._check_origin():
+            return "cross-origin request not allowed"
+        return ""
+
     def _resolve_request_model(self, req):
         """Resolve the requested model. Returns a tuple or None (error sent)."""
         raw = req.get("model")
@@ -343,6 +434,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if self._needs_auth(path) and not self._authorized():
                 self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST, "invalid_api_key")
                 return
+            # Security checks: Host, Origin, Content-Type
+            security_err = self._check_security()
+            if security_err:
+                self.send_api_error(403, security_err, ERR_INVALID_REQUEST)
+                return
+            # Require application/json for POST requests (except OPTIONS)
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                self.send_api_error(415, "Content-Type must be application/json", ERR_INVALID_REQUEST)
+                return
             body = self._read_request_body()
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat(body)
@@ -354,6 +454,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self._handle_google_generate(body, stream=False)
             else:
                 self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
+        except ValueError as e:
+            # Body parsing errors: invalid Content-Length, too large, etc.
+            if "too large" in str(e):
+                self.send_api_error(413, str(e), ERR_INVALID_REQUEST)
+            else:
+                self.send_api_error(400, str(e), ERR_INVALID_REQUEST)
+            return
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:

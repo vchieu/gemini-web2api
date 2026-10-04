@@ -2,10 +2,11 @@
 import argparse
 import os
 import sys
+import uuid
 
 from .config import CONFIG, load_config, find_config
 from .models import MODELS
-from .gemini import HAS_HTTPX, fetch_latest_bl
+from .gemini import HAS_HTTPX, fetch_latest_bl, log
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
 
@@ -24,26 +25,24 @@ def _guard_bind(host, allow_insecure: bool) -> None:
     """Refuse an exposed bind with no API keys unless explicitly opted in.
 
     Binding a routable interface with ``api_keys: []`` hands your Google
-    session to anyone who can reach the port, so this fails fast instead of
-    printing a warning that scrolls past in the startup banner.
+    session to anyone who can reach the port. With no keys configured and
+    no ``--allow-insecure``, we generate a one-time random key at startup,
+    print it in the banner, and require it for every request -- so the
+    Dockerfile can omit ``--allow-insecure``.  Anyone really wanting to
+    expose the port passes ``--allow-insecure`` intentionally.
     """
-    if allow_insecure or _is_loopback(host) or CONFIG.get("api_keys"):
+    if allow_insecure:
         return
-    lines = [
-        "",
-        "Refusing to start: no api_keys configured while binding a non-loopback host.",
-        f"  host={host}  port={CONFIG['port']}",
-        "Anyone able to reach this port can use the Google account behind it.",
-        "",
-        "Pick one:",
-        '  1. set "api_keys": ["some-long-random-secret"] in your config  (recommended)',
-        "  2. bind loopback only:  --host 127.0.0.1",
-        "  3. pass --allow-insecure if exposure is intentional",
-        "",
-    ]
-    sys.stderr.write("\n".join(lines) + "\n")
-    sys.stderr.flush()
-    raise SystemExit(1)
+    if _is_loopback(host):
+        return
+    if CONFIG.get("api_keys"):
+        return
+
+    # Generate a one-time key and require it; Docker users read it from
+    # the startup log and use it with Authorization: Bearer <key>.
+    key = uuid.uuid4().hex[:32] + uuid.uuid4().hex[:32]
+    log(f"Auto-generated API key (print this): {key}")
+    CONFIG["api_keys"] = [key]
 
 
 def _maybe_refresh_bl() -> None:
@@ -98,7 +97,12 @@ def main():
     print(f"  Listening: http://{host}:{port}")
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
-    print(f"  Auth:      {'enabled' if CONFIG.get('api_keys') else 'DISABLED (any client can call this)'}")
+    auth_enabled = bool(CONFIG.get('api_keys'))
+    auth_msg = 'enabled' if auth_enabled else 'DISABLED (any client can call this)'
+    if auth_enabled and not CONFIG.get('api_keys'):
+        # Auto-generated key case: show that auth is required
+        auth_msg = 'enabled (auto-generated key required)'
+    print(f"  Auth:      {auth_msg}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
     print(f"  Proxy:     {CONFIG.get('proxy') or 'system env'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
