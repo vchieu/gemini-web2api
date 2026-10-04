@@ -701,6 +701,31 @@ def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
     return clean, tool_calls
 
 
+def looks_like_tool_call(text: str) -> bool:
+    """Whether ``text`` holds a block ``parse_tool_calls`` would actually emit.
+
+    One response carries its answer and its tool call as separate texts, so a
+    caller that picks between them by length can let a summary win over a call
+    the model really made -- the client then receives prose claiming a tool
+    was used and no call to run. This is the tie-breaker for that choice.
+
+    Only the canonical shape counts. A fenced JSON example that merely happens
+    to carry a top-level ``name`` is not a call, so preferring candidates that
+    pass here can never swap the answer for a snippet quoted in prose: anything
+    rejected simply stays out of the running and the caller falls back to
+    comparing lengths as before.
+    """
+    for _start, _end, data, kind in _iter_tool_blocks(text):
+        if not isinstance(data, dict) or not data.get("name"):
+            continue
+        # ``{"name": ..., "arguments": ...}`` is a call under any fence; a
+        # bare ``json`` fence needs the argument wrapper, because ``{"name":
+        # "Alice"}`` in an example is exactly the prose this must not catch.
+        if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
+            return True
+    return False
+
+
 # Gemini's own generation step failing produces this canned sentence rather
 # than an answer. It reaches the client as a normal 200, so the caller reads it
 # as "the model replied" and stops -- when in fact nothing was generated and a

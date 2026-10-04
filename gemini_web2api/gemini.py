@@ -18,6 +18,7 @@ except ImportError:
     HAS_HTTPX = False
 
 from .config import CONFIG
+from .tools import looks_like_tool_call
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
@@ -318,16 +319,28 @@ def _extract_texts_from_line(line: str) -> list:
 
 
 def extract_response_text(raw: str) -> str:
-    """Parse full response to get final text."""
+    """Parse full response to get final text.
+
+    Ties break towards the candidate carrying a tool call, not towards the
+    longer one. The answer and the call arrive as separate texts within the
+    same payload; if a thinking or summary block happens to run longer, a
+    longest-wins pick drops the call and the client is handed prose that only
+    claims a tool was used. Nothing changes when no candidate looks like a
+    call, which is the overwhelmingly common case.
+    """
     bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
     if bard_err:
         raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
-    last_text = ""
+    best_text = ""
+    best_call = ""
     for line in raw.split("\n"):
         for t in _extract_texts_from_line(line):
-            if len(t) > len(last_text):
-                last_text = t
-    return clean_text(last_text)
+            if looks_like_tool_call(t):
+                if len(t) > len(best_call):
+                    best_call = t
+            elif len(t) > len(best_text):
+                best_text = t
+    return clean_text(best_call or best_text)
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:

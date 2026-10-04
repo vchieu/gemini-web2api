@@ -10,13 +10,14 @@ from urllib.parse import parse_qs
 
 from gemini_web2api.__main__ import _guard_bind, _maybe_refresh_bl
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload, generate_stream
+from gemini_web2api.gemini import _build_payload, extract_response_text, generate_stream
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
     google_contents_to_prompt,
     is_required_tool_choice,
     looks_like_missed_tool_call,
+    looks_like_tool_call,
     looks_like_upstream_error,
     messages_to_prompt,
     parse_google_function_calls,
@@ -1200,6 +1201,48 @@ class GenerateStreamTests(unittest.TestCase):
 
         self.assertEqual(len(out), 2)
         self.assertEqual(out[1], "The answer is 42.")
+
+
+class ResponseExtractionTests(unittest.TestCase):
+    """Which text of a multi-text payload becomes the response body.
+
+    ``generate_stream`` already treats ``texts[1:]`` in one line as separate
+    blocks, so the shape is known to occur. The non-streaming path reaches the
+    same place by taking the longest text it can find -- which drops a tool
+    call whenever the model also says anything of length.
+    """
+
+    CALL = '```tool_call\n{"name": "read", "arguments": {"path": "a.py"}}\n```'
+
+    def test_a_tool_call_wins_over_a_longer_summary(self):
+        summary = "Dai hon nhieu: " + "mo ta viec da doc file a.py. " * 12
+        self.assertGreater(len(summary), len(self.CALL))
+
+        raw = _wrb_line_parts([summary, self.CALL])
+
+        self.assertEqual(extract_response_text(raw).strip(), self.CALL.strip())
+
+    def test_without_a_tool_call_length_still_decides(self):
+        """Nothing changes for the common case: no candidate looks like a call."""
+        long = "Day la cau tra loi day du va chi tiet hon nhieu. " * 6
+        raw = _wrb_line_parts(["ngan.", long])
+
+        self.assertEqual(extract_response_text(raw).strip(), long.strip())
+
+    def test_json_quoted_in_prose_is_not_mistaken_for_a_call(self):
+        """A fenced example carrying ``name`` must not win the tie.
+
+        Preferring candidates that only *look* like a call would swap a real
+        answer for the snippet someone quoted while explaining something.
+        """
+        self.assertFalse(looks_like_tool_call('```json\n{"name": "Alice"}\n```'))
+
+    def test_a_fenced_json_call_is_still_recognised(self):
+        """``{"name": ..., "arguments": ...}`` is a call whatever the fence."""
+        self.assertTrue(looks_like_tool_call(
+            '```json\n{"name": "read", "arguments": {"path": "a.py"}}\n```'))
+        self.assertTrue(looks_like_tool_call(self.CALL))
+        self.assertFalse(looks_like_tool_call("```tool_call\nnot json\n```"))
 
 
 class StartupGuardTests(unittest.TestCase):
