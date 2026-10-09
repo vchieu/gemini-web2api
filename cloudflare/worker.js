@@ -2139,7 +2139,8 @@ async function handleChatCompletions(request, body, config) {
 
     } catch (error) {
       log('Upstream error: ' + error.message, 'ERROR', config);
-      return sendJSON({ error: { message: 'upstream error: ' + error.message } }, 502);
+      // 503, not 502: /chat/completions declares 400/401/403/404/429/500/503.
+      return sendJSON({ error: { message: 'upstream error: ' + error.message } }, 503);
     }
   }
 
@@ -2667,7 +2668,8 @@ async function handleResponses(request, body, config) {
       usage: usage,
     }));
   } catch (error) {
-    return sendJSON({ error: { message: 'upstream error: ' + error.message } }, 502);
+    // 503, not 502: /responses declares 400/404/429/503.
+    return sendJSON({ error: { message: 'upstream error: ' + error.message } }, 503);
   }
 }
 
