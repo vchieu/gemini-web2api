@@ -201,6 +201,18 @@ var DEFAULT_CONFIG = {
   // 可选值参考 MODELS 字典的键名
   defaultModel: 'gemini-3.6-flash',
 
+  // ---- 模型票据（决定上游真正使用哪个模型）----
+  // 键名对应 MODELS 里每个模型的 ticket 字段：
+  //   flash / flash-thinking / lite / lite-thinking / pro / pro-thinking
+  // 值是从浏览器 StreamGenerate 请求头 X-Goog-Ext-525001261-Jspb
+  // 原样复制的整串 JSON。抓取方法：
+  //   1. 打开 https://gemini.google.com 并选择要抓取的模型
+  //   2. F12 → Network → 找到 StreamGenerate 请求
+  //   3. Headers → Request Headers → 复制该头的完整值
+  //   4. 配置到 CF Dashboard 的 MODEL_TICKETS 环境变量（JSON 对象）
+  // 票据会过期，过期后上游退回账号默认模型，日志会打印"路由不匹配"警告。
+  modelTickets: {},
+
   // ---- API 密钥白名单 ----
   // 用于验证客户端请求的密钥列表
   // 空数组 [] 表示不验证，所有请求都可以访问（不推荐用于生产）
@@ -440,45 +452,165 @@ function getRandomSecChUaPlatform() {
 // 
 // think 字段含义（思考模式）：
 //   0 = 启用深度思考（模型会花更多时间推理）
+//   1 = Extended（扩展思考，实测输出比 0 更长）
 //   4 = AUTO（自动选择思考深度，由 Gemini 决定）
+//
+// variant 字段 → inner[80]（1=标准版，2=扩展/思考版）
+// ticket 字段 → config.modelTickets 里的键名
+//
+// ⚠️ 模型路由的关键事实（2026-09 实测，与 Python 端一致）：
+//   上游只有在请求带 X-Goog-Ext-525001261-Jspb 票据头时才认
+//   inner[79]/inner[80]。没有票据这两个字段会被忽略，上游直接用账号
+//   默认模型作答（实测为 3.1 Pro）——也就是"选了什么模型都变成 Pro"。
+//   有票据时以票据为准，票据内嵌的 (family, variant) 覆盖 body 字段。
 
 var MODELS = {
   'gemini-3.6-flash': {
     mode: 1,        // FAST - 快速模式
     think: 4,       // AUTO - 自动选择思考深度
+    variant: 1,     // inner[80] - 标准版
+    ticket: 'flash',
     desc: 'Latest all-around model (Gemini 3.6 Flash)',
   },
   'gemini-3.5-flash': {
     mode: 1,        // FAST
     think: 4,       // AUTO
+    variant: 1,     // inner[80] - 标准版
+    ticket: 'flash',
     desc: 'Alias for gemini-3.6-flash (backend upgraded)',
   },
   'gemini-3.5-flash-thinking': {
     mode: 2,        // THINKING - 深度思考模式
-    think: 0,       // 启用深度思考
+    think: 1,       // Extended（实测比 0 输出更长）
+    variant: 2,     // inner[80] - 扩展思考版
+    ticket: 'flash-thinking',
     desc: 'Deep thinking mode, longest output (~20k chars)',
   },
   'gemini-3.1-pro': {
     mode: 3,        // PRO - 专业版
     think: 4,       // AUTO
+    variant: 1,     // inner[80] - 标准版
+    ticket: 'pro',
     desc: 'Pro model (requires cookie for real routing)',
   },
   'gemini-auto': {
     mode: 4,        // AUTO - 自动模型选择
     think: 4,       // AUTO
+    variant: 1,     // inner[80] - 标准版
+    // 不配票据：由上游自行决定用哪个模型
     desc: 'Auto model selection',
   },
   'gemini-3.5-flash-thinking-lite': {
     mode: 5,        // FAST_DYNAMIC_THINKING - 动态思考
-    think: 0,       // 启用思考
+    think: 1,       // Extended（实测比 0 输出更长）
+    variant: 2,     // inner[80] - 扩展思考版
+    // lite-thinking 票据内嵌的是 (6,2)，实际落到 Flash-Lite Extended
+    ticket: 'lite-thinking',
     desc: 'Dynamic thinking with adaptive depth',
   },
   'gemini-flash-lite': {
     mode: 6,        // FLASH_LITE - 轻量快速
     think: 4,       // AUTO
+    variant: 1,     // inner[80] - 标准版
+    ticket: 'lite',
     desc: 'Lightweight fast model',
   },
 };
+
+// 模型票据请求头：浏览器为每个模型家族铸造一个，上游按它路由模型。
+// 票据内嵌时间戳会过期，过期后上游退回账号默认模型（见上方说明）。
+var TICKET_HEADER = 'X-Goog-Ext-525001261-Jspb';
+
+/**
+ * 根据模型名查出该模型的票据值
+ *
+ * @param {string} modelName - 模型名称（不含 @think= 参数）
+ * @param {Object} config - 请求级配置对象（含 modelTickets）
+ * @returns {string|null} 票据值，未配置时返回 null
+ */
+function ticketFor(modelName, config) {
+  var cfg = MODELS[modelName];
+  if (!cfg || !cfg.ticket) return null;
+  var tickets = (config && config.modelTickets) || {};
+  return tickets[cfg.ticket] || null;
+}
+
+/**
+ * 从一行 wrb.fr 响应中解析上游实际使用的模型
+ *
+ * 响应会回显真正服务本次请求的模型名 / family / variant，
+ * 用来发现"请求 A 实际被 B 服务"这种静默路由错误。
+ *
+ * @param {string} line - 包含 "wrb.fr" 的完整响应行
+ * @returns {Object|null} {label, family, variant}，解析失败返回 null
+ */
+function upstreamEcho(line) {
+  if (line.indexOf('"wrb.fr"') === -1 || line.length < 200) return null;
+  try {
+    var meta = JSON.parse(JSON.parse(line)[0][2]);
+    if (Array.isArray(meta) && meta.length >= 60) {
+      return { label: meta[42], family: meta[58], variant: meta[59] };
+    }
+  } catch (e) {
+    // 行不完整或结构变化：忽略，不影响正文解析
+  }
+  return null;
+}
+
+/**
+ * 核对一行上游响应里回显的模型与请求是否一致
+ *
+ * 票据优先于 body 字段，所以期望值优先取票据内嵌的 (family, variant)。
+ * 请求本身仍然 200，答案也正常，只有这条日志能暴露票据已过期。
+ *
+ * @param {string} line - 包含 "wrb.fr" 的完整响应行
+ * @param {string|null} ticket - 本次请求使用的票据
+ * @param {number} modelId - 请求的 family（inner[79]）
+ * @param {number} [variant] - 请求的 variant（inner[80]）
+ * @param {Object} config - 请求级配置对象
+ * @returns {boolean} 该行确实包含模型回显时返回 true
+ */
+function checkRoutingLine(line, ticket, modelId, variant, config) {
+  var echo = upstreamEcho(line);
+  if (!echo) return false;
+
+  var wantFamily = modelId;
+  var wantVariant = variant;
+  if (ticket) {
+    try {
+      var t = JSON.parse(ticket);
+      wantFamily = t[14];
+      wantVariant = t[15];
+    } catch (e) {
+      // 票据不是合法 JSON：退回 body 字段做比较
+    }
+  }
+  if (echo.family !== wantFamily ||
+      (wantVariant !== undefined && wantVariant !== null && echo.variant !== wantVariant)) {
+    log('路由不匹配：请求 family=' + wantFamily + ' variant=' + wantVariant +
+        '，上游实际使用 ' + JSON.stringify(echo.label) +
+        '（family=' + echo.family + ' variant=' + echo.variant + '）；' +
+        'modelTickets 里的票据可能缺失或已过期，请从浏览器重新抓取', 'WARN', config);
+  }
+  return true;
+}
+
+/**
+ * 在整段响应文本里核对一次路由（只看第一个带模型回显的行）
+ *
+ * @param {string} raw - 上游原始响应文本
+ * @param {string|null} ticket - 本次请求使用的票据
+ * @param {number} modelId - 请求的 family（inner[79]）
+ * @param {number} [variant] - 请求的 variant（inner[80]）
+ * @param {Object} config - 请求级配置对象
+ */
+function checkRouting(raw, ticket, modelId, variant, config) {
+  if (!raw) return;
+  var lines = raw.split('\n');
+  for (var i = 0; i < lines.length; i++) {
+    if (checkRoutingLine(lines[i], ticket, modelId, variant, config)) return;
+  }
+}
 
 // ============================================================================
 // 🔑 核心：请求级配置生成器（解决并发串扰 + 多Cookie轮换 + 指纹轮换）
@@ -537,6 +669,10 @@ function getRequestConfig(env) {
     sapisid: DEFAULT_CONFIG.sapisid,
     logRequests: DEFAULT_CONFIG.logRequests,
     fingerprintJitterMs: DEFAULT_CONFIG.fingerprintJitterMs,
+
+    // ---- 嵌套对象：modelTickets 需要深拷贝 ----
+    // 同 rateLimit：对象不能直接赋值，否则多个请求共享同一个引用
+    modelTickets: Object.assign({}, DEFAULT_CONFIG.modelTickets),
 
     // ---- 嵌套对象：rateLimit 需要深拷贝 ----
     // 因为 rateLimit 是一个对象，不能直接赋值（会引用共享）
@@ -645,6 +781,21 @@ function getRequestConfig(env) {
       // JSON 解析失败时保留默认值
       // 输出错误日志但不中断程序运行
       console.error('[ERROR] API_KEYS 解析失败: ' + e.message + '，使用默认值');
+    }
+  }
+
+  // ---- 模型票据：JSON 对象格式，同样需要解析 ----
+  // env.MODEL_TICKETS 形如 '{"flash":"[1,null,...]","lite-thinking":"[1,null,...]"}'
+  // 键名对应 MODELS 里各模型的 ticket 字段
+  if (env.MODEL_TICKETS) {
+    try {
+      var parsedTickets = JSON.parse(env.MODEL_TICKETS);
+      if (parsedTickets && typeof parsedTickets === 'object') {
+        config.modelTickets = parsedTickets;
+      }
+    } catch (e) {
+      // 解析失败时保留默认值（空对象），此时模型会退回 body 字段路由
+      console.error('[ERROR] MODEL_TICKETS 解析失败: ' + e.message + '，使用默认值');
     }
   }
 
@@ -888,6 +1039,9 @@ function getAccountPrefix(config) {
  *   inner[61]: 附件列表 []
  *   inner[79]: 模型选择（MODE_CATEGORY 枚举值）⭐ 最关键的字段
  *     1=FAST, 2=THINKING, 3=PRO, 4=AUTO, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
+ *   inner[80]: 模型变体（1=标准版, 2=扩展/思考版）
+ *     与 inner[79] 一起决定模型；但两者只有在请求带票据头时才生效
+ *     （见 MODELS 上方的说明）
  * 
  * 其他索引位置的值为 null，表示使用默认设置。
  * 
@@ -899,12 +1053,13 @@ function getAccountPrefix(config) {
  * @param {number} modelId - 模型类别 ID（MODE_CATEGORY 枚举值: 1-6）
  * @param {number} thinkMode - 思考模式设置（0=深度思考, 4=自动）
  * @param {Object} config - 请求级配置对象
+ * @param {number} [variant] - 模型变体（inner[80]），未定义时不发送该字段
  * @returns {string} URL 编码的请求体字符串，格式为 "f.req=..."
  */
-function buildPayload(prompt, modelId, thinkMode, config) {
-  // 创建 80 个元素的数组，所有元素初始化为 null
-  // 这是 Gemini Web 前端实际使用的数据结构
-  var inner = new Array(80).fill(null);
+function buildPayload(prompt, modelId, thinkMode, config, variant) {
+  // 创建 81 个元素的数组，所有元素初始化为 null
+  // 这是 Gemini Web 前端实际使用的数据结构（含 inner[80] 变体字段）
+  var inner = new Array(81).fill(null);
 
   // --- 用户消息 ---
   // [prompt, 消息索引, 图片, 附件, 元数据, 上下文ID, 新对话标志]
@@ -961,6 +1116,13 @@ function buildPayload(prompt, modelId, thinkMode, config) {
   //   1=FAST（快速）, 2=THINKING（深度思考）, 3=PRO（专业版）
   //   4=AUTO（自动）, 5=FAST_DYNAMIC_THINKING, 6=FLASH_LITE
   inner[79] = modelId;
+
+  // ⭐ 模型变体（与 [79] 配合决定具体模型）
+  //   1=标准版, 2=扩展/思考版
+  // 只在有值时发送：留 null 与 Gemini Web 前端的默认行为一致
+  if (typeof variant === 'number') {
+    inner[80] = variant;
+  }
 
   // --- 外层包装 ---
   // Gemini 的请求体是双层嵌套 JSON:
@@ -1032,9 +1194,10 @@ function buildUrl(config) {
  * 所以只有当 UA 是 Chrome 时才添加这些头。
  * 
  * @param {Object} config - 请求级配置对象
+ * @param {string} [ticket] - 模型票据（X-Goog-Ext-525001261-Jspb 的值）
  * @returns {Promise<Object>} HTTP 请求头对象
  */
-async function buildHeaders(config) {
+async function buildHeaders(config, ticket) {
   // 获取多账户 URL 前缀
   var prefix = getAccountPrefix(config);
 
@@ -1094,6 +1257,13 @@ async function buildHeaders(config) {
     headers['Authorization'] = await makeSapisidHash(config.sapisid);
   }
 
+  // 第七步：模型票据头
+  // 上游按这个头路由模型，inner[79]/inner[80] 只是它的补充
+  // 没有它时上游会忽略 body 里的模型字段，直接用账号默认模型
+  if (ticket) {
+    headers[TICKET_HEADER] = ticket;
+  }
+
   return headers;
 }
 
@@ -1131,10 +1301,12 @@ async function buildHeaders(config) {
  * @param {number} modelId - 模型类别 ID（MODE_CATEGORY 枚举值: 1-6）
  * @param {number} thinkMode - 思考模式设置（0=深度思考, 4=自动）
  * @param {Object} config - 请求级配置对象
+ * @param {string} [ticket] - 模型票据（决定上游实际使用的模型）
+ * @param {number} [variant] - 模型变体（inner[80]）
  * @returns {Promise<string>} API 原始响应文本（包含嵌套 JSON）
  * @throws {Error} 所有重试失败后抛出最后的错误
  */
-async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
+async function geminiStreamGenerate(prompt, modelId, thinkMode, config, ticket, variant) {
   // 🎭 请求前添加随机微小延迟（模拟人类操作间隔）
   // 延迟时间在 0 到 fingerprintJitterMs 毫秒之间随机均匀分布
   // 例如 fingerprintJitterMs=1500 时，延迟在 0 到 1.5 秒之间
@@ -1144,8 +1316,8 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
   }
 
   // 构建请求负载、请求头、请求 URL
-  var body = buildPayload(prompt, modelId, thinkMode, config);
-  var headers = await buildHeaders(config);
+  var body = buildPayload(prompt, modelId, thinkMode, config, variant);
+  var headers = await buildHeaders(config, ticket);
   var url = buildUrl(config);
 
   // 保存最后一次错误，所有重试失败后抛出
@@ -1157,7 +1329,7 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
       // 🎭 重试时重新构建请求头（使用不同的浏览器指纹）
       // 这增加了重试成功的机会
       if (attempt > 0) {
-        headers = await buildHeaders(config);
+        headers = await buildHeaders(config, ticket);
         // 重试时也添加新的随机延迟
         // 避免在完全相同的时间点重试
         if (config.fingerprintJitterMs > 0) {
@@ -1221,8 +1393,11 @@ async function geminiStreamGenerate(prompt, modelId, thinkMode, config) {
         throw new Error('HTTP ' + response.status + ': ' + errorText.substring(0, 200));
       }
 
-      // 请求成功，返回响应文本
-      return await response.text();
+      // 请求成功，读取响应文本
+      // 顺带核对一次路由：票据缺失/过期时上游会换成别的模型，只有日志看得出来
+      var rawText = await response.text();
+      checkRouting(rawText, ticket, modelId, variant, config);
+      return rawText;
 
     } catch (error) {
       // 保存错误信息
@@ -1948,9 +2123,11 @@ function sendSSE(stream) {
  *   - modelName: 去掉 @think= 参数后的实际模型名称
  *   - modelId: MODE_CATEGORY 枚举值（1-6）
  *   - thinkMode: 思考模式（0=深度思考, 4=自动）
+ *   - variant: inner[80]（1=标准版, 2=扩展思考版），未定义时不发送该字段
+ *   - ticket: 该模型的上游票据值，未配置时为 null
  *   - error: 错误信息，null 表示正常
  */
-function resolveModel(modelName, fallbackModel) {
+function resolveModel(modelName, fallbackModel, config) {
   var thinkOverride = null;
   var actualModelName = modelName;
 
@@ -1965,6 +2142,7 @@ function resolveModel(modelName, fallbackModel) {
   }
 
   // 查找模型配置
+  var usedName = actualModelName;
   var cfg = MODELS[actualModelName];
   if (!cfg) {
     // Unknown model: fall back the way the Python server does so hard-coded
@@ -1974,6 +2152,7 @@ function resolveModel(modelName, fallbackModel) {
     if (!cfg) {
       return { error: '未知模型: ' + actualModelName };
     }
+    usedName = fallbackModel;   // 票据要按实际使用的模型查
   }
 
   // 返回解析结果
@@ -1981,6 +2160,8 @@ function resolveModel(modelName, fallbackModel) {
     modelName: actualModelName,
     modelId: cfg.mode,                                            // 模型类别 ID
     thinkMode: thinkOverride !== null ? thinkOverride : cfg.think,  // 使用覆盖值或默认值
+    variant: cfg.variant,                                          // inner[80] 变体
+    ticket: ticketFor(usedName, config),                           // 上游路由票据
     error: null,
   };
 }
@@ -2019,7 +2200,7 @@ function resolveModel(modelName, fallbackModel) {
  */
 async function handleChatCompletions(request, body, config) {
   // ---- 第一步：解析模型 ----
-  var resolved = resolveModel(body.model || config.defaultModel, config.defaultModel);
+  var resolved = resolveModel(body.model || config.defaultModel, config.defaultModel, config);
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -2062,7 +2243,7 @@ async function handleChatCompletions(request, body, config) {
         var callPrompt = (attempt > 0)
           ? prompt + '\n\nIMPORTANT: Respond with a tool_call block ONLY.'
           : prompt;
-        var raw = await geminiStreamGenerate(callPrompt, modelId, thinkMode, config);
+        var raw = await geminiStreamGenerate(callPrompt, modelId, thinkMode, config, resolved.ticket, resolved.variant);
 
         // 提取并清理响应文本
         text = extractResponseText(raw);
@@ -2238,8 +2419,8 @@ async function handleChatCompletions(request, body, config) {
           }, 2000);
 
           // ---- 第三步：构建并发送 Gemini 请求 ----
-          var reqBody = buildPayload(prompt, modelId, thinkMode, config);
-          var headers = await buildHeaders(config);
+          var reqBody = buildPayload(prompt, modelId, thinkMode, config, resolved.variant);
+          var headers = await buildHeaders(config, resolved.ticket);
           var url = buildUrl(config);
 
           // 创建独立的 AbortController 用于超时控制
@@ -2274,6 +2455,7 @@ async function handleChatCompletions(request, body, config) {
             var decoder = new TextDecoder();
             var buffer = '';      // 行缓冲区（处理不完整的行）
             var prevText = '';    // 记录之前已发送的完整文本
+            var routingChecked = false;   // 路由核对只需做一次
 
             while (true) {
               var readResult = await reader.read();
@@ -2300,6 +2482,12 @@ async function handleChatCompletions(request, body, config) {
                 var line = lines[li];
                 // 跳过不包含数据标记的行或太短的行
                 if (line.indexOf('"wrb.fr"') === -1 || line.length < 200) continue;
+
+                // 核对一次路由：票据缺失/过期时上游会换成别的模型
+                if (!routingChecked) {
+                  routingChecked = true;
+                  checkRoutingLine(line, resolved.ticket, modelId, resolved.variant, config);
+                }
 
                 try {
                   // 解析 Gemini 的嵌套 JSON 响应
@@ -2417,7 +2605,7 @@ async function handleChatCompletions(request, body, config) {
  */
 async function handleResponses(request, body, config) {
   // 解析模型
-  var resolved = resolveModel(body.model || config.defaultModel, config.defaultModel);
+  var resolved = resolveModel(body.model || config.defaultModel, config.defaultModel, config);
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -2533,7 +2721,7 @@ async function handleResponses(request, body, config) {
       var callPrompt = (attempt > 0)
         ? prompt + '\n\nIMPORTANT: Respond with a tool_call block ONLY.'
         : prompt;
-      var raw = await geminiStreamGenerate(callPrompt, modelId, thinkMode, config);
+      var raw = await geminiStreamGenerate(callPrompt, modelId, thinkMode, config, resolved.ticket, resolved.variant);
       var text = extractResponseText(raw);
       var parsed = null;
 
@@ -2696,7 +2884,7 @@ async function handleGoogleAPI(request, body, stream, config) {
     return sendJSON({ error: { message: 'model not specified in path' } }, 400);
   }
 
-  var resolved = resolveModel(modelName, config.defaultModel);
+  var resolved = resolveModel(modelName, config.defaultModel, config);
   if (resolved.error) {
     return sendJSON({ error: { message: resolved.error } }, 400);
   }
@@ -2711,7 +2899,7 @@ async function handleGoogleAPI(request, body, stream, config) {
   }
 
   try {
-    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config);
+    var raw = await geminiStreamGenerate(prompt, modelId, thinkMode, config, resolved.ticket, resolved.variant);
     var text = extractResponseText(raw);
 
     // 构建 Google 格式的响应

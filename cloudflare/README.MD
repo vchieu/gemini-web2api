@@ -159,6 +159,11 @@ curl -N https://你的worker.workers.dev/v1/chat/completions \
 | `GEMINI_BL` | Gemini 构建标签（遇到 405 时更新） | `boq_assistant-bard-web-server_20260716.08_p0` |
 | `DEFAULT_MODEL` | 默认模型 | `gemini-3.6-flash` |
 | `AUTH_USER` | 多账户索引 | `0` |
+| `MODEL_TICKETS` | 模型票据（JSON 对象，决定上游真正使用的模型） | `{"flash":"[1,null,...]"}` |
+
+`MODEL_TICKETS` 的键名对应 `MODELS` 里各模型的 `ticket` 字段：
+`flash` / `flash-thinking` / `lite` / `lite-thinking` / `pro` / `pro-thinking`。
+抓取方法见下方「模型票据（必需）」。
 
 ### 性能调优
 
@@ -274,6 +279,34 @@ SAPISID = "sapisid_1| sapisid_2| sapisid_3"
 
 **原因**：多模型并发请求共享全局配置。  
 **解决**：当前版本已通过请求级配置隔离解决此问题。
+
+---
+
+## 🎫 模型票据（必需）
+
+上游**不是按模型名路由**的，而是按浏览器为每个模型家族铸造的票据请求头
+`X-Goog-Ext-525001261-Jspb`。请求体里的 `inner[79]`（家族）和 `inner[80]`（变体）
+只是它的补充：**没有票据时这两个字段会被忽略，上游直接用账号默认模型作答**
+（实测为 3.1 Pro）——也就是不管选什么模型都会变成 Pro。
+
+抓取步骤：
+
+1. 打开 https://gemini.google.com，在模型选择器里选中目标模型（比如思考版）
+2. 发送一条消息
+3. F12 → Network → 选中 `StreamGenerate` 请求
+4. Headers → Request Headers → 复制 `X-Goog-Ext-525001261-Jspb` 的**完整值**
+5. 填入 `MODEL_TICKETS` 环境变量中对应的键
+
+票据内嵌时间戳，会过期。过期后请求仍然返回 200，但 Worker 日志会出现：
+
+```
+路由不匹配：请求 family=6 variant=2，上游实际使用 "3.1 Pro"（family=3 variant=1）；modelTickets 里的票据可能缺失或已过期，请从浏览器重新抓取
+```
+
+此时只需重新抓取该家族的票据并更新环境变量即可。
+
+注意：票据优先于请求体字段，所以**实际模型由票据决定**。例如
+`lite-thinking` 票据内嵌的是 `(6,2)`，实际落到 Flash-Lite Extended。
 
 ---
 
