@@ -292,7 +292,11 @@ def _tool_use_block(tools_json: str, constraint: str) -> str:
         "the code unless a [Tool result for ...] message proves it. Knowing a "
         "file's contents or a command's output requires calling the tool.\n"
         "- Never claim the tools are unavailable, restricted, or that you lack "
-        "permission: they are connected and will run.\n\n"
+        "permission: they are connected and will run.\n"
+        "- Triple backticks inside a string argument (Markdown or code the user "
+        "asked you to save) are literal text: keep all three of them. A fence "
+        'inside the JSON never closes the "tool_call" block, so shortening '
+        "them corrupts the file you were asked to write.\n\n"
         f"Available tools:\n{tools_json}"
         f"{constraint}"
     )
