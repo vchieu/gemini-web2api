@@ -20,6 +20,8 @@ from .tools import (
     strip_code_fence,
     tool_names,
     tool_parameters,
+    tool_required_params,
+    missing_required_params,
     is_required_tool_choice,
     looks_like_missed_tool_call,
     looks_like_upstream_error,
@@ -148,6 +150,27 @@ def _upload_images(images: list) -> list:
         except Exception as e:
             raise RuntimeError(f"image upload failed: {e}") from e
     return file_refs if file_refs else None
+
+
+def _tool_retry_attempts(required_tool: bool, tools_active: bool) -> int:
+    """Total upstream attempts for a turn that is expected to end in a call.
+
+    One retry leaves a model that answers in prose instead of emitting the
+    block failing on a meaningful share of turns (and every ``tool_choice:
+    "required"`` failure is a 503 for the client), so the number of extra
+    attempts is configurable -- ``tool_retry_attempts`` in the config. The
+    default of 1 keeps the cost at "one extra call, and only when the first
+    one already failed"; an operator running a forgetful model raises it
+    instead of everyone paying for three calls on turns that succeeded.
+    """
+    if not (required_tool or (tools_active and CONFIG.get("tool_retry_on_miss"))):
+        return 1
+    try:
+        extra = int(CONFIG.get("tool_retry_attempts", 1))
+    except (TypeError, ValueError):
+        extra = 1
+    return 1 + max(0, extra)
+
 
 def _log_tool_trace(raw_text: str, tool_calls) -> None:
     """Log what the model emitted and what was parsed out of it.
@@ -593,8 +616,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _generate_with_tool_retry(self, prompt, model_id, think_mode, file_refs,
                                   extra, tools_active, allowed_names,
                                   tool_schemas, required_tool, messages=None,
-                                  ticket=None):
-        """Run ``generate()``, retrying once when the reply did not use a tool.
+                                  ticket=None, tool_required=None):
+        """Run ``generate()``, retrying while the reply did not use a tool.
 
         Five shapes all arrive as a normal HTTP 200 yet leave the client
         believing the turn is over:
@@ -609,19 +632,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         * the model *fabricating* an answer about a file no tool call has
           opened -- the reply is fluent and complete, so nothing in the text
           itself looks wrong (see ``pending_tool_request``);
-        * ``tool_choice: "required"`` with no block at all.
+        * ``tool_choice: "required"`` with no block at all -- or a block that
+          parses but omits a required parameter, which fails on the client's
+          side and costs a round-trip before anyone learns what was missing.
 
-        The retry appends a hard instruction. Raises once attempts are
-        exhausted (or if ``generate`` itself fails on the final attempt) so the
-        caller decides how the failure is reported -- both endpoints map it
-        through ``_map_upstream_error``.
+        The retry appends a hard instruction. The number of attempts comes from
+        :func:`_tool_retry_attempts`. Raises once attempts are exhausted (or if
+        ``generate`` itself fails on the final attempt) so the caller decides
+        how the failure is reported -- both endpoints map it through
+        ``_map_upstream_error``.
         """
         retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
-        attempts = 2 if (required_tool or (tools_active and retry_on_miss)) else 1
+        attempts = _tool_retry_attempts(required_tool, tools_active)
         # Computed once: it inspects the whole conversation, not the reply.
         owed = pending_tool_request(messages) if tools_active else None
 
-        text, tool_calls = "", None
+        text, tool_calls, missing = "", None, []
         for attempt in range(attempts):
             call_prompt = prompt
             if attempt > 0:
@@ -630,13 +656,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 # summary into a call nobody asked for -- and an agent happily
                 # runs that, then asks again. Conditional wording still pushes
                 # an acting model to act while letting a genuine answer stand.
-                call_prompt = prompt + "\n\n" + (
+                nudge = (
                     "IMPORTANT: Respond with a tool_call block ONLY."
                     if required_tool else
                     "IMPORTANT: Do not describe a tool call -- make it. If "
                     "answering requires reading or changing something, call "
                     "the tool now; otherwise give your final answer."
                 )
+                if missing:
+                    # A model that omitted a parameter believes its call is
+                    # complete, so it has to be told which fields were absent.
+                    nudge += (f" The previous tool call was missing required "
+                              f"parameter(s): {', '.join(missing)} -- include "
+                              "every required parameter.")
+                    missing = []
+                call_prompt = prompt + "\n\n" + nudge
             try:
                 raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
             except Exception as e:
@@ -649,6 +683,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 text, tool_calls = parse_tool_calls(text, allowed_names, tool_schemas)
                 _log_tool_trace(raw, tool_calls)
             if tool_calls:
+                missing = missing_required_params(tool_calls, tool_required)
+                if missing:
+                    # Always logged: even when no attempt is left this is the
+                    # only place that shows the model wrote a call the client
+                    # cannot run.
+                    log(f"tool_call missing required parameter(s): "
+                        f"{', '.join(missing)}")
+                    if attempt + 1 < attempts:
+                        log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                            "asking the model to fill them in")
+                        continue
                 break
             if required_tool:
                 continue
@@ -730,6 +775,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         allowed_names = tool_names(tools) or None
         tool_schemas = tool_parameters(tools) or None
+        tool_required = tool_required_params(tools) or None
 
         # Pure streaming (no tools, no post-processing): stream tokens straight through.
         # When response_format is set the text still has to be defenced and
@@ -747,7 +793,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text, tool_calls = self._generate_with_tool_retry(
                 prompt, model_id, think_mode, file_refs, extra,
                 tools_active, allowed_names, tool_schemas, required_tool,
-                messages=messages, ticket=ticket)
+                messages=messages, ticket=ticket, tool_required=tool_required)
         except Exception as e:
             self.send_api_error(*_map_upstream_error(e))
             return
@@ -1007,6 +1053,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         allowed_names = tool_names(tools) or None
         tool_schemas = tool_parameters(tools) or None
+        tool_required = tool_required_params(tools) or None
         required_tool = is_required_tool_choice(tool_choice)
         tools_active = bool(tools) and tool_choice != "none"
 
@@ -1015,7 +1062,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text, tool_calls = self._generate_with_tool_retry(
                 prompt, model_id, think_mode, file_refs, extra,
                 tools_active, allowed_names, tool_schemas, required_tool,
-                messages=messages, ticket=ticket)
+                messages=messages, ticket=ticket, tool_required=tool_required)
         except Exception as e:
             self.send_api_error(*_map_upstream_error(e))
             return
@@ -1238,26 +1285,77 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         pass
             return
 
-        try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra, ticket)
-        except Exception as e:
-            self.send_google_error(*_map_google_error(e))
-            return
+        # The Google path used to call generate() once and hand back whatever
+        # came out, so none of the "the model said it would act but did not"
+        # protections the OpenAI endpoints have applied here: a client using
+        # the native API was the one most likely to be left with prose.
+        required_tool = fc_mode == "ANY"
+        retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
+        attempts = _tool_retry_attempts(required_tool, has_tools)
+
+        text, clean_text, function_calls = "", "", []
+        for attempt in range(attempts):
+            call_prompt = prompt
+            if attempt > 0:
+                nudge = (
+                    "IMPORTANT: Respond with a function_call block ONLY."
+                    if required_tool else
+                    "IMPORTANT: Do not describe a function call -- make it. If "
+                    "answering requires reading or changing something, call "
+                    "the tool now; otherwise give your final answer."
+                )
+                call_prompt = prompt + "\n\n" + nudge
+            try:
+                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+            except Exception as e:
+                if attempt + 1 < attempts:
+                    log(f"Google tool retry after upstream error: {e}")
+                    continue
+                raise
+            text = raw
+            clean_text, function_calls = "", []
+            if has_tools and raw:
+                clean_text, function_calls = parse_google_function_calls(raw)
+            if function_calls:
+                break
+            if attempt + 1 >= attempts:
+                break
+            if not (raw or "").strip():
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    "upstream returned an empty response")
+                continue
+            if looks_like_upstream_error(raw):
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    "upstream returned its canned error placeholder instead of "
+                    "a response")
+                continue
+            if required_tool:
+                continue
+            if retry_on_miss and looks_like_missed_tool_call(raw):
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    f"response looks like a missed tool call ({len(raw)} chars)")
+                continue
+            break
 
         if not text:
             self.send_google_error(502, "empty response from upstream", "UNAVAILABLE")
             return
 
+        # The canned sentence is an upstream failure, not something the model
+        # said. Returning it as a candidate tells the client "answered".
+        if looks_like_upstream_error(text):
+            status, message, gstatus = _map_google_error(GeminiError(
+                "upstream returned an error placeholder instead of a response; "
+                "please retry"))
+            self.send_google_error(status, message, gstatus)
+            return
+
         response_parts = []
-        if has_tools:
-            clean_text, function_calls = parse_google_function_calls(text)
-            if function_calls:
-                if clean_text:
-                    response_parts.append({"text": clean_text})
-                for fc in function_calls:
-                    response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
-            else:
-                response_parts.append({"text": text})
+        if has_tools and function_calls:
+            if clean_text:
+                response_parts.append({"text": clean_text})
+            for fc in function_calls:
+                response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
         else:
             response_parts.append({"text": text})
 

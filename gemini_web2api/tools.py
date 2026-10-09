@@ -138,6 +138,60 @@ def tool_parameters(tools) -> dict:
     return schemas
 
 
+def tool_required_params(tools) -> dict:
+    """Map tool name -> set of required parameter names from a tools list.
+
+    Complements :func:`tool_parameters`: a call can carry every declared
+    property and still be unusable because the one required one is missing,
+    and neither the client nor the model learns anything from the failure it
+    produces.
+    """
+    required = {}
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        params = fn.get("parameters") or tool.get("parameters") or {}
+        names = params.get("required") if isinstance(params, dict) else None
+        if isinstance(names, list):
+            required[fn["name"]] = {n for n in names if isinstance(n, str)}
+    return required
+
+
+def missing_required_params(tool_calls, required) -> list:
+    """``["tool.param", ...]`` for every required parameter a call left out.
+
+    A call that parses but omits a required parameter reaches the client as a
+    perfectly valid tool call, fails on the client's side, and the error the
+    client sends back costs a round-trip the model spends guessing what was
+    wrong. Reported per *tool.parameter* so the retry instruction can name the
+    exact thing to add. Arguments that are not a JSON object are skipped: they
+    cannot be checked, and they already carry their own "unusable arguments"
+    report.
+    """
+    missing = []
+    if not required:
+        return missing
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        name = fn.get("name")
+        params = required.get(name)
+        if not params:
+            continue
+        try:
+            args = json.loads(fn.get("arguments") or "{}", strict=False)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(args, dict):
+            continue
+        missing.extend(f"{name}.{p}" for p in sorted(params) if p not in args)
+    return missing
+
+
 # Sits between the dropped leading block and the kept tail so the model can see
 # that history was removed rather than silently wondering what it missed.
 _TRUNCATION_MARKER = "[...truncated...]"
@@ -1077,6 +1131,48 @@ def google_contents_to_prompt(req: dict) -> tuple:
     return "\n\n".join(p for p in parts if p), images
 
 
+# A ``function_call`` marker with no fence around it. Models drop the
+# backticks often enough that ignoring these would lose real calls. The
+# ``(?:^|\\n)`` is deliberate: with ``search(text, pos)`` a bare ``^`` only ever
+# matches the very start of the string, so an already-scanned marker is never
+# found again and the scan always moves forward.
+_BARE_FUNCTION_CALL = re.compile(r'(?:^|\n)function_call\s*\n')
+
+
+def _iter_bare_function_calls(text: str):
+    """Yield ``(start, end, data)`` for each unfenced ``function_call`` marker.
+
+    Same ``raw_decode`` technique as :func:`_iter_tool_blocks`: the payload
+    starts right after the marker and ends when the JSON object does, so a
+    nested ``args`` object neither truncates it nor confuses it. The regex this
+    replaces stopped at the *first* ``}`` -- i.e. one level too early for any
+    payload with nested arguments -- and, because the same pattern was used to
+    blank the match out of the answer, left the trailing ``}`` behind while the
+    call itself was lost.
+    """
+    dec = json.JSONDecoder(strict=False)
+    pos = 0
+    while True:
+        m = _BARE_FUNCTION_CALL.search(text, pos)
+        if not m:
+            return
+        j = m.end()
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        try:
+            data, end = dec.raw_decode(text, j)
+        except ValueError:
+            # Unreadable payload: skip the marker only, leaving the text as
+            # the model wrote it rather than eating a chunk of the answer.
+            pos = m.end()
+            continue
+        if end <= pos:
+            pos = m.end()
+            continue
+        yield m.start(), end, data
+        pos = end
+
+
 def parse_google_function_calls(text: str) -> tuple:
     """Extract function_call blocks from model output.
 
@@ -1085,27 +1181,47 @@ def parse_google_function_calls(text: str) -> tuple:
     2. function_call\\n{...} (without backticks)
     3. Raw JSON with "name" + "args" keys
 
+    Both the fenced and the unfenced payload are located with
+    ``JSONDecoder.raw_decode`` rather than a regex. A non-greedy pattern stops
+    at the first fence or brace that appears *inside* the payload -- ordinary
+    for an ``args`` object with nested fields, or for a ``write`` call whose
+    content is Markdown -- which cuts the JSON in half: ``json.loads`` then
+    fails and the pattern used to blank the block removes that much text from
+    the answer too. Blocks that still cannot be read are left in the text, so
+    nothing the model wrote is silently dropped.
+
     Returns (clean_text, [{"name": ..., "args": ...}])
     """
     function_calls = []
-    pattern1 = r'```function_call\s*\n(.*?)\n```'
-    pattern2 = r'(?:^|\n)function_call\s*\n(\{[^`]*?\})'
-    clean = text
-    for pattern in [pattern1, pattern2]:
-        for match in re.findall(pattern, clean, re.DOTALL):
-            try:
-                data = json.loads(match.strip())
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if isinstance(data, dict) and data.get("name"):
-                function_calls.append({
-                    "name": data["name"],
-                    "args": _arguments_dict(data),
-                })
-        clean = re.sub(pattern, '', clean, flags=re.DOTALL).strip()
-    if not function_calls and clean.strip().startswith("{"):
+
+    # 1. Fenced blocks. ``json`` fences are skipped: without a declared-name
+    #    check (this endpoint parses before it knows what the client sent) an
+    #    ordinary JSON example in prose would be taken for a call.
+    parts, last_end = [], 0
+    for start, end, data, kind in _iter_tool_blocks(text):
+        if kind == "json" or not (isinstance(data, dict) and data.get("name")):
+            continue
+        function_calls.append({"name": data["name"], "args": _arguments_dict(data)})
+        parts.append(text[last_end:start])
+        last_end = end
+    parts.append(text[last_end:])
+    clean = "".join(parts)
+
+    # 2. The same payload with a bare marker and no fences.
+    parts, last_end = [], 0
+    for start, end, data in _iter_bare_function_calls(clean):
+        if not (isinstance(data, dict) and data.get("name")):
+            continue
+        function_calls.append({"name": data["name"], "args": _arguments_dict(data)})
+        parts.append(clean[last_end:start])
+        last_end = end
+    parts.append(clean[last_end:])
+    clean = "".join(parts).strip()
+
+    # 3. The whole answer is one bare JSON payload.
+    if not function_calls and clean.startswith("{"):
         try:
-            data = json.loads(clean.strip())
+            data = json.loads(clean, strict=False)
         except (json.JSONDecodeError, ValueError):
             data = None
         if isinstance(data, dict) and data.get("name"):

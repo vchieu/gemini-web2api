@@ -52,6 +52,13 @@ DEFAULT_CONFIG = {
     # failure sentence). One extra upstream call at most, and off entirely if
     # the heuristic proves noisy.
     "tool_retry_on_miss": True,
+    # Extra upstream attempts (beyond the first) when a turn is expected to end
+    # in a tool call: tool_choice "required", or tools offered with
+    # tool_retry_on_miss above. 0 restores the old single call, 2 or 3 helps a
+    # model that keeps answering in prose instead of emitting the block -- each
+    # extra attempt only ever costs a call that was already failing, never one
+    # that succeeded.
+    "tool_retry_attempts": 1,
     # Diagnostics: dump every raw upstream response to debug_raw_file so the
     # payload shape (thinking vs answer vs tool call) can be inspected. Off by
     # default -- raw responses can be large and carry conversation content.

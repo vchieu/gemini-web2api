@@ -21,8 +21,16 @@ from .config import CONFIG
 from .tools import looks_like_tool_call
 
 _ssl_ctx = None
-_cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
+# A cache entry is a single immutable tuple, never a dict of separate keys:
+# readers grab one reference (atomic under the GIL), so `str` from one file
+# generation can never be paired with `sapisid`/`mtime` from another while a
+# second thread is mid-update.
+_cookie_cache = ("", None, 0)
 _httpx_client = None
+# Client construction is not idempotent. The server is threaded, so two
+# requests racing on the `None` check would each build an httpx.Client and one
+# of them would be dropped without ever being closed.
+_httpx_lock = threading.Lock()
 
 
 def log(msg: str):
@@ -143,21 +151,27 @@ def _get_ssl_ctx():
 def _get_httpx_client():
     global _httpx_client
     if _httpx_client is None and HAS_HTTPX:
-        proxy = CONFIG.get("proxy")
-        transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        with _httpx_lock:
+            # Re-checked inside the lock: only the thread that created the
+            # client assigns it, the rest reuse the same one.
+            if _httpx_client is None:
+                proxy = CONFIG.get("proxy")
+                transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+                _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
     return _httpx_client
 
 
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
+    global _cookie_cache
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
+    cached_str, cached_sapisid, cached_mtime = _cookie_cache
     try:
         mtime = os.path.getmtime(cookie_file)
-        if mtime == _cookie_cache["mtime"] and _cookie_cache["str"]:
-            return _cookie_cache["str"], _cookie_cache["sapisid"]
+        if mtime == cached_mtime and cached_str:
+            return cached_str, cached_sapisid
         with open(cookie_file, "r") as f:
             content = f.read().strip()
         if content.startswith("{"):
@@ -180,11 +194,13 @@ def load_cookie() -> tuple:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
             sapisid = pairs.get("SAPISID", "")
-        _cookie_cache.update({"str": cookie_str, "sapisid": sapisid or None, "mtime": mtime})
+        # One atomic swap: a reader either sees the whole old entry or the
+        # whole new one.
+        _cookie_cache = (cookie_str, sapisid or None, mtime)
         return cookie_str, sapisid if sapisid else None
     except Exception as e:
         log(f"Cookie load error: {e}")
-        return _cookie_cache["str"], _cookie_cache["sapisid"]
+        return cached_str, cached_sapisid
 
 
 def make_sapisidhash(sapisid: str) -> str:

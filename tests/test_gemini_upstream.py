@@ -81,14 +81,14 @@ class CookieExportSyncTests(unittest.TestCase):
     def setUp(self):
         self._saved = {k: CONFIG.get(k) for k in
                        ("cookie_file", "xsrf_token", "auth_user", "gemini_bl")}
-        self._cache = dict(gemini._cookie_cache)
-        gemini._cookie_cache.update({"str": "", "sapisid": None, "mtime": 0})
+        self._cache = gemini._cookie_cache
+        gemini._cookie_cache = ("", None, 0)
         fd, self.path = tempfile.mkstemp(suffix=".json")
         os.close(fd)
 
     def tearDown(self):
         CONFIG.update(self._saved)
-        gemini._cookie_cache.update(self._cache)
+        gemini._cookie_cache = self._cache
         os.unlink(self.path)
 
     def test_export_fields_reach_config(self):

@@ -28,9 +28,11 @@ from gemini_web2api.tools import (
     looks_like_tool_call,
     looks_like_upstream_error,
     messages_to_prompt,
+    missing_required_params,
     parse_google_function_calls,
     parse_tool_calls,
     pending_tool_request,
+    tool_required_params,
 )
 
 
@@ -1366,6 +1368,108 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(error["type"], "api_error")
         self.assertIn("placeholder", error["message"])
 
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_retries_when_the_tool_call_omits_a_required_parameter(self, generate):
+        """A call that parses but cannot run is not a call the client can use.
+
+        ``{"name": "read", "arguments": {}}`` is valid on the wire, so the
+        client executes it, its tool fails on the missing path and the error
+        comes back as a whole extra round-trip -- at the end of which the
+        model, shown only its own complete-looking call, still does not know
+        which field was absent. The retry names it.
+        """
+        generate.side_effect = [
+            '```tool_call\n{"name": "read", "arguments": {}}\n```',
+            '```tool_call\n{"name": "read", "arguments": {"path": "README.md"}}\n```',
+        ]
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "doc README"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("missing required parameter(s): read.path",
+                      generate.call_args_list[1].args[0])
+        choice = json.loads(body)["choices"][0]
+        self.assertEqual(
+            json.loads(choice["message"]["tool_calls"][0]["function"]["arguments"]),
+            {"path": "README.md"},
+        )
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_extra_tool_retries_are_configurable(self, generate):
+        """One retry leaves a forgetful model failing on a real share of turns.
+
+        The count of extra attempts belongs to the config so an operator can
+        trade upstream calls for reliability instead of it being fixed here.
+        """
+        CONFIG["tool_retry_attempts"] = 2
+        generate.return_value = "Dung tool read de minh doc file:"
+
+        status, _, _ = self.post_json(
+            "/v1/chat/completions",
+            {"model": "gemini-3.6-flash",
+             "messages": [{"role": "user", "content": "doc README"}],
+             "tools": self._READ_TOOL},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 3)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_google_generate_retries_when_the_model_announces_a_call(self, generate):
+        """The native endpoint had no retry, so Gemini CLI got the prose.
+
+        Everything the OpenAI endpoints do to catch "I will read that..." with
+        no block behind it applies here too: this is the same upstream and the
+        same model.
+        """
+        generate.side_effect = [
+            "Dung tool read de minh doc file:",
+            '```function_call\n{"name": "read", "args": {"path": "README.md"}}\n```',
+        ]
+
+        status, _, body = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:generateContent",
+            {"contents": [{"role": "user", "parts": [{"text": "doc README"}]}],
+             "tools": [{"functionDeclarations": [{
+                 "name": "read",
+                 "parameters": {"type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"]}}]}]},
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(generate.call_count, 2)
+        parts = json.loads(body)["candidates"][0]["content"]["parts"]
+        calls = [p["functionCall"] for p in parts if "functionCall" in p]
+        self.assertEqual(calls, [{"name": "read", "args": {"path": "README.md"}}])
+
+    @mock.patch("gemini_web2api.server.generate",
+                return_value="I encountered an error doing what you asked. "
+                             "Could you try again?")
+    def test_google_generate_reports_the_upstream_placeholder_as_an_error(self, generate):
+        """The canned failure sentence used to reach the client as a candidate.
+
+        It reads as a finished answer, so the operator sees "the model replied
+        with an error" instead of a failure they can act on.
+        """
+        status, _, body = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:generateContent",
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+             "tools": [{"functionDeclarations": [{"name": "read"}]}]},
+        )
+
+        self.assertEqual(status, 503)
+        self.assertEqual(generate.call_count, 2)
+        error = json.loads(body)["error"]
+        self.assertEqual(error["status"], "UNAVAILABLE")
+        self.assertIn("placeholder", error["message"])
+
     # ── Giai đoạn 6: /v1/responses has to behave like /v1/chat/completions ──
 
     _RESPONSES_READ_TOOL = [{
@@ -2093,6 +2197,145 @@ class PendingToolRequestTests(unittest.TestCase):
         self.assertIn('{"name": "func_name", "arguments": {"param": "value"}}', prompt)
         self.assertIn('never beside "name"', prompt)
         self.assertIn('"commands"', prompt)
+
+
+class GoogleFunctionCallParsingTests(unittest.TestCase):
+    """The Google endpoint used to locate calls with regexes.
+
+    Everything the OpenAI path already did with ``raw_decode`` applied here as
+    well: a payload is found by parsing it, not by guessing where it ends.
+    """
+
+    def test_bare_marker_with_nested_args_is_extracted(self):
+        """The old pattern stopped at the *first* ``}`` -- one level early.
+
+        It then blanked that half-open match out of the answer, so the client
+        got no call at all and the text kept nothing but a stray ``}``.
+        """
+        clean, calls = parse_google_function_calls(
+            'function_call\n{"name": "run_commands", '
+            '"args": {"commands": ["dir"], "cwd": "."}}')
+
+        self.assertEqual(calls, [{"name": "run_commands",
+                                  "args": {"commands": ["dir"], "cwd": "."}}])
+        self.assertNotIn("run_commands", clean)
+        self.assertNotIn("}", clean)
+
+    def test_a_fence_inside_a_string_argument_does_not_cut_the_call(self):
+        """A ``write`` payload carries a file body, newline and fences and all.
+
+        Strict ``json.loads`` rejects the raw newline the model wrote instead
+        of escaping it -- and the pattern that blanked the match took a chunk
+        of the answer with it.
+        """
+        payload = ('{"name": "write_file", "args": {"path": "x.md", '
+                   '"content": "# Title\n\n```python\nprint(1)\n```"}}')
+        text = "Truoc\n```function_call\n" + payload + "\n```\nSau"
+
+        clean, calls = parse_google_function_calls(text)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["args"]["content"],
+                         "# Title\n\n```python\nprint(1)\n```")
+        self.assertNotIn("function_call", clean)
+        self.assertIn("Truoc", clean)
+        self.assertIn("Sau", clean)
+
+    def test_unreadable_block_stays_in_the_text(self):
+        """Nothing the model wrote may be deleted on the way to a parse error."""
+        text = "Truoc\n```function_call\nnot json\n```\nSau"
+
+        clean, calls = parse_google_function_calls(text)
+
+        self.assertEqual(calls, [])
+        for kept in ("Truoc", "not json", "Sau"):
+            self.assertIn(kept, clean)
+
+    def test_a_fence_and_a_bare_marker_in_one_answer(self):
+        clean, calls = parse_google_function_calls(
+            '```function_call\n{"name": "read", "args": {"path": "a.md"}}\n```\n'
+            'func tiep:\nfunction_call\n{"name": "run", "args": {"cmd": "ls"}}')
+
+        self.assertEqual([c["name"] for c in calls], ["read", "run"])
+        self.assertNotIn("function_call", clean)
+
+
+class ToolRequiredParamTests(unittest.TestCase):
+    """A call the client cannot run must be caught before it is sent."""
+
+    TOOLS = [{
+        "type": "function",
+        "function": {"name": "read",
+                     "parameters": {"type": "object",
+                                    "properties": {"path": {"type": "string"},
+                                                   "mode": {"type": "string"}},
+                                    "required": ["path"]}},
+    }, {
+        "type": "function",
+        "function": {"name": "ping",
+                     "parameters": {"type": "object", "properties": {}}},
+    }]
+
+    def test_tool_required_params_reads_the_required_list(self):
+        self.assertEqual(tool_required_params(self.TOOLS), {"read": {"path"}})
+
+    def test_missing_required_params_names_the_tool_and_the_field(self):
+        calls = [
+            {"type": "function", "function": {"name": "read", "arguments": "{}"}},
+            {"type": "function",
+             "function": {"name": "read", "arguments": '{"path": "a.md"}'}},
+            {"type": "function", "function": {"name": "ping", "arguments": "{}"}},
+        ]
+
+        self.assertEqual(
+            missing_required_params(calls, tool_required_params(self.TOOLS)),
+            ["read.path"],
+        )
+
+    def test_nothing_is_reported_without_schemas_or_arguments(self):
+        self.assertEqual(
+            missing_required_params([{"function": {"name": "x"}}], None), [])
+        # Not a JSON object: already reported as unusable arguments instead.
+        self.assertEqual(
+            missing_required_params(
+                [{"function": {"name": "read", "arguments": "[1]"}}],
+                {"read": {"path"}}),
+            [])
+
+
+class HttpClientThreadSafetyTests(unittest.TestCase):
+    """A client built twice by two racing threads is one nobody ever closes."""
+
+    def test_concurrent_first_calls_build_exactly_one_client(self):
+        import gemini_web2api.gemini as gemini
+
+        if not gemini.HAS_HTTPX:
+            self.skipTest("httpx is not installed")
+        sentinel = object()
+        built = []
+        real = gemini._httpx_client
+        gemini._httpx_client = None
+        try:
+            with mock.patch.object(gemini.httpx, "Client",
+                                   side_effect=lambda **kw: built.append(kw) or sentinel):
+                barrier = threading.Barrier(8)
+                results = []
+
+                def worker():
+                    barrier.wait()
+                    results.append(gemini._get_httpx_client())
+
+                threads = [threading.Thread(target=worker) for _ in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=10)
+        finally:
+            gemini._httpx_client = real
+
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len(built), 1)
+        self.assertTrue(all(r is sentinel for r in results))
 
 
 if __name__ == "__main__":
