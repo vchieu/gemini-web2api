@@ -448,7 +448,16 @@ resp = client.chat.completions.create(
 
 This tool reverse-engineers Google Gemini's web StreamGenerate protocol. It sends requests to the same endpoint that the Gemini web app uses, converting between OpenAI's API format and Gemini's internal protobuf-like format.
 
-The model selection is controlled by field `[79]` in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum).
+The model selection is controlled by field `[79]` (family) and `[80]` (variant) in the request payload, mapped from Gemini's frontend JavaScript source (`MODE_CATEGORY` enum), plus the per-family ticket header — see "Model routing tickets" above.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests    # Python package (server, tools, routing)
+node tests/worker_routing_test.js       # Cloudflare worker model routing
+```
+
+The worker test needs Node only; it loads `cloudflare/worker.js` in a `vm` sandbox with the Cloudflare globals stubbed, so it never touches the network.
 
 ## Acknowledgments
 
