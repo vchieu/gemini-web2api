@@ -201,7 +201,7 @@ def _account_prefix() -> str:
     return f"/u/{auth_user}"
 
 
-def _build_headers() -> dict:
+def _build_headers(ticket: str = None) -> dict:
     account_prefix = _account_prefix()
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -217,6 +217,11 @@ def _build_headers() -> dict:
         headers["Cookie"] = cookie_str
     if sapisid:
         headers["Authorization"] = make_sapisidhash(sapisid)
+    if ticket:
+        # The per-family ticket is what the upstream actually routes on; the
+        # f.req [79]/[80] fields are advisory without it.
+        from .models import TICKET_HEADER
+        headers[TICKET_HEADER] = ticket
     return headers
 
 
@@ -261,6 +266,9 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     if extra_fields:
         for k, v in extra_fields.items():
             inner[k] = v
+    # One line per request naming what was actually asked for: when the answer
+    # looks like another model, this plus check_routing is the whole trail.
+    log(f"Upstream model family={model_id} variant={(extra_fields or {}).get(80)}")
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
@@ -411,6 +419,54 @@ def extract_response_text(raw: str) -> str:
     return clean_text(best_call or best_text)
 
 
+def upstream_echo(raw: str):
+    """Return the (label, family, variant) the upstream echoed, or None.
+
+    The StreamGenerate response names the model that actually served the
+    request; comparing it against what was requested is the only way to see a
+    silent misroute (the request still answers 200 with fluent text).
+    """
+    for line in raw.split("\n"):
+        if '"wrb.fr"' not in line or len(line) < 200:
+            continue
+        try:
+            meta = json.loads(json.loads(line)[0][2])
+        except (json.JSONDecodeError, IndexError, TypeError):
+            continue
+        if isinstance(meta, list) and len(meta) >= 60:
+            return meta[42], meta[58], meta[59]
+    return None
+
+
+def check_routing(raw: str, model_id: int, extra_fields: dict = None, ticket: str = None) -> None:
+    """Log a warning when upstream served a different model than requested.
+
+    A missing or expired model ticket is what causes this: the upstream then
+    ignores [79]/[80] and answers with the account default (Pro). The answer
+    itself is fine, so nothing else in the pipeline notices -- hence a log
+    line rather than an error.
+    """
+    echo = upstream_echo(raw)
+    if not echo:
+        return
+    _, fam, var = echo
+    if ticket:
+        # The ticket wins over the body fields, so expectations are read from
+        # the (family, variant) embedded in the ticket actually sent.
+        try:
+            t = json.loads(ticket)
+            want_fam, want_var = t[14], t[15]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            want_fam, want_var = model_id, (extra_fields or {}).get(80)
+    else:
+        want_fam, want_var = model_id, (extra_fields or {}).get(80)
+    if fam != want_fam or (want_var is not None and var != want_var):
+        log(f"Routing mismatch: requested family={want_fam} variant={want_var} "
+            f"but upstream served {echo[0]!r} (family={fam} variant={var}); "
+            f"the model ticket in CONFIG['model_tickets'] may be missing or "
+            f"expired -- refresh it from a fresh browser capture")
+
+
 def _status_error(status) -> GeminiError:
     """Build the GeminiError for an upstream HTTP status.
 
@@ -427,7 +483,7 @@ def _status_error(status) -> GeminiError:
     return GeminiError(msg, status=status)
 
 
-def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, ticket: str = None) -> str:
     """Non-streaming generation with BL-aware retry."""
     body = _build_payload(prompt, model_id, think_mode, file_refs, extra_fields).encode()
     ctx = _get_ssl_ctx()
@@ -437,7 +493,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     bl_refreshed = False
     for attempt in range(CONFIG["retry_attempts"]):
         url = _get_url()
-        headers = _build_headers()
+        headers = _build_headers(ticket)
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -451,6 +507,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             raw = resp.read().decode("utf-8", errors="replace")
             if CONFIG.get("debug_raw"):
                 _dump_raw(raw)
+            check_routing(raw, model_id, extra_fields, ticket)
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
             last_err = _status_error(e.code)
@@ -470,7 +527,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     raise last_err
 
 
-def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None):
+def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None, ticket: str = None):
     """Streaming generation via httpx with BL-aware retry.
 
     Text is buffered only while an *upstream scaffolding* fence is open so that
@@ -479,7 +536,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     immediately.
     """
     if not HAS_HTTPX:
-        text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+        text = generate(prompt, model_id, think_mode, file_refs, extra_fields, ticket)
         if text:
             yield text
         return
@@ -491,7 +548,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     bl_refreshed = False
     for attempt in range(CONFIG["retry_attempts"]):
         url = _get_url()
-        headers = _build_headers()
+        headers = _build_headers(ticket)
         emitted_raw_text = ""
         clean_buf = ""
         emitted_any = False
@@ -556,6 +613,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 # Mirror generate(): the stream path also dumps the raw
                 # upstream frames so prefix/delta handling can be audited.
                 _dump_raw(raw_full)
+            check_routing(raw_full, model_id, extra_fields, ticket)
             return
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else None

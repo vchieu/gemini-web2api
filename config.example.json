@@ -16,5 +16,6 @@
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "model_tickets": {}
 }

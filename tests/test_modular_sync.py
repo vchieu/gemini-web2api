@@ -10,7 +10,15 @@ from urllib.parse import parse_qs
 
 from gemini_web2api.__main__ import _guard_bind, _maybe_refresh_bl
 from gemini_web2api.config import CONFIG, DEFAULT_CONFIG
-from gemini_web2api.gemini import _build_payload, extract_response_text, generate_stream
+from gemini_web2api.gemini import (
+    _build_headers,
+    _build_payload,
+    check_routing,
+    extract_response_text,
+    generate_stream,
+    upstream_echo,
+)
+from gemini_web2api.models import TICKET_HEADER, resolve_model, ticket_for
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
@@ -141,6 +149,115 @@ class PayloadPersistenceTests(unittest.TestCase):
             dumped = dump.call_args[0][0]
             self.assertIn("REQUEST >>>", dumped)
             self.assertIn("secret-prompt", dumped)
+
+
+class ModelRoutingTests(unittest.TestCase):
+    """Model selection = inner[79] (family) + inner[80] (variant).
+
+    Both decoded from live browser StreamGenerate captures (Sep 2026). The
+    regression: sending inner[79] alone (no variant, no ticket) made the
+    upstream ignore the request and answer with the account default, so every
+    model -- flash, lite, thinking -- came back as 3.1 Pro.
+    """
+    def test_browser_captured_family_variant_pairs(self):
+        cases = {
+            "gemini-3.7-flash": (1, 1),
+            "gemini-3.6-flash": (1, 1),
+            "gemini-3.5-flash": (1, 1),
+            "gemini-3.5-flash-thinking": (2, 2),
+            "gemini-3.1-pro": (3, 1),
+            "gemini-3.1-pro-enhanced": (3, 3),
+            "gemini-auto": (4, 1),
+            "gemini-3.5-flash-thinking-lite": (5, 2),
+            "gemini-flash-lite": (6, 1),
+        }
+        for name, (family, variant) in cases.items():
+            with self.subTest(model=name):
+                _, mode, _, err, extra = resolve_model(name)
+                self.assertIsNone(err)
+                inner = _decode_payload(_build_payload("hi", mode, 4, extra_fields=extra))
+                self.assertEqual(inner[79], family)
+                self.assertEqual(inner[80], variant)
+
+    def test_explicit_variant_is_not_overridden(self):
+        # pro-enhanced pins inner[80]=3 through extra; the per-model variant
+        # must not clobber it.
+        _, _, _, err, extra = resolve_model("gemini-3.1-pro-enhanced")
+        self.assertIsNone(err)
+        self.assertEqual(extra[80], 3)
+
+
+class ModelTicketTests(unittest.TestCase):
+    # The upstream routes BY the X-Goog-Ext-525001261-Jspb ticket and ignores
+    # f.req [79]/[80] without it (verified live: (3,1)+pro-ticket -> Pro,
+    # (3,1)+flash-ticket -> Flash -- the ticket wins over the body).
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        CONFIG["model_tickets"] = {
+            "flash": '[1,null,null,null,"fbb127bbb056c959",null,null,0,'
+                     '[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,"561701FD",'
+                     'null,null,[[6,908199999],[1789884088,624000000]]]',
+            "lite-thinking": '[1,null,null,null,"cf41b0e0dd7d53e5",null,null,0,'
+                             '[4,5,6,8,4,5,6,8],null,null,1,null,null,6,2,"279B5F21",'
+                             'null,null,[[2,950300000],[1789899759,320000000]]]',
+        }
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def test_ticket_mapping(self):
+        self.assertEqual(
+            ticket_for("gemini-3.6-flash"), CONFIG["model_tickets"]["flash"])
+        self.assertEqual(
+            ticket_for("gemini-3.5-flash-thinking-lite"),
+            CONFIG["model_tickets"]["lite-thinking"])
+        # No ticket configured (or no ticket at all for the model).
+        self.assertIsNone(ticket_for("gemini-3.1-pro"))
+        self.assertIsNone(ticket_for("gemini-auto"))
+
+    def test_ticket_embeds_family_variant(self):
+        flash = json.loads(CONFIG["model_tickets"]["flash"])
+        lite_thinking = json.loads(CONFIG["model_tickets"]["lite-thinking"])
+        self.assertEqual((flash[14], flash[15]), (1, 1))
+        self.assertEqual((lite_thinking[14], lite_thinking[15]), (6, 2))
+
+    def test_ticket_header_sent(self):
+        headers = _build_headers(ticket="TICKET-VALUE")
+        self.assertEqual(headers[TICKET_HEADER], "TICKET-VALUE")
+        headers = _build_headers()
+        self.assertNotIn(TICKET_HEADER, headers)
+
+    def test_upstream_echo_parsing(self):
+        raw = self._raw_echo("3.5 Flash-Lite", 6, 1)
+        self.assertEqual(upstream_echo(raw), ("3.5 Flash-Lite", 6, 1))
+        self.assertIsNone(upstream_echo("garbage"))
+
+    def _raw_echo(self, label, family, variant):
+        meta = [None] * 60
+        meta[42] = label
+        meta[58] = family
+        meta[59] = variant
+        return json.dumps([["wrb.fr", None, json.dumps(meta)]]) + "\n" + "x" * 200
+
+    def test_routing_mismatch_is_logged(self):
+        # The observed failure mode: thinking-lite asked for, Pro answered.
+        raw = self._raw_echo("3.1 Pro", 3, 1)
+        with mock.patch("gemini_web2api.gemini.log") as logger:
+            check_routing(raw, model_id=5, extra_fields={80: 2})
+        self.assertTrue(any("Routing mismatch" in c.args[0]
+                            for c in logger.call_args_list))
+
+    def test_matching_route_is_not_logged(self):
+        # The lite-thinking ticket embeds (6,2), so Flash-Lite Extended is the
+        # expected answer here even though the body asked for family 5 -- the
+        # ticket wins over the body fields.
+        raw = self._raw_echo("3.5 Flash-Lite Extended", 6, 2)
+        with mock.patch("gemini_web2api.gemini.log") as logger:
+            check_routing(raw, model_id=5, extra_fields={80: 2},
+                          ticket=CONFIG["model_tickets"]["lite-thinking"])
+        self.assertFalse(any("Routing mismatch" in c.args[0]
+                             for c in logger.call_args_list))
 
 
 class MessageParsingTests(unittest.TestCase):

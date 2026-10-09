@@ -108,6 +108,44 @@ gemini-3.5-flash-thinking@think=2   # medium
 gemini-3.5-flash-thinking@think=4   # shallowest
 ```
 
+### Model routing tickets
+
+The upstream does **not** route on the model name. It routes on the
+`X-Goog-Ext-525001261-Jspb` header the browser mints per model family; the
+`f.req` family/variant fields (`inner[79]`/`inner[80]`) only back that up.
+Without a ticket the upstream **ignores the requested model and answers with
+the account default** (3.1 Pro), so every model silently becomes Pro.
+
+Put one captured ticket per family in `config.json`:
+
+```json
+{
+  "model_tickets": {
+    "flash": "[1,null,null,null,\"fbb127bbb056c959\",...]",
+    "flash-thinking": "...",
+    "lite": "...",
+    "lite-thinking": "...",
+    "pro": "...",
+    "pro-thinking": "..."
+  }
+}
+```
+
+To capture one: open [gemini.google.com](https://gemini.google.com), pick the
+model in the UI, send a message, then in DevTools → Network select the
+`StreamGenerate` request and copy the full value of its
+`X-Goog-Ext-525001261-Jspb` request header.
+
+Tickets expire. When one does, the request still succeeds but the log says:
+
+```
+Routing mismatch: requested family=5 variant=2 but upstream served '3.1 Pro'
+(family=3 variant=1); the model ticket in CONFIG['model_tickets'] may be
+missing or expired -- refresh it from a fresh browser capture
+```
+
+Re-capture the ticket for that family; nothing else needs changing.
+
 ## Optional: Cookie for Pro
 
 Anonymous access works for all models, but `gemini-3.1-pro` routes to Flash without authentication. To get real Pro routing, you need a **Gemini Advanced (paid subscription)** account cookie:

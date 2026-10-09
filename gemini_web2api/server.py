@@ -9,7 +9,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
 from .config import CONFIG
-from .models import MODELS, resolve_model
+from .models import MODELS, resolve_model, ticket_for
 from .gemini import generate, generate_stream, log, GeminiError
 from .tools import (
     messages_to_prompt,
@@ -498,7 +498,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_api_error(400, err, ERR_INVALID_REQUEST)
             return None
         echo = raw if isinstance(raw, str) and raw else model_name
-        return echo, model_name, model_id, think_mode, extra
+        # The ticket is what upstream routes on; [79]/[80] alone are ignored.
+        return echo, model_name, model_id, think_mode, extra, ticket_for(model_name)
 
     def do_POST(self):
         try:
@@ -591,7 +592,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _generate_with_tool_retry(self, prompt, model_id, think_mode, file_refs,
                                   extra, tools_active, allowed_names,
-                                  tool_schemas, required_tool, messages=None):
+                                  tool_schemas, required_tool, messages=None,
+                                  ticket=None):
         """Run ``generate()``, retrying once when the reply did not use a tool.
 
         Five shapes all arrive as a normal HTTP 200 yet leave the client
@@ -636,7 +638,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "the tool now; otherwise give your final answer."
                 )
             try:
-                raw = generate(call_prompt, model_id, think_mode, file_refs, extra)
+                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
             except Exception as e:
                 if attempt + 1 < attempts:
                     log(f"Tool retry after upstream error: {e}")
@@ -690,7 +692,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         resolved = self._resolve_request_model(req)
         if resolved is None:
             return
-        echo_model, model_name, model_id, think_mode, extra = resolved
+        echo_model, model_name, model_id, think_mode, extra, ticket = resolved
 
         n = req.get("n", 1)
         if isinstance(n, int) and n > 1:
@@ -734,7 +736,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # normalised, so it has to go through the buffered path below.
         if stream and not rf_instruction and (not tools or tool_choice == "none"):
             self._stream_chat(cid, echo_model, prompt, model_id, think_mode, file_refs,
-                              extra, stop_strings, max_tokens, include_usage)
+                              extra, stop_strings, max_tokens, include_usage, ticket)
             return
 
         # Tool calls need the full text; retry once when the reply did not use
@@ -745,7 +747,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text, tool_calls = self._generate_with_tool_retry(
                 prompt, model_id, think_mode, file_refs, extra,
                 tools_active, allowed_names, tool_schemas, required_tool,
-                messages=messages)
+                messages=messages, ticket=ticket)
         except Exception as e:
             self.send_api_error(*_map_upstream_error(e))
             return
@@ -801,9 +803,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             yield delta
 
     def _stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
-                     extra, stop_strings, max_tokens, include_usage):
+                     extra, stop_strings, max_tokens, include_usage, ticket=None):
         try:
-            gen = generate_stream(prompt, model_id, think_mode, file_refs, extra)
+            gen = generate_stream(prompt, model_id, think_mode, file_refs, extra, ticket)
             first = next(gen, _MISSING)
         except Exception as e:
             self.send_api_error(*_map_upstream_error(e))
@@ -981,7 +983,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         resolved = self._resolve_request_model(req)
         if resolved is None:
             return
-        echo_model, model_name, model_id, think_mode, extra = resolved
+        echo_model, model_name, model_id, think_mode, extra, ticket = resolved
 
         tools = self._normalize_responses_tools(req.get("tools"))
         messages = self._responses_messages(req.get("input", []), req.get("instructions"))
@@ -1013,7 +1015,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text, tool_calls = self._generate_with_tool_retry(
                 prompt, model_id, think_mode, file_refs, extra,
                 tools_active, allowed_names, tool_schemas, required_tool,
-                messages=messages)
+                messages=messages, ticket=ticket)
         except Exception as e:
             self.send_api_error(*_map_upstream_error(e))
             return
@@ -1161,6 +1163,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if err:
             self.send_google_error(400, err, "INVALID_ARGUMENT")
             return
+        ticket = ticket_for(model_name)
 
         tool_config = req.get("toolConfig", {})
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
@@ -1179,7 +1182,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not has_tools:
             try:
-                gen = generate_stream(prompt, model_id, think_mode, file_refs, extra)
+                gen = generate_stream(prompt, model_id, think_mode, file_refs, extra, ticket)
                 first = next(gen, _MISSING)
             except Exception as e:
                 self.send_google_error(*_map_google_error(e))
@@ -1236,7 +1239,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra)
+            text = generate(prompt, model_id, think_mode, file_refs, extra, ticket)
         except Exception as e:
             self.send_google_error(*_map_google_error(e))
             return

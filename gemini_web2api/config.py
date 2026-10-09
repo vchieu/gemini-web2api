@@ -28,6 +28,15 @@ DEFAULT_CONFIG = {
     "cookie_file": None,
     "proxy": None,
     "api_keys": [],
+    # Per-model upstream tickets (X-Goog-Ext-525001261-Jspb). The browser mints
+    # one per model family and the upstream routes BY TICKET: without it the
+    # f.req [79]/[80] fields are ignored and the account default model answers
+    # (observed: 3.1 Pro for every requested model). Tickets embed their
+    # (family, variant) in plaintext and expire, so refresh a key by copying
+    # the header value from a fresh browser StreamGenerate request (DevTools ->
+    # Copy as cURL) for the matching family ("flash", "pro", "lite", ...).
+    # gemini.check_routing logs a mismatch warning when one stops working.
+    "model_tickets": {},
     # CORS origins allowed to read the response. Empty list means no CORS
     # headers are emitted at all, which is the safe default when api_keys is
     # also empty -- a malicious page could otherwise fetch the local server.
