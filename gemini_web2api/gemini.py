@@ -87,7 +87,13 @@ def fetch_latest_bl():
         else:
             resp = urllib.request.urlopen(req, context=ctx, timeout=15)
         html = resp.read().decode("utf-8", errors="replace")
-        m = re.search(r'(boq_assistant-bard-web-server_\d+\.\d+_p\d+)', html)
+        # The label family is not stable: Google renamed
+        # ``boq_assistant-bard-web-server_20260716.08_p0`` to
+        # ``boq_gemini-web-uiserver_20261007.12_p0`` when the UI was rebuilt,
+        # and a family-specific pattern then matches nothing -- auto-update
+        # silently stops working and every request uses the stale default.
+        # Match the shape (``boq_<family>_<date>.<build>_p<n>``) instead.
+        m = re.search(r'(boq_[a-z0-9-]+_\d+\.\d+_p\d+)', html)
         if m:
             return m.group(1)
     except Exception as e:
@@ -158,6 +164,18 @@ def load_cookie() -> tuple:
             data = json.loads(content)
             cookie_str = data.get("cookie", "")
             sapisid = data.get("sapisid", "")
+            # The bundled extension exports {cookie, sapisid, auth_user,
+            # xsrf_token, gemini_bl} in one file. Ignore the extra fields and
+            # StreamGenerate goes out without its `at` form field (HTTP 400)
+            # and with whatever stale build label happens to be configured,
+            # so sync them here: pointing cookie_file at the export must be
+            # enough on its own.
+            if data.get("xsrf_token"):
+                CONFIG["xsrf_token"] = data["xsrf_token"]
+            if data.get("auth_user") not in (None, ""):
+                CONFIG["auth_user"] = data["auth_user"]
+            if data.get("gemini_bl"):
+                CONFIG["gemini_bl"] = data["gemini_bl"]
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
@@ -213,6 +231,11 @@ def _apply_chat_persistence_flags(inner: list) -> None:
 
 
 def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
+    # The `at` (xsrf) token lives in the cookie file and only reaches CONFIG
+    # via load_cookie(). The body is built before any header is assembled, so
+    # without this call the first attempt of a request goes out without `at`
+    # and Gemini answers HTTP 400 -- and 400 is treated as non-retryable.
+    load_cookie()
     inner = [None] * 102
     if file_refs:
         refs = [[None, None, ref] for ref in file_refs]
@@ -242,6 +265,12 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
     params = {"f.req": json.dumps(outer)}
     if CONFIG.get("xsrf_token"):
         params["at"] = CONFIG["xsrf_token"]
+    if CONFIG.get("debug_raw"):
+        # Mirror the response dump: the built prompt (with tool block and any
+        # injected extra fields) is what the model actually sees, so a collapse
+        # between client request and upstream text is visible right here.
+        _dump_raw("REQUEST >>>\n" + json.dumps(inner, ensure_ascii=False)
+                  + "\n<<< REQUEST")
     return urllib.parse.urlencode(params)
 
 
@@ -318,6 +347,47 @@ def _extract_texts_from_line(line: str) -> list:
         return []
 
 
+# Two payload shapes carry the same upstream rejection: the legacy prose form
+# ``BardErrorInfo [1099]`` and the protobuf-JSON form the current build emits
+# (``...application.BardErrorInfo",[1099]]``). The second one does not match
+# ``BardErrorInfo\s*\[`` -- a quote and a comma sit between the name and the
+# bracket -- so the rejection used to fall through as an empty reply and the
+# real reason (often transient: the same request succeeds minutes later)
+# never reached the log or the client.
+_BARD_ERROR_RE = re.compile(r'BardErrorInfo["\]]*[\s,]*\[(\d+)\]')
+
+# Codes Google is known to return, appended as a human-readable hint.
+BARD_ERROR_HINTS = {
+    1013: "temporary generation error",
+    1037: "usage limit exceeded for the requested model",
+    1050: "requested model is inconsistent with the conversation",
+    1052: "requested model header is invalid or unavailable",
+    1060: "Google temporarily blocked this IP address",
+}
+
+
+def bard_error_code(raw: str):
+    """Return the BardErrorInfo code embedded in ``raw``, or None."""
+    m = _BARD_ERROR_RE.search(raw)
+    return int(m.group(1)) if m else None
+
+
+def raise_bard_error(raw: str) -> None:
+    """Raise a GeminiError when ``raw`` carries a BardErrorInfo rejection.
+
+    Returns silently otherwise. GeminiError (status None) maps to 503 on the
+    OpenAI endpoints: the upstream -- not the client's request -- refused.
+    """
+    code = bard_error_code(raw)
+    if code is None:
+        return
+    hint = BARD_ERROR_HINTS.get(code)
+    raise GeminiError(
+        f"Gemini upstream rejected request: BardErrorInfo [{code}]"
+        + (f" -- {hint}" if hint else "")
+    )
+
+
 def extract_response_text(raw: str) -> str:
     """Parse full response to get final text.
 
@@ -328,9 +398,7 @@ def extract_response_text(raw: str) -> str:
     claims a tool was used. Nothing changes when no candidate looks like a
     call, which is the overwhelmingly common case.
     """
-    bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', raw)
-    if bard_err:
-        raise RuntimeError(f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]")
+    raise_bard_error(raw)
     best_text = ""
     best_call = ""
     for line in raw.split("\n"):
@@ -341,6 +409,22 @@ def extract_response_text(raw: str) -> str:
             elif len(t) > len(best_text):
                 best_text = t
     return clean_text(best_call or best_text)
+
+
+def _status_error(status) -> GeminiError:
+    """Build the GeminiError for an upstream HTTP status.
+
+    A 400 with no cookie configured is rarely the client's fault: Google
+    rejects cookie-less (anonymous) sessions with 400, and reporting that
+    verbatim tells the caller their request was malformed when the real fix
+    is on this side.
+    """
+    msg = f"HTTP {status} from Gemini upstream"
+    if status == 400 and not CONFIG.get("cookie_file"):
+        msg += ("; no cookie_file is set and Google currently rejects"
+                " anonymous sessions -- export cookies via the bundled"
+                " extension and set cookie_file")
+    return GeminiError(msg, status=status)
 
 
 def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None, extra_fields: dict = None) -> str:
@@ -369,7 +453,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 _dump_raw(raw)
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
-            last_err = GeminiError(f"HTTP {e.code} from Gemini upstream", status=e.code)
+            last_err = _status_error(e.code)
             # A stale BL build label manifests as 405/404: refresh and retry once.
             if e.code in (404, 405) and not bl_refreshed and update_bl_if_needed():
                 bl_refreshed = True
@@ -411,18 +495,16 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         emitted_raw_text = ""
         clean_buf = ""
         emitted_any = False
+        raw_full = ""
         try:
             with client.stream("POST", url, content=body, headers=headers) as resp:
                 resp.raise_for_status()
                 buf = ""
                 for chunk in resp.iter_text():
                     buf += chunk
+                    raw_full += chunk
                     if "BardErrorInfo" in buf:
-                        bard_err = re.search(r'BardErrorInfo\s*\[(\d+)\]', buf)
-                        if bard_err:
-                            raise RuntimeError(
-                                f"Gemini upstream rejected request: BardErrorInfo [{bard_err.group(1)}]"
-                            )
+                        raise_bard_error(buf)
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
                         texts = _extract_texts_from_line(line)
@@ -470,10 +552,14 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 delta = clean_text(clean_buf, strip=False)
                 if delta:
                     yield delta
+            if CONFIG.get("debug_raw") and raw_full:
+                # Mirror generate(): the stream path also dumps the raw
+                # upstream frames so prefix/delta handling can be audited.
+                _dump_raw(raw_full)
             return
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else None
-            last_err = GeminiError(f"HTTP {status} from Gemini upstream", status=status)
+            last_err = _status_error(status)
             if status in (404, 405) and not bl_refreshed and update_bl_if_needed():
                 bl_refreshed = True
                 log("BL updated after upstream error, retrying stream")
@@ -488,4 +574,6 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         if attempt < CONFIG["retry_attempts"] - 1:
             log(f"Stream retry {attempt + 1}/{CONFIG['retry_attempts']}: {last_err}")
             time.sleep(CONFIG["retry_delay_sec"])
+    if CONFIG.get("debug_raw") and raw_full:
+        _dump_raw(raw_full)
     raise last_err
