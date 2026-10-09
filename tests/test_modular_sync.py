@@ -129,6 +129,19 @@ class PayloadPersistenceTests(unittest.TestCase):
         self.assertEqual(inner[0][0], "describe")
         self.assertEqual(inner[0][3], [[None, None, "/uploaded/image-ref"]])
 
+    def test_request_dump_only_when_debug_raw_enabled(self):
+        with mock.patch("gemini_web2api.gemini._dump_raw") as dump:
+            CONFIG["debug_raw"] = False
+            _build_payload("secret-prompt", 1, 4)
+            dump.assert_not_called()
+
+            CONFIG["debug_raw"] = True
+            _build_payload("secret-prompt", 1, 4)
+            dump.assert_called_once()
+            dumped = dump.call_args[0][0]
+            self.assertIn("REQUEST >>>", dumped)
+            self.assertIn("secret-prompt", dumped)
+
 
 class MessageParsingTests(unittest.TestCase):
     def test_messages_to_prompt_extracts_openai_image_url_data_url(self):
@@ -243,6 +256,21 @@ class PromptTruncationTests(unittest.TestCase):
 
         self.assertEqual(prompt, "hello")
 
+    def test_tool_block_instructs_literal_triple_backticks(self):
+        # An agent-context write arrived with shortened fences
+        # (```python -> `python), silently corrupting the file being
+        # written. The root cause turned out to be in the test harness
+        # rather than the model, but the invariant is cheap to state and
+        # expensive to violate, so the block asserts it explicitly.
+        tools = [{"type": "function", "function": {
+            "name": "write", "description": "create a file",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"}, "content": {"type": "string"}}}}}]
+
+        prompt, _ = messages_to_prompt([{"role": "user", "content": "hi"}], tools)
+
+        self.assertIn("Triple backticks inside a string argument", prompt)
+
 
 class StreamingEndpointTests(unittest.TestCase):
     @classmethod
@@ -316,10 +344,69 @@ class StreamingEndpointTests(unittest.TestCase):
             for line in body.splitlines()
             if line.startswith("data: {")
         ]
-        self.assertEqual(chunks[0]["choices"][0]["delta"], {"role": "assistant"})
+        self.assertEqual(chunks[0]["choices"][0]["delta"],
+                         {"role": "assistant", "content": ""})
         self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hel"})
         self.assertEqual(chunks[2]["choices"][0]["delta"], {"content": "lo"})
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate", return_value="hi")
+    def test_chat_message_and_choice_carry_required_nullable_fields(self, _generate):
+        """`logprobs` on the choice is required-nullable, `refusal` is documented
+        as null in the spec's own example.
+
+        The Python SDK tolerates absent keys; strict SDKs (Go, Rust, Java)
+        generated from the schema do not.
+        """
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        choice = json.loads(body)["choices"][0]
+        self.assertIn("logprobs", choice)
+        self.assertIsNone(choice["logprobs"])
+        self.assertIn("refusal", choice["message"])
+        self.assertIsNone(choice["message"]["refusal"])
+
+    @mock.patch("gemini_web2api.server.generate_stream")
+    def test_chat_stream_chunks_carry_required_nullable_fields(self, generate_stream):
+        generate_stream.return_value = iter(["hel", "lo"])
+
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+
+        self.assertEqual(status, 200)
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        for chunk in chunks:
+            for choice in chunk["choices"]:
+                self.assertIn("logprobs", choice)
+                self.assertIsNone(choice["logprobs"])
+        # include_usage: every chunk carries `usage`, null except the last,
+        # whose choices list is empty and holds the totals.
+        for chunk in chunks[:-1]:
+            self.assertIn("usage", chunk)
+            self.assertIsNone(chunk["usage"])
+        self.assertEqual(chunks[-1]["choices"], [])
+        self.assertEqual(
+            sorted(chunks[-1]["usage"]),
+            ["completion_tokens", "prompt_tokens", "total_tokens"],
+        )
 
     @mock.patch("gemini_web2api.server.generate", return_value="chunked ok")
     def test_chat_accepts_chunked_body(self, _generate):
@@ -490,6 +577,68 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[-1][1]["response"]["status"], "completed")
         self.assertEqual(events[-1][1]["response"]["output"][0]["content"][0]["text"], "hello")
 
+    @mock.patch("gemini_web2api.server.generate", return_value="Hello!")
+    def test_responses_object_includes_required_fields(self, _generate):
+        """The spec marks these required on every response object (nullable,
+        but present), and requires the two usage breakdowns by name."""
+        status, _, body = self.post_json(
+            "/v1/responses",
+            {
+                "model": "gemini-3.6-flash",
+                "input": "hi",
+                "instructions": "be terse",
+                "temperature": 0.2,
+            },
+        )
+
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        for key in ("id", "object", "created_at", "status", "model", "output",
+                    "error", "incomplete_details", "instructions", "tools",
+                    "parallel_tool_calls", "metadata", "tool_choice",
+                    "temperature", "top_p", "access_programs", "usage"):
+            self.assertIn(key, data)
+        self.assertIsNone(data["error"])
+        self.assertIsNone(data["incomplete_details"])
+        self.assertEqual(data["instructions"], "be terse")
+        self.assertEqual(data["temperature"], 0.2)
+        self.assertEqual(data["tool_choice"], "auto")
+        part = data["output"][0]["content"][0]
+        self.assertEqual(part["annotations"], [])
+        self.assertEqual(part["logprobs"], [])
+        self.assertEqual(data["output"][0]["status"], "completed")
+        usage = data["usage"]
+        self.assertEqual(usage["input_tokens_details"]["cached_tokens"], 0)
+        self.assertEqual(usage["input_tokens_details"]["cache_write_tokens"], 0)
+        self.assertEqual(usage["output_tokens_details"]["reasoning_tokens"], 0)
+
+    @mock.patch("gemini_web2api.server.generate", return_value="hello")
+    def test_responses_text_events_carry_required_logprobs(self, _generate):
+        """Both text events require `logprobs`, as does the content part."""
+        status, _, body = self.post_json(
+            "/v1/responses",
+            {"model": "gemini-3.6-flash", "input": "hi", "stream": True},
+        )
+
+        self.assertEqual(status, 200)
+        events = _decode_sse(body)
+        by_type = {event_type: event for event_type, event in events}
+        self.assertEqual(by_type["response.output_text.delta"]["logprobs"], [])
+        self.assertEqual(by_type["response.output_text.done"]["logprobs"], [])
+        self.assertEqual(by_type["response.content_part.added"]["part"]["logprobs"], [])
+        self.assertEqual(
+            by_type["response.completed"]["response"]["output"][0]["content"][0]["logprobs"],
+            [],
+        )
+        # The in_progress objects carry the same required fields, with a null
+        # usage until the response completes.
+        created = by_type["response.created"]["response"]
+        for key in ("error", "incomplete_details", "instructions", "tools",
+                    "parallel_tool_calls", "metadata", "tool_choice",
+                    "temperature", "top_p", "access_programs", "usage"):
+            self.assertIn(key, created)
+        self.assertIsNone(created["usage"])
+
     @mock.patch("gemini_web2api.server.parse_tool_calls")
     @mock.patch("gemini_web2api.server.generate", return_value="tool output")
     def test_responses_function_call_stream_has_complete_event_sequence(
@@ -594,7 +743,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate_stream", side_effect=RuntimeError("boom"))
-    def test_chat_stream_error_before_start_returns_json_502(self, _generate_stream):
+    def test_chat_stream_error_before_start_returns_json_503(self, _generate_stream):
         status, headers, body = self.post_json(
             "/v1/chat/completions",
             {
@@ -604,7 +753,8 @@ class StreamingEndpointTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(status, 502)
+        # The spec declares 500/503 (never 502) for /chat/completions.
+        self.assertEqual(status, 503)
         self.assertEqual(headers["Content-Type"], "application/json")
         self.assertIn("error", json.loads(body))
 
@@ -629,7 +779,7 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate", return_value="")
-    def test_chat_empty_upstream_returns_502(self, _generate):
+    def test_chat_empty_upstream_returns_503(self, _generate):
         status, _, body = self.post_json(
             "/v1/chat/completions",
             {
@@ -638,7 +788,7 @@ class StreamingEndpointTests(unittest.TestCase):
             },
         )
 
-        self.assertEqual(status, 502)
+        self.assertEqual(status, 503)
         self.assertEqual(json.loads(body)["error"]["type"], "api_error")
 
     def test_models_endpoint_ignores_query_string(self):
@@ -864,6 +1014,8 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(data["status"], "incomplete")
         self.assertEqual(data["incomplete_details"]["reason"], "max_output_tokens")
         self.assertEqual(len(data["output"][0]["content"][0]["text"]), 16)
+        # The message itself was cut off, so it cannot claim to be completed.
+        self.assertEqual(data["output"][0]["status"], "incomplete")
 
     def test_google_stream_midstream_error_emits_error_chunk(self):
         def flaky_stream(*args, **kwargs):
@@ -1062,7 +1214,7 @@ class StreamingEndpointTests(unittest.TestCase):
 
     @mock.patch("gemini_web2api.server.generate")
     def test_empty_response_without_tools_is_reported_not_retried(self, generate):
-        """With no tools there is no block to chase, so a blank reply is a 502."""
+        """With no tools there is no block to chase, so a blank reply is a 503."""
         generate.return_value = ""
 
         status, _, body = self.post_json(
@@ -1071,7 +1223,7 @@ class StreamingEndpointTests(unittest.TestCase):
              "messages": [{"role": "user", "content": "xin chao"}]},
         )
 
-        self.assertEqual(status, 502)
+        self.assertEqual(status, 503)
         self.assertEqual(generate.call_count, 1)
         self.assertIn("empty response", body)
 
@@ -1091,7 +1243,7 @@ class StreamingEndpointTests(unittest.TestCase):
              "tools": self._READ_TOOL},
         )
 
-        self.assertEqual(status, 502)
+        self.assertEqual(status, 503)
         self.assertEqual(generate.call_count, 2)
         error = json.loads(body)["error"]
         self.assertEqual(error["type"], "api_error")
@@ -1162,6 +1314,63 @@ class StreamingEndpointTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(generate.call_count, 2)
+
+    # ── Unsupported methods must still answer in JSON ──
+
+    def test_delete_unknown_response_returns_json_404(self):
+        """DELETE /v1/responses/{id} is a spec endpoint; nothing is stored here.
+
+        The status matches the spec's 404 for an unknown id, and the body is
+        an OpenAI error object instead of BaseHTTPRequestHandler's bare-text
+        501.
+        """
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("DELETE", "/v1/responses/resp_missing")
+        response = connection.getresponse()
+        body = response.read().decode()
+        connection.close()
+
+        self.assertEqual(response.status, 404)
+        error = json.loads(body)["error"]
+        for key in ("message", "type", "param", "code"):
+            self.assertIn(key, error)
+        self.assertEqual(error["code"], "response_not_found")
+
+    def test_get_unknown_response_returns_json_404(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", "/v1/responses/resp_missing")
+        response = connection.getresponse()
+        body = response.read().decode()
+        connection.close()
+
+        self.assertEqual(response.status, 404)
+        self.assertEqual(json.loads(body)["error"]["code"], "response_not_found")
+
+        # Deeper paths are not a response id, so they get the generic 404.
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request("GET", "/v1/responses/resp_missing/input_items")
+        response = connection.getresponse()
+        body = response.read().decode()
+        connection.close()
+
+        self.assertEqual(response.status, 404)
+        self.assertNotEqual(json.loads(body)["error"]["code"], "response_not_found")
+
+    def test_put_and_patch_return_json_405(self):
+        for method in ("PUT", "PATCH"):
+            with self.subTest(method=method):
+                connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+                connection.request(method, "/v1/chat/completions", body=b"{}",
+                                   headers={"Content-Type": "application/json"})
+                response = connection.getresponse()
+                body = response.read().decode()
+                connection.close()
+
+                self.assertEqual(response.status, 405)
+                self.assertEqual(response.getheader("Content-Type"), "application/json")
+                error = json.loads(body)["error"]
+                self.assertEqual(error["code"], "method_not_allowed")
+                self.assertEqual(error["type"], "invalid_request_error")
 
 
 class GenerateStreamTests(unittest.TestCase):
@@ -1301,6 +1510,54 @@ class StartupGuardTests(unittest.TestCase):
 
         fetch.assert_not_called()
         self.assertEqual(CONFIG["gemini_bl"], "pinned_bl")
+
+
+class HostCheckTests(unittest.TestCase):
+    """`_check_host` blocks DNS rebinding without mangling `host:port` forms."""
+
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    @staticmethod
+    def check(host, bind="127.0.0.1", keys=None):
+        handler = GeminiHandler.__new__(GeminiHandler)
+        handler.headers = {} if host is None else {"Host": host}
+        CONFIG["host"] = bind
+        CONFIG["api_keys"] = list(keys or [])
+        return handler._check_host()
+
+    def test_loopback_with_port_is_allowed(self):
+        self.assertTrue(self.check("127.0.0.1:8081"))
+
+    def test_ipv6_loopback_with_port_is_allowed(self):
+        # rsplit(":", 1) used to leave "[::1]" behind, which never matched "::1".
+        self.assertTrue(self.check("[::1]:8081"))
+
+    def test_localhost_with_port_is_allowed(self):
+        self.assertTrue(self.check("localhost:8081"))
+
+    def test_foreign_host_is_rejected(self):
+        self.assertFalse(self.check("attacker.example"))
+        self.assertFalse(self.check("attacker.example:8081"))
+
+    def test_wildcard_bind_serves_every_interface(self):
+        # A LAN IP or container hostname must pass when the operator bound
+        # 0.0.0.0 on purpose; only the loopback names matched before.
+        self.assertTrue(self.check("192.168.1.10:8081", bind="0.0.0.0"))
+        self.assertTrue(self.check("gemini-web2api:8081", bind="0.0.0.0"))
+
+    def test_loopback_bind_rejects_the_wildcard_host(self):
+        self.assertFalse(self.check("0.0.0.0:8081", bind="127.0.0.1"))
+
+    def test_configured_key_makes_the_host_check_redundant(self):
+        self.assertTrue(self.check("attacker.example", keys=["secret"]))
+
+    def test_missing_host_header_is_allowed(self):
+        self.assertTrue(self.check(None))
 
 
 class ToolParsingTests(unittest.TestCase):

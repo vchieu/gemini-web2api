@@ -100,7 +100,14 @@ def _responses_text_format(text_field) -> dict:
 
 
 def _map_upstream_error(e) -> tuple:
-    """Map an upstream exception to (status, message, type, code)."""
+    """Map an upstream exception to (status, message, type, code).
+
+    503 rather than 502: the spec declares 400/401/403/404/429/500/503 for
+    ``/chat/completions`` and 400/404/429/503 for ``/responses``. A 502 is
+    documented only for the audio endpoints, and a strict client that treats
+    undeclared statuses as a protocol error would reject it. Upstream Gemini
+    failing is exactly the "service unavailable" case 503 describes.
+    """
     status = getattr(e, "status", None)
     if status is None:
         status = getattr(e, "code", None)
@@ -109,8 +116,8 @@ def _map_upstream_error(e) -> tuple:
     if status == 429:
         return 429, f"upstream rate limited: {e}", ERR_RATE_LIMIT, "rate_limit_exceeded"
     if status:
-        return 502, f"upstream error ({status}): {e}", ERR_API, None
-    return 502, f"upstream error: {e}", ERR_API, None
+        return 503, f"upstream error ({status}): {e}", ERR_API, None
+    return 503, f"upstream error: {e}", ERR_API, None
 
 
 def _map_google_error(e) -> tuple:
@@ -211,18 +218,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         This blocks DNS-rebinding attacks where an attacker's domain resolves
         to 127.0.0.1 but the browser sends ``Host: attacker.com``.
+
+        Three cases where the check is deliberately not restrictive:
+
+        * ``api_keys`` configured -- the request already had to present a valid
+          key, so a rebound hostname buys nothing (``do_GET`` never runs this
+          check either, so only POST was ever gated);
+        * a wildcard bind (``0.0.0.0`` / ``::``) -- the operator chose to serve
+          every interface, so LAN IPs and container hostnames must pass, not
+          just ``localhost``;
+        * no ``Host`` header at all (non-HTTP/1.1 edge case).
+
+        The hostname is parsed with ``urlsplit`` so ``[::1]:8081`` yields
+        ``::1`` instead of the unbracketed ``[::1]`` that ``rsplit(":")``
+        produced, and a port is never mistaken for part of the name.
         """
+        if CONFIG.get("api_keys"):
+            return True
         host = self.headers.get("Host", "")
         if not host:
-            return True  # No Host header: allow (non-HTTP/1.1 edge case)
-        # Strip port
-        host_only = host.rsplit(":", 1)[0].lower()
+            return True
+        hostname = (urllib.parse.urlsplit("//" + host).hostname or "").lower()
+        if not hostname:
+            return True
         allowed = {"localhost", "127.0.0.1", "::1"}
-        # Also allow the configured bind host
-        bind_host = (CONFIG.get("host") or "").lower()
+        bind_host = (CONFIG.get("host") or "").lower().strip("[]")
         if bind_host:
+            if bind_host in ("0.0.0.0", "::", "*"):
+                return True  # Wildcard bind: reachable on every interface.
             allowed.add(bind_host)
-        return host_only in allowed
+        return hostname in allowed
 
     def _check_origin(self) -> bool:
         """Reject cross-origin requests when no API key is configured.
@@ -272,14 +297,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
-    def _sse_chunk(self, cid, model, delta, finish_reason):
+    def _sse_chunk(self, cid, model, delta, finish_reason, include_usage=False):
+        # ``logprobs`` is required (nullable) on the choice of a chat chunk and
+        # ``delta`` must open with an empty ``content`` so clients that read
+        # ``delta.content`` on the first chunk (NextChat among them) see a
+        # string rather than an absent key.
         chunk = {
             "id": cid,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model,
-            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+            "choices": [{"index": 0, "delta": delta, "logprobs": None,
+                         "finish_reason": finish_reason}],
         }
+        if include_usage:
+            # stream_options.include_usage: every chunk carries a usage field,
+            # null until the final usage chunk.
+            chunk["usage"] = None
         self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
         self.wfile.flush()
 
@@ -420,6 +454,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
+            elif re.match(r"^/(v1/)?responses/[^/]+$", path):
+                # The spec declares GET /v1/responses/{id} (200/404) but this
+                # server keeps no store, so every id is unknown. Deeper paths
+                # (e.g. /input_items) fall through to the generic 404.
+                self.send_api_error(404, f"response '{path.rsplit('/', 1)[-1]}' not found",
+                                    ERR_INVALID_REQUEST, "response_not_found")
             elif path in ("/", "/health"):
                 self.send_json({"status": "ok", "version": __version__,
                                 "models": list(MODELS.keys())})
@@ -501,6 +541,53 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_api_error(500, str(e), ERR_API)
             except Exception:
                 pass
+
+    def _unsupported_method(self):
+        """Answer PUT/PATCH/DELETE with a JSON error instead of 501 HTML.
+
+        ``BaseHTTPRequestHandler`` replies to any method it has no ``do_*``
+        for with a bare-text ``501``, which no OpenAI SDK can parse.
+        """
+        try:
+            path = self._route_path()
+            if self._needs_auth(path) and not self._authorized():
+                self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST,
+                                    "invalid_api_key")
+                return
+            # Drain the body before answering. Left unread it becomes the next
+            # "request line", and the resulting connection reset can discard
+            # the very response written here.
+            try:
+                self._read_request_body()
+            except ValueError as e:
+                if "too large" in str(e):
+                    self.send_api_error(413, str(e), ERR_INVALID_REQUEST)
+                    return
+            # DELETE /v1/responses/{id} is a real spec endpoint (200 or 404),
+            # and this server stores nothing, so every id is simply unknown.
+            if self.command == "DELETE" and re.match(r"^/(v1/)?responses/[^/]+$", path):
+                self.send_api_error(404, f"response '{path.rsplit('/', 1)[-1]}' not found",
+                                    ERR_INVALID_REQUEST, "response_not_found")
+                return
+            self.send_api_error(405, f"{self.command} is not allowed for {path}",
+                                ERR_INVALID_REQUEST, "method_not_allowed")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"{self.command} error: {e}")
+            try:
+                self.send_api_error(500, str(e), ERR_API)
+            except Exception:
+                pass
+
+    def do_PUT(self):
+        self._unsupported_method()
+
+    def do_PATCH(self):
+        self._unsupported_method()
+
+    def do_DELETE(self):
+        self._unsupported_method()
 
     def _generate_with_tool_retry(self, prompt, model_id, think_mode, file_refs,
                                   extra, tools_active, allowed_names,
@@ -636,7 +723,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
-            self.send_api_error(502, f"upstream error: {e}", ERR_API)
+            self.send_api_error(503, f"upstream error: {e}", ERR_API)
             return
 
         allowed_names = tool_names(tools) or None
@@ -669,10 +756,13 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text, truncated = _apply_max_tokens(text, max_tokens)
 
         if not text and not tool_calls:
-            self.send_api_error(502, "empty response from upstream", ERR_API)
+            self.send_api_error(503, "empty response from upstream", ERR_API)
             return
 
-        msg = {"role": "assistant", "content": text or None}
+        # `refusal` and `logprobs` are required-nullable on the spec's
+        # response message/choice; strict SDKs (Go, Rust, Java) reject an
+        # absent key where Python's only checks for null.
+        msg = {"role": "assistant", "content": text or None, "refusal": None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
         finish = "tool_calls" if tool_calls else ("length" if truncated else "stop")
@@ -680,12 +770,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if stream:
             try:
                 self._start_sse()
-                self._sse_chunk(cid, echo_model, {"role": "assistant"}, None)
+                self._sse_chunk(cid, echo_model, {"role": "assistant", "content": ""},
+                                None, include_usage)
                 if text:
-                    self._sse_chunk(cid, echo_model, {"content": text}, None)
+                    self._sse_chunk(cid, echo_model, {"content": text}, None, include_usage)
                 for index, tc in enumerate(tool_calls or []):
-                    self._sse_chunk(cid, echo_model, {"tool_calls": [{"index": index, **tc}]}, None)
-                self._sse_chunk(cid, echo_model, {}, finish)
+                    self._sse_chunk(cid, echo_model,
+                                    {"tool_calls": [{"index": index, **tc}]},
+                                    None, include_usage)
+                self._sse_chunk(cid, echo_model, {}, finish, include_usage)
                 if include_usage:
                     self._sse_usage(cid, echo_model, prompt, text)
                 self._sse_done()
@@ -696,7 +789,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self.send_json({
             "id": cid, "object": "chat.completion", "created": int(time.time()),
             "model": echo_model,
-            "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
+            "choices": [{"index": 0, "message": msg, "logprobs": None,
+                         "finish_reason": finish}],
             "usage": _usage(prompt, text),
         })
 
@@ -715,11 +809,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_api_error(*_map_upstream_error(e))
             return
         if first is _MISSING:
-            self.send_api_error(502, "empty response from upstream", ERR_API)
+            self.send_api_error(503, "empty response from upstream", ERR_API)
             return
 
         self._start_sse()
-        self._sse_chunk(cid, model, {"role": "assistant"}, None)
+        self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
+                        None, include_usage)
         full_text = ""
         finish = "stop"
         hold = max((len(s) for s in stop_strings), default=0)
@@ -738,7 +833,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     piece = buf[:hit]
                     if piece:
                         full_text += piece
-                        self._sse_chunk(cid, model, {"content": piece}, None)
+                        self._sse_chunk(cid, model, {"content": piece}, None, include_usage)
                     buf = ""
                     break
                 # `>` rather than `>=`: a reply that lands exactly on the budget
@@ -748,7 +843,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     piece = buf[:allowed]
                     if piece:
                         full_text += piece
-                        self._sse_chunk(cid, model, {"content": piece}, None)
+                        self._sse_chunk(cid, model, {"content": piece}, None, include_usage)
                     buf = ""
                     finish = "length"
                     break
@@ -757,11 +852,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     buf = buf[-hold:] if hold else ""
                     if piece:
                         full_text += piece
-                        self._sse_chunk(cid, model, {"content": piece}, None)
+                        self._sse_chunk(cid, model, {"content": piece}, None, include_usage)
             else:
                 if buf:
                     full_text += buf
-                    self._sse_chunk(cid, model, {"content": buf}, None)
+                    self._sse_chunk(cid, model, {"content": buf}, None, include_usage)
         except (BrokenPipeError, ConnectionResetError):
             return
         except Exception as e:
@@ -780,7 +875,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-        self._sse_chunk(cid, model, {}, finish)
+        self._sse_chunk(cid, model, {}, finish, include_usage)
         if include_usage:
             self._sse_usage(cid, model, prompt, full_text)
         self._sse_done()
@@ -890,7 +985,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = self._normalize_responses_tools(req.get("tools"))
         messages = self._responses_messages(req.get("input", []), req.get("instructions"))
-        tool_choice = req.get("tool_choice", "auto")
+        # `null` is a legal JSON value here; the spec has no null variant, so
+        # fall back to "auto" rather than echoing a null tool_choice back.
+        tool_choice = req.get("tool_choice") or "auto"
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
 
         rf = req.get("response_format")
@@ -925,12 +1022,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text = _apply_stop(text, stop_strings)
         text, truncated = _apply_max_tokens(text, max_tokens)
         if not text and not tool_calls:
-            self.send_api_error(502, "empty response from upstream", ERR_API)
+            self.send_api_error(503, "empty response from upstream", ERR_API)
             return
 
         # Responses reports a cut-off answer as incomplete rather than completed.
         final_status = "incomplete" if truncated else "completed"
-        status_fields = {"incomplete_details": {"reason": "max_output_tokens"}} if truncated else {}
+        # `incomplete_details` is required on the object and null when the
+        # answer is complete; it must not disappear from the payload.
+        incomplete_details = {"reason": "max_output_tokens"} if truncated else None
+        # A message that max_output_tokens cut off is itself incomplete --
+        # leaving it "completed" while the response says "incomplete" is the
+        # contradiction strict clients flag.
+        message_status = "incomplete" if truncated else "completed"
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -942,9 +1045,58 @@ class GeminiHandler(BaseHTTPRequestHandler):
                                "arguments": tc["function"]["arguments"], "status": "completed"})
         if text or not tool_calls:
             output.append({"type": "message", "id": mid, "role": "assistant",
-                           "status": "completed",
+                           "status": message_status,
                            "content": [{"type": "output_text", "text": text or "",
-                                        "annotations": []}]})
+                                        "annotations": [], "logprobs": []}]})
+
+        usage = {
+            "input_tokens": len(prompt) // 4,
+            "output_tokens": len(text or "") // 4,
+            "total_tokens": (len(prompt) + len(text or "")) // 4,
+            # Required breakdowns: their absence fails strict SDKs even though
+            # the totals are all we can actually measure.
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+
+        # Fields the spec marks required on every response object. Request
+        # fields are echoed back unchanged where we honour them, otherwise the
+        # spec's own default is used.
+        created_at = int(time.time())
+        instructions = req.get("instructions")
+        tools_echo = req.get("tools")
+        metadata = req.get("metadata")
+        parallel = req.get("parallel_tool_calls")
+        temperature = req.get("temperature")
+        top_p = req.get("top_p")
+
+        def _number(value, default):
+            # `bool` is an ``int`` subclass: `temperature: true` must not be
+            # echoed back as a number the schema rejects.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return default
+            return value
+
+        def response_fields(status, items, token_usage):
+            return {
+                "id": rid,
+                "object": "response",
+                "created_at": created_at,
+                "status": status,
+                "model": echo_model,
+                "output": items,
+                "error": None,
+                "incomplete_details": incomplete_details,
+                "instructions": instructions if isinstance(instructions, str) else None,
+                "tools": tools_echo if isinstance(tools_echo, list) else [],
+                "parallel_tool_calls": parallel if isinstance(parallel, bool) else True,
+                "metadata": metadata if isinstance(metadata, dict) else None,
+                "tool_choice": tool_choice,
+                "temperature": _number(temperature, 1),
+                "top_p": _number(top_p, 1),
+                "access_programs": None,
+                "usage": token_usage,
+            }
 
         if req.get("stream"):
             self._start_sse()
@@ -956,19 +1108,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 event = {"type": event_type, "sequence_number": sequence_number, **fields}
                 self.wfile.write(f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode())
 
-            usage = {
-                "input_tokens": len(prompt) // 4,
-                "output_tokens": len(text or "") // 4,
-                "total_tokens": (len(prompt) + len(text or "")) // 4,
-            }
-            base_response = {
-                "id": rid, "object": "response",
-                "created_at": int(time.time()), "model": echo_model,
-            }
-            emit("response.created", response={
-                **base_response, "status": "in_progress", "output": [], "usage": None})
-            emit("response.in_progress", response={
-                **base_response, "status": "in_progress", "output": [], "usage": None})
+            emit("response.created", response=response_fields("in_progress", [], None))
+            emit("response.in_progress", response=response_fields("in_progress", [], None))
             for output_index, item in enumerate(output):
                 if item["type"] == "function_call":
                     pending_item = {
@@ -991,26 +1132,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
                         event_fields = {"item_id": item["id"], "output_index": output_index,
                                         "content_index": content_index}
                         emit("response.content_part.added", **event_fields, part={
-                            "type": "output_text", "text": "", "annotations": []})
+                            "type": "output_text", "text": "", "annotations": [],
+                            "logprobs": []})
+                        # `logprobs` is required on both text events (an empty
+                        # list: we never see upstream probabilities).
                         emit("response.output_text.delta", **event_fields,
-                             delta=content_part["text"])
+                             delta=content_part["text"], logprobs=[])
                         emit("response.output_text.done", **event_fields,
-                             text=content_part["text"])
+                             text=content_part["text"], logprobs=[])
                         emit("response.content_part.done", **event_fields, part=content_part)
                     emit("response.output_item.done", output_index=output_index, item=item)
             final_event = "response.incomplete" if truncated else "response.completed"
-            emit(final_event, response={**base_response, "status": final_status,
-                                        "output": output, "usage": usage, **status_fields})
+            emit(final_event, response=response_fields(final_status, output, usage))
             self.wfile.flush()
         else:
-            self.send_json({
-                "id": rid, "object": "response", "created_at": int(time.time()),
-                "status": final_status, "model": echo_model, "output": output,
-                "usage": {"input_tokens": len(prompt) // 4,
-                          "output_tokens": len(text or "") // 4,
-                          "total_tokens": (len(prompt) + len(text or "")) // 4},
-                **status_fields,
-            })
+            self.send_json(response_fields(final_status, output, usage))
 
     # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
 

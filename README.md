@@ -197,6 +197,12 @@ refresh overwrites whatever you configured.
 > this is easy to forget, the server now refuses a non-loopback `--host` with
 > no keys unless you pass `--allow-insecure`.
 
+Requests also pass a Host allow-list check that blocks DNS rebinding. It
+accepts `localhost`, `127.0.0.1`, `::1` and whatever `host` you bound to (IPv6
+and ports are parsed properly, so `[::1]:8081` matches), accepts any Host when
+`host` is a wildcard such as `0.0.0.0`, and is skipped entirely when `api_keys`
+is configured — the key already gates the request.
+
 Unknown model names silently fall back to `default_model` (and the response
 echoes the name the client sent), which keeps strict clients working. Set
 `strict_models` to `true` to return `404 model_not_found` instead.
@@ -230,7 +236,7 @@ docker run -d --name gemini-web2api -p 127.0.0.1:8081:8081 -v ./config.json:/app
 
 Set `"cookie_file": "/app/cookie.txt"` in `config.json`.
 
-> **Note**: If upstream returns an empty body while using Docker's default bridge network, the request fails with HTTP 502 (`empty response from upstream`). Switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
+> **Note**: If upstream returns an empty body while using Docker's default bridge network, the request fails with HTTP 503 (`empty response from upstream`). Switch to host networking: `docker run --network host ...` or add `network_mode: host` in your compose file. This is caused by Gemini's upstream rejecting requests from certain Docker NAT IP ranges.
 
 ## Proxy
 
@@ -278,20 +284,58 @@ with the full response, including `output` items and `usage`:
 {
   "id": "resp_abc123",
   "object": "response",
+  "created_at": 1741476777,
   "status": "completed",
   "model": "gemini-3.5-flash",
+  "instructions": null,
+  "tools": [],
+  "tool_choice": "auto",
+  "parallel_tool_calls": true,
+  "metadata": null,
+  "temperature": 1,
+  "top_p": 1,
+  "access_programs": null,
+  "error": null,
+  "incomplete_details": null,
   "output": [
     {
       "type": "message",
       "id": "msg_xyz",
       "role": "assistant",
       "status": "completed",
-      "content": [{"type": "output_text", "text": "Hello!", "annotations": []}]
+      "content": [
+        {"type": "output_text", "text": "Hello!", "annotations": [], "logprobs": []}
+      ]
     }
   ],
-  "usage": {"input_tokens": 10, "output_tokens": 3, "total_tokens": 13}
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 3,
+    "total_tokens": 13,
+    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+    "output_tokens_details": {"reasoning_tokens": 0}
+  }
 }
 ```
+
+Every field above marked required by the OpenAI spec is present even when it
+is null (`error`, `incomplete_details`, `instructions`, `tools`, `metadata`,
+`temperature`, `top_p`, `parallel_tool_calls`, `tool_choice`,
+`access_programs`); strict SDKs reject a missing key where the Python SDK
+tolerates it.
+
+### What Responses does not do
+
+- **No response store**: `GET`/`DELETE /v1/responses/{id}`,
+  `POST /v1/responses/{id}/cancel` and `GET /v1/responses/{id}/input_items`
+  have no state to work on. The first two answer `404` with
+  `code: "response_not_found"`, the other two `404` "not found".
+- **`previous_response_id` and `store` are ignored**: there is no server-side
+  conversation to chain from, so a client that relies on chaining must resend
+  the whole conversation in `input` (as Codex does).
+- **Only `type: "function"` tools** are forwarded. Custom/hosted tool types
+  (`custom`, `local_shell`, `web_search`, `apply_patch`, ...) are dropped with
+  a log line.
 
 ### Tool calling in Responses API
 
@@ -351,6 +395,10 @@ resp = client.chat.completions.create(
 - **Single-turn only**: Each request is an independent conversation. Multi-turn context is simulated by including previous messages in the prompt.
 - **Rate limits**: Google may throttle high-frequency requests. The server retries automatically but sustained heavy use may be blocked.
 - **Token usage is an estimate**: `usage` is computed as `len(text) // 4`. This is a rough heuristic and can be noticeably off for Vietnamese/Chinese text and for code.
+- **Ignored request parameters**: `temperature`, `top_p`, `seed`, `logprobs`, `parallel_tool_calls`, `reasoning_effort`, `service_tier`, `store`, `metadata`, `input_audio`/`file` content parts, and the legacy `functions`/`function` role are accepted and echoed where the spec requires them, but have no effect on generation — Gemini's web endpoint exposes none of them.
+- **Only `type: "function"` tools**: other tool types (`custom`, `local_shell`, `apply_patch`, hosted tools) are dropped with a log line, so a client that depends on them sees no calls.
+- **Unsupported methods answer in JSON**: `PUT`/`PATCH` return `405 method_not_allowed`, `DELETE /v1/responses/{id}` and `GET /v1/responses/{id}` return `404 response_not_found` (nothing is stored). Unimplemented paths keep the OpenAI error shape instead of the stdlib's plain-text `501`.
+- **Upstream failures return `503`**: the status codes the spec declares for `/chat/completions` (400/401/403/404/429/500/503) and `/responses` (400/404/429/503) — never `502`, which the spec documents only for the audio endpoints.
 
 ## Requirements
 
