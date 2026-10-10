@@ -1,0 +1,16 @@
+{
+  "log_requests": true,
+  "log_file": "gemini-web2api.log",
+  "cookie_file": "gemini-auth.json",
+  "debug_raw": true,
+  "debug_trace": true,
+  "debug_raw_file": "gemini-raw.log",
+  "model_tickets": {
+    "flash": "[1,null,null,null,\"fbb127bbb056c959\",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,1,1,\"561701FD-A2E8-4275-98B0-636DFE1554F9\",null,null,[[6,908199999],[1789884088,624000000]]]",
+    "pro": "[1,null,null,null,\"9d8ca3786ebdfbea\",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,1,\"32C786FF-9AE2-49E5-A67C-0A35421F63A6\",null,null,[[6,620699999],[1789897904,515000000]]]",
+    "lite": "[1,null,null,null,\"cf41b0e0dd7d53e5\",null,null,0,[4,5,6,8,16,4,5,6,8,16],null,null,1,null,null,6,1,\"A04F51D1-6B33-4E0E-AD92-997A0B05A045\",null,null,[[2,400699999],[1791605875,321000000]]]",
+    "flash-thinking": "[1,null,null,null,\"cf41b0e0dd7d53e5\",null,null,0,[4,5,6,8,16,4,5,6,8,16],null,null,1,null,null,6,2,\"A04F51D1-6B33-4E0E-AD92-997A0B05A045\",null,null,[[2,962600000],[1791606008,905000000]]]",
+    "lite-thinking": "[1,null,null,null,\"cf41b0e0dd7d53e5\",null,null,0,[4,5,6,8,16,4,5,6,8,16],null,null,1,null,null,6,4,\"A04F51D1-6B33-4E0E-AD92-997A0B05A045\",null,null,[[6,748100000],[1791605978,755000000]]]",
+    "pro-thinking": "[1,null,null,null,\"9d8ca3786ebdfbea\",null,null,0,[4,5,6,8,4,5,6,8],null,null,1,null,null,3,2,\"279B5F21-C196-4B10-8EC7-31625C0CABE6\",null,null,[[null,85000000],[1789900208,389000000]]]"
+  }
+}
