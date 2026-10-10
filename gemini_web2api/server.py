@@ -4,6 +4,7 @@ import time
 import uuid
 import re
 import hmac
+import threading
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -34,6 +35,11 @@ from . import __version__
 ERR_INVALID_REQUEST = "invalid_request_error"
 ERR_RATE_LIMIT = "rate_limit_error"
 ERR_API = "api_error"
+
+# Gap between SSE keep-alive comments while a buffered turn still works
+# upstream. Must stay well under every client's idle/chunk timeout (OpenCode
+# defaults to 300 s).
+SSE_PING_INTERVAL_SEC = 15
 
 _MISSING = object()
 
@@ -321,6 +327,58 @@ class GeminiHandler(BaseHTTPRequestHandler):
         self._send_cors_headers()
         self.end_headers()
 
+    def _sse_write(self, data: bytes):
+        """Write raw bytes to the SSE stream.
+
+        A keep-alive thread may be writing ``: ping`` comments concurrently
+        (see ``_start_sse_with_keepalive``), so every SSE write goes through
+        one lock -- an interleaved frame would corrupt the stream.
+        """
+        lock = getattr(self, "_sse_lock", None)
+        if lock is None:
+            self.wfile.write(data)
+            self.wfile.flush()
+            return
+        with lock:
+            self.wfile.write(data)
+            self.wfile.flush()
+
+    def _start_sse_with_keepalive(self):
+        """Send the SSE response head *now* and keep the wire warm.
+
+        A buffered turn (tools active, or response_format set) can spend
+        minutes upstream -- a thinking model plus one heuristic retry -- and
+        HTTP carries its status line with the first body byte. A client that
+        waits for response headers would see nothing at all until the very
+        end and abort on its own header timeout (observed with OpenCode:
+        "Timed out waiting for response headers", every 5 minutes, forever,
+        while upstream answers kept arriving at a dead socket).
+
+        Sending the head immediately plus an SSE comment every
+        ``SSE_PING_INTERVAL_SEC`` keeps every idle timeout quiet; comments
+        dispatch no event, so conformant clients never see them.
+        """
+        self._sse_lock = threading.Lock()
+        client_gone = threading.Event()
+        self._start_sse()
+
+        stop_ping = threading.Event()
+
+        def _ping():
+            while not stop_ping.wait(SSE_PING_INTERVAL_SEC):
+                try:
+                    self._sse_write(b": ping\n\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    # Nobody is listening any more; the caller uses this to
+                    # stop burning upstream calls for an answer no one gets.
+                    client_gone.set()
+                    return
+                except Exception:
+                    return
+
+        threading.Thread(target=_ping, daemon=True).start()
+        return stop_ping.set, client_gone
+
     def _sse_chunk(self, cid, model, delta, finish_reason, include_usage=False):
         # ``logprobs`` is required (nullable) on the choice of a chat chunk and
         # ``delta`` must open with an empty ``content`` so clients that read
@@ -340,8 +398,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             chunk["usage"] = None
         frame = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         trace("PROXY -> CLIENT (SSE frame)", frame)
-        self.wfile.write(frame.encode())
-        self.wfile.flush()
+        self._sse_write(frame.encode())
 
     def _sse_usage(self, cid, model, prompt, text):
         chunk = {
@@ -354,20 +411,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         }
         frame = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         trace("PROXY -> CLIENT (SSE usage)", frame)
-        self.wfile.write(frame.encode())
-        self.wfile.flush()
+        self._sse_write(frame.encode())
 
     def _sse_event_error(self, status, message, type_=ERR_API, code=None):
         payload = {"error": {"message": message, "type": type_, "param": None, "code": code}}
         frame = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
         trace("PROXY -> CLIENT (SSE error)", frame)
-        self.wfile.write(frame.encode())
-        self.wfile.flush()
+        self._sse_write(frame.encode())
 
     def _sse_done(self):
         trace("PROXY -> CLIENT (SSE done)", "data: [DONE]\n\n")
-        self.wfile.write(b"data: [DONE]\n\n")
-        self.wfile.flush()
+        self._sse_write(b"data: [DONE]\n\n")
 
 # ─── request parsing / auth / routing ─────────────────────────────────────
 
@@ -625,7 +679,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
     def _generate_with_tool_retry(self, prompt, model_id, think_mode, file_refs,
                                   extra, tools_active, allowed_names,
                                   tool_schemas, required_tool, messages=None,
-                                  ticket=None, tool_required=None):
+                                  ticket=None, tool_required=None,
+                                  client_gone=None):
         """Run ``generate()``, retrying while the reply did not use a tool.
 
         Five shapes all arrive as a normal HTTP 200 yet leave the client
@@ -658,6 +713,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         text, tool_calls, missing = "", None, []
         for attempt in range(attempts):
+            if attempt > 0 and client_gone is not None and client_gone.is_set():
+                # The client hung up while an earlier attempt ran (a keep-alive
+                # write failed): another upstream call would bill the account
+                # for an answer that reaches nobody.
+                log("Tool retry skipped: client disconnected")
+                break
             call_prompt = prompt
             if attempt > 0:
                 # "tool_call block ONLY" is right when the client demands a
@@ -798,14 +859,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # one (see _generate_with_tool_retry).
         required_tool = is_required_tool_choice(tool_choice)
         tools_active = bool(tools) and tool_choice != "none"
+
+        # A streaming client gets its response head and the opening role chunk
+        # immediately, then keep-alive comments while upstream works: a
+        # buffered turn can take minutes (thinking model plus one tool retry),
+        # and a client that has received no headers at all gives up on its own
+        # header timeout mid-generation (see _start_sse_with_keepalive).
+        stop_ping, client_gone = None, None
+        if stream:
+            stop_ping, client_gone = self._start_sse_with_keepalive()
+            self._sse_chunk(cid, echo_model, {"role": "assistant", "content": ""},
+                            None, include_usage)
         try:
             text, tool_calls = self._generate_with_tool_retry(
                 prompt, model_id, think_mode, file_refs, extra,
                 tools_active, allowed_names, tool_schemas, required_tool,
-                messages=messages, ticket=ticket, tool_required=tool_required)
+                messages=messages, ticket=ticket, tool_required=tool_required,
+                client_gone=client_gone)
         except Exception as e:
+            if stream:
+                try:
+                    self._sse_event_error(*_map_upstream_error(e))
+                    self._sse_done()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             self.send_api_error(*_map_upstream_error(e))
             return
+        finally:
+            if stop_ping is not None:
+                stop_ping()
 
         if rf_instruction and text:
             text = strip_code_fence(text)
@@ -813,6 +896,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         text, truncated = _apply_max_tokens(text, max_tokens)
 
         if not text and not tool_calls:
+            if stream:
+                self._sse_event_error(503, "empty response from upstream", ERR_API)
+                self._sse_done()
+                return
             self.send_api_error(503, "empty response from upstream", ERR_API)
             return
 
@@ -825,10 +912,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         finish = "tool_calls" if tool_calls else ("length" if truncated else "stop")
 
         if stream:
+            # The head and the role chunk were sent before upstream started.
             try:
-                self._start_sse()
-                self._sse_chunk(cid, echo_model, {"role": "assistant", "content": ""},
-                                None, include_usage)
                 if text:
                     self._sse_chunk(cid, echo_model, {"content": text}, None, include_usage)
                 for index, tc in enumerate(tool_calls or []):
@@ -859,24 +944,39 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def _stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
                      extra, stop_strings, max_tokens, include_usage, ticket=None):
+        # Head first, upstream second: the first upstream byte can take
+        # minutes on a thinking model, and a client waiting for response
+        # headers would abort before a single frame (see
+        # _start_sse_with_keepalive).
+        stop_ping, _client_gone = self._start_sse_with_keepalive()
+        self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
+                        None, include_usage)
         try:
             gen = generate_stream(prompt, model_id, think_mode, file_refs, extra, ticket)
             first = next(gen, _MISSING)
         except Exception as e:
-            self.send_api_error(*_map_upstream_error(e))
+            stop_ping()
+            try:
+                self._sse_event_error(*_map_upstream_error(e))
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         if first is _MISSING:
-            self.send_api_error(503, "empty response from upstream", ERR_API)
+            try:
+                self._sse_event_error(503, "empty response from upstream", ERR_API)
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
-
-        self._start_sse()
-        self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
-                        None, include_usage)
         full_text = ""
         finish = "stop"
         hold = max((len(s) for s in stop_strings), default=0)
         buf = ""
         try:
+            # The keep-alive stays on for the whole stream: a thinking model
+            # can go silent between chunks for longer than a client's chunk
+            # timeout, and a comment is ignored by every SSE parser.
             for raw in self._iter_with_first(first, gen):
                 if not raw:
                     continue
@@ -925,6 +1025,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             return
         finally:
+            stop_ping()
             close = getattr(gen, "close", None)
             if callable(close):
                 try:

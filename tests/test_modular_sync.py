@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -959,7 +960,10 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertTrue(body.endswith("data: [DONE]\n\n"))
 
     @mock.patch("gemini_web2api.server.generate_stream", side_effect=RuntimeError("boom"))
-    def test_chat_stream_error_before_start_returns_json_503(self, _generate_stream):
+    def test_chat_stream_error_before_start_emits_error_event_and_done(self, _generate_stream):
+        # The head goes out before upstream starts (a thinking model may take
+        # minutes for its first byte), so a failure can no longer be an HTTP
+        # status: it arrives as an SSE error event on the already-open stream.
         status, headers, body = self.post_json(
             "/v1/chat/completions",
             {
@@ -969,10 +973,127 @@ class StreamingEndpointTests(unittest.TestCase):
             },
         )
 
-        # The spec declares 500/503 (never 502) for /chat/completions.
-        self.assertEqual(status, 503)
-        self.assertEqual(headers["Content-Type"], "application/json")
-        self.assertIn("error", json.loads(body))
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        error_frames = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {") and "error" in json.loads(line[len("data: "):])
+        ]
+        self.assertEqual(len(error_frames), 1)
+        self.assertIn("boom", error_frames[0]["error"]["message"])
+        self.assertEqual(error_frames[0]["error"]["type"], "api_error")
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_stream_with_tools_headers_before_upstream_finishes(self, generate):
+        """The response head must arrive while upstream is still generating.
+
+        OpenCode (and any streaming client) waits for response headers; before
+        this, a tools turn buffered everything and the client saw nothing for
+        minutes, hit its header timeout, and aborted -- while upstream answers
+        kept arriving at a dead socket.
+        """
+        upstream_started = threading.Event()
+        release_upstream = threading.Event()
+
+        def slow_generate(*args, **kwargs):
+            upstream_started.set()
+            if not release_upstream.wait(timeout=5):
+                raise RuntimeError("upstream was never released")
+            return "hi"
+
+        generate.side_effect = slow_generate
+
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        connection.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps({
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "read",
+                        "description": "Read a file",
+                        "parameters": {"type": "object"},
+                    },
+                }],
+                "stream": True,
+            }),
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            response = connection.getresponse()
+            # The head arrived while generate() is still blocked: the upstream
+            # call is in flight and nobody has released it yet.
+            self.assertTrue(upstream_started.wait(timeout=2))
+            self.assertFalse(release_upstream.is_set())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.getheader("Content-Type"), "text/event-stream")
+            release_upstream.set()
+            body = response.read().decode()
+        finally:
+            release_upstream.set()
+            connection.close()
+
+        chunks = [
+            json.loads(line[len("data: "):])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+        self.assertEqual(chunks[0]["choices"][0]["delta"],
+                         {"role": "assistant", "content": ""})
+        self.assertEqual(chunks[1]["choices"][0]["delta"], {"content": "hi"})
+        self.assertTrue(body.endswith("data: [DONE]\n\n"))
+
+    @mock.patch("gemini_web2api.server.SSE_PING_INTERVAL_SEC", 0.05)
+    @mock.patch("gemini_web2api.server.generate")
+    def test_chat_stream_keepalive_ping_during_slow_upstream(self, generate):
+        """An SSE comment must reach the client while upstream still works.
+
+        The comment carries no event (SSE parsers ignore it), but it proves
+        the connection is alive so no client idle/chunk timeout fires.
+        """
+        release_upstream = threading.Event()
+
+        def slow_generate(*args, **kwargs):
+            release_upstream.wait(timeout=5)
+            return "done"
+
+        generate.side_effect = slow_generate
+
+        body = json.dumps({
+            "model": "gemini-3.6-flash",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "read",
+                    "description": "Read a file",
+                    "parameters": {"type": "object"},
+                },
+            }],
+            "stream": True,
+        }).encode()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            sock.settimeout(3)
+            received = b""
+            while b": ping" not in received:
+                received += sock.recv(4096)
+        finally:
+            release_upstream.set()
+            sock.close()
+        self.assertIn(b": ping\n\n", received)
 
     def test_chat_stream_midstream_error_emits_error_event_and_done(self):
         def flaky_stream(*args, **kwargs):
@@ -2398,6 +2519,67 @@ class ToolRequiredParamTests(unittest.TestCase):
                 [{"function": {"name": "read", "arguments": "[1]"}}],
                 {"read": {"path"}}),
             [])
+
+
+class ToolRetryClientGoneTests(unittest.TestCase):
+    """A hung-up client must not be billed another upstream call."""
+
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def _handler(self):
+        return GeminiHandler.__new__(GeminiHandler)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_disconnect_during_first_attempt_skips_the_retry(self, generate):
+        CONFIG["tool_retry_on_miss"] = True
+        client_gone = threading.Event()
+
+        def answer_then_client_leaves(*args, **kwargs):
+            # The client hung up while this call was in flight (a keep-alive
+            # write failed) and the reply is prose with no tool call.
+            client_gone.set()
+            return "README.md được mô tả trong AGENTS.md"
+
+        generate.side_effect = answer_then_client_leaves
+
+        text, tool_calls = self._handler()._generate_with_tool_retry(
+            "review source giùm", 2, 1, None, None,
+            True, {"read"}, {"read": []}, False,
+            messages=[{"role": "user", "content": "review source giùm"}],
+            client_gone=client_gone,
+        )
+
+        # The prose answer is still returned (nothing raises), but the
+        # heuristic retry -- a second upstream call nobody will read -- is not.
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(text, "README.md được mô tả trong AGENTS.md")
+        self.assertFalse(tool_calls)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_connected_client_still_gets_the_retry(self, generate):
+        CONFIG["tool_retry_on_miss"] = True
+        # The first reply is prose (no call); the retry -- an unconnected
+        # client would have skipped -- yields a real tool_call block.
+        generate.side_effect = [
+            "Xem thì rõ",
+            '```tool_call\n{"name": "read", "arguments": {"path": "a.py"}}\n```',
+        ]
+
+        text, tool_calls = self._handler()._generate_with_tool_retry(
+            "review source giùm", 2, 1, None, None,
+            True, {"read"}, {"read": []}, False,
+            messages=[{"role": "user", "content": "review source giùm"}],
+            client_gone=threading.Event(),
+        )
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertTrue(tool_calls)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read")
 
 
 class HttpClientThreadSafetyTests(unittest.TestCase):
