@@ -17,6 +17,9 @@ from .tools import (
     parse_tool_calls,
     google_contents_to_prompt,
     parse_google_function_calls,
+    _canonical_args,
+    _google_repeatable,
+    _repeatable_calls,
     build_response_format_instruction,
     strip_code_fence,
     tool_names,
@@ -578,7 +581,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                                 ERR_INVALID_REQUEST, "model_not_found")
             return None
         model_name, model_id, think_mode, err, extra = resolve_model(
-            raw or CONFIG["default_model"])
+            raw or CONFIG["default_model"], default=CONFIG["default_model"])
         if err:
             self.send_api_error(400, err, ERR_INVALID_REQUEST)
             return None
@@ -710,8 +713,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
         attempts = _tool_retry_attempts(required_tool, tools_active)
         # Computed once: it inspects the whole conversation, not the reply.
         owed = pending_tool_request(messages) if tools_active else None
+        # Calls this conversation already has results for: emitting one again
+        # is a loop, not progress.
+        repeatable = _repeatable_calls(messages) if tools_active else set()
 
         text, tool_calls, missing = "", None, []
+        dropped = []
+        nudge_extra = ""
+        repeat_nudge = ""
+        repeats = 0
+        best_text, best_idx = "", -1
         for attempt in range(attempts):
             if attempt > 0 and client_gone is not None and client_gone.is_set():
                 # The client hung up while an earlier attempt ran (a keep-alive
@@ -740,6 +751,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                               f"parameter(s): {', '.join(missing)} -- include "
                               "every required parameter.")
                     missing = []
+                if nudge_extra:
+                    nudge += nudge_extra
+                    nudge_extra = ""
+                if repeat_nudge:
+                    nudge += repeat_nudge
+                    repeat_nudge = ""
                 call_prompt = prompt + "\n\n" + nudge
             try:
                 raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
@@ -747,12 +764,36 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if attempt + 1 < attempts:
                     log(f"Tool retry after upstream error: {e}")
                     continue
+                if best_text and not required_tool:
+                    log(f"Tool retry: final attempt failed ({e}); returning "
+                        f"best text from attempt {best_idx + 1}")
+                    return best_text, None
                 raise
-            text, tool_calls = raw, None
+            text, tool_calls, dropped = raw, None, []
             if tools_active and text:
-                text, tool_calls = parse_tool_calls(text, allowed_names, tool_schemas)
+                text, tool_calls, dropped = parse_tool_calls(text, allowed_names, tool_schemas)
                 _log_tool_trace(raw, tool_calls)
             if tool_calls:
+                if all(((tc.get("function") or {}).get("name"),
+                        _canonical_args((tc.get("function") or {}).get("arguments")))
+                       in repeatable for tc in tool_calls):
+                    # Every call repeats one whose result is already in the
+                    # conversation: running it again cannot learn anything.
+                    if repeats < 3 and attempt + 1 < attempts:
+                        repeats += 1
+                        repeat_nudge = (" The result of this exact tool call "
+                                        "is already in the conversation -- "
+                                        "answer in plain text, do not call "
+                                        "it again.")
+                        log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                            "duplicate tool call already answered, nudging "
+                            "the model to answer instead")
+                        continue
+                    log("Duplicate tool call repeated 3 times (or no attempts "
+                        "left): a loop is worse than one prose turn, "
+                        "returning the plain-text answer instead")
+                    tool_calls = None
+                    break
                 missing = missing_required_params(tool_calls, tool_required)
                 if missing:
                     # Always logged: even when no attempt is left this is the
@@ -765,6 +806,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
                             "asking the model to fill them in")
                         continue
                 break
+            if (text or "").strip() and not looks_like_upstream_error(text):
+                # A usable answer worth keeping if a later attempt fails: a
+                # good first turn must not become a 503 because the retry
+                # produced the placeholder or raised.
+                best_text, best_idx = text, attempt
             if required_tool:
                 continue
             if attempt + 1 >= attempts:
@@ -781,6 +827,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
                     "returned its canned error placeholder instead of a response")
                 continue
+            if tools_active and dropped:
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): previous "
+                    f"tool_call block(s) unusable: {'; '.join(dropped)}")
+                nudge_extra = (" Your previous tool_call block(s) could not be "
+                               "used: " + "; ".join(dropped) +
+                               ". Valid tool names: "
+                               + ", ".join(sorted(allowed_names or [])) + ".")
+                continue
             if retry_on_miss and owed:
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
                 continue
@@ -793,8 +847,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # The canned sentence is an upstream failure, not something the model
         # said. Handing it to the client as 200 says "answered" when it was not.
         if not tool_calls and looks_like_upstream_error(text):
+            if best_text and not required_tool:
+                log(f"Tool retry: final answer is the upstream placeholder; "
+                    f"returning best text from attempt {best_idx + 1}")
+                return best_text, None
             raise GeminiError("upstream returned an error placeholder instead "
                               "of a response; please retry")
+        if not tool_calls and not (text or "").strip():
+            if best_text and not required_tool:
+                log(f"Tool retry: final answer is empty; returning best text "
+                    f"from attempt {best_idx + 1}")
+                return best_text, None
         return text, tool_calls
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
@@ -1166,61 +1229,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_required = tool_required_params(tools) or None
         required_tool = is_required_tool_choice(tool_choice)
         tools_active = bool(tools) and tool_choice != "none"
-
-        try:
-            file_refs = _upload_images(images)
-            text, tool_calls = self._generate_with_tool_retry(
-                prompt, model_id, think_mode, file_refs, extra,
-                tools_active, allowed_names, tool_schemas, required_tool,
-                messages=messages, ticket=ticket, tool_required=tool_required)
-        except Exception as e:
-            self.send_api_error(*_map_upstream_error(e))
-            return
-        if rf_instruction and text:
-            text = strip_code_fence(text)
-        text = _apply_stop(text, stop_strings)
-        text, truncated = _apply_max_tokens(text, max_tokens)
-        if not text and not tool_calls:
-            self.send_api_error(503, "empty response from upstream", ERR_API)
-            return
-
-        # Responses reports a cut-off answer as incomplete rather than completed.
-        final_status = "incomplete" if truncated else "completed"
-        # `incomplete_details` is required on the object and null when the
-        # answer is complete; it must not disappear from the payload.
-        incomplete_details = {"reason": "max_output_tokens"} if truncated else None
-        # A message that max_output_tokens cut off is itself incomplete --
-        # leaving it "completed" while the response says "incomplete" is the
-        # contradiction strict clients flag.
-        message_status = "incomplete" if truncated else "completed"
-
-        rid = f"resp_{uuid.uuid4().hex[:16]}"
-        mid = f"msg_{uuid.uuid4().hex[:12]}"
-        output = []
-        if tool_calls:
-            for tc in tool_calls:
-                output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
-                               "name": tc["function"]["name"],
-                               "arguments": tc["function"]["arguments"], "status": "completed"})
-        if text or not tool_calls:
-            output.append({"type": "message", "id": mid, "role": "assistant",
-                           "status": message_status,
-                           "content": [{"type": "output_text", "text": text or "",
-                                        "annotations": [], "logprobs": []}]})
-
-        usage = {
-            "input_tokens": len(prompt) // 4,
-            "output_tokens": len(text or "") // 4,
-            "total_tokens": (len(prompt) + len(text or "")) // 4,
-            # Required breakdowns: their absence fails strict SDKs even though
-            # the totals are all we can actually measure.
-            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
-            "output_tokens_details": {"reasoning_tokens": 0},
-        }
+        want_stream = bool(req.get("stream"))
 
         # Fields the spec marks required on every response object. Request
         # fields are echoed back unchanged where we honour them, otherwise the
         # spec's own default is used.
+        rid = f"resp_{uuid.uuid4().hex[:16]}"
         created_at = int(time.time())
         instructions = req.get("instructions")
         tools_echo = req.get("tools")
@@ -1228,6 +1242,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
         parallel = req.get("parallel_tool_calls")
         temperature = req.get("temperature")
         top_p = req.get("top_p")
+        # Set before generate (the opening events carry it as null) and
+        # reassigned once truncation is known; the closure reads it at call
+        # time, so both see the right value.
+        incomplete_details = None
 
         def _number(value, default):
             # `bool` is an ``int`` subclass: `temperature: true` must not be
@@ -1257,53 +1275,147 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 "usage": token_usage,
             }
 
-        if req.get("stream"):
-            self._start_sse()
+        # A buffered turn can spend minutes upstream, and HTTP carries its
+        # status line with the first body byte: without the head now, a
+        # streaming client aborts on its own header timeout mid-generation.
+        stop_ping, client_gone = None, None
+        if want_stream:
+            stop_ping, client_gone = self._start_sse_with_keepalive()
             sequence_number = 0
 
             def emit(event_type, **fields):
                 nonlocal sequence_number
                 sequence_number += 1
-                event = {"type": event_type, "sequence_number": sequence_number, **fields}
-                self.wfile.write(f"event: {event_type}\ndata: {json.dumps(event)}\n\n".encode())
+                event = {"type": event_type, "sequence_number": sequence_number,
+                         **fields}
+                frame = (f"event: {event_type}\n"
+                         f"data: {json.dumps(event)}\n\n").encode()
+                trace(f"PROXY -> CLIENT (SSE {event_type})", frame)
+                self._sse_write(frame)
 
             emit("response.created", response=response_fields("in_progress", [], None))
             emit("response.in_progress", response=response_fields("in_progress", [], None))
-            for output_index, item in enumerate(output):
-                if item["type"] == "function_call":
-                    pending_item = {
-                        "type": "function_call", "id": item["id"], "call_id": item["call_id"],
-                        "name": item["name"], "arguments": "", "status": "in_progress",
-                    }
-                    emit("response.output_item.added", output_index=output_index, item=pending_item)
-                    emit("response.function_call_arguments.delta", item_id=item["id"],
-                         output_index=output_index, delta=item["arguments"])
-                    emit("response.function_call_arguments.done", item_id=item["id"],
-                         output_index=output_index, arguments=item["arguments"])
-                    emit("response.output_item.done", output_index=output_index, item=item)
-                elif item["type"] == "message":
-                    pending_item = {
-                        "type": "message", "id": item["id"], "role": "assistant",
-                        "status": "in_progress", "content": [],
-                    }
-                    emit("response.output_item.added", output_index=output_index, item=pending_item)
-                    for content_index, content_part in enumerate(item["content"]):
-                        event_fields = {"item_id": item["id"], "output_index": output_index,
-                                        "content_index": content_index}
-                        emit("response.content_part.added", **event_fields, part={
-                            "type": "output_text", "text": "", "annotations": [],
-                            "logprobs": []})
-                        # `logprobs` is required on both text events (an empty
-                        # list: we never see upstream probabilities).
-                        emit("response.output_text.delta", **event_fields,
-                             delta=content_part["text"], logprobs=[])
-                        emit("response.output_text.done", **event_fields,
-                             text=content_part["text"], logprobs=[])
-                        emit("response.content_part.done", **event_fields, part=content_part)
-                    emit("response.output_item.done", output_index=output_index, item=item)
-            final_event = "response.incomplete" if truncated else "response.completed"
-            emit(final_event, response=response_fields(final_status, output, usage))
-            self.wfile.flush()
+        try:
+            file_refs = _upload_images(images)
+            text, tool_calls = self._generate_with_tool_retry(
+                prompt, model_id, think_mode, file_refs, extra,
+                tools_active, allowed_names, tool_schemas, required_tool,
+                messages=messages, ticket=ticket, tool_required=tool_required,
+                client_gone=client_gone)
+        except Exception as e:
+            if want_stream:
+                try:
+                    _status, message, _type, _code = _map_upstream_error(e)
+                    failed = response_fields("failed", [], None)
+                    failed["error"] = {"message": message}
+                    emit("response.failed", response=failed)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    stop_ping()
+                return
+            self.send_api_error(*_map_upstream_error(e))
+            return
+        if rf_instruction and text:
+            text = strip_code_fence(text)
+        text = _apply_stop(text, stop_strings)
+        text, truncated = _apply_max_tokens(text, max_tokens)
+        if not text and not tool_calls:
+            if want_stream:
+                # Headers are already on the wire: the failure arrives as an
+                # event, not a status.
+                try:
+                    failed = response_fields("failed", [], None)
+                    failed["error"] = {"message": "empty response from upstream"}
+                    emit("response.failed", response=failed)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    stop_ping()
+                return
+            self.send_api_error(503, "empty response from upstream", ERR_API)
+            return
+
+        # Responses reports a cut-off answer as incomplete rather than completed.
+        final_status = "incomplete" if truncated else "completed"
+        # `incomplete_details` is required on the object and null when the
+        # answer is complete; it must not disappear from the payload.
+        incomplete_details = {"reason": "max_output_tokens"} if truncated else None
+        # A message that max_output_tokens cut off is itself incomplete --
+        # leaving it "completed" while the response says "incomplete" is the
+        # contradiction strict clients flag.
+        message_status = "incomplete" if truncated else "completed"
+
+        mid = f"msg_{uuid.uuid4().hex[:12]}"
+        output = []
+        if tool_calls:
+            for tc in tool_calls:
+                output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
+                               "name": tc["function"]["name"],
+                               "arguments": tc["function"]["arguments"], "status": "completed"})
+        if text or not tool_calls:
+            output.append({"type": "message", "id": mid, "role": "assistant",
+                           "status": message_status,
+                           "content": [{"type": "output_text", "text": text or "",
+                                        "annotations": [], "logprobs": []}]})
+
+        usage = {
+            "input_tokens": len(prompt) // 4,
+            "output_tokens": len(text or "") // 4,
+            "total_tokens": (len(prompt) + len(text or "")) // 4,
+            # Required breakdowns: their absence fails strict SDKs even though
+            # the totals are all we can actually measure.
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+
+        # Fields the spec marks required on every response object were bound
+        # before generate (above); `created_at`, the echoed request fields and
+        # `response_fields` are all reused here.
+        if want_stream:
+            # The head plus response.created/in_progress went out before
+            # upstream started; only the output items and the final event
+            # remain, on the same sequence.
+            try:
+                for output_index, item in enumerate(output):
+                    if item["type"] == "function_call":
+                        pending_item = {
+                            "type": "function_call", "id": item["id"], "call_id": item["call_id"],
+                            "name": item["name"], "arguments": "", "status": "in_progress",
+                        }
+                        emit("response.output_item.added", output_index=output_index, item=pending_item)
+                        emit("response.function_call_arguments.delta", item_id=item["id"],
+                             output_index=output_index, delta=item["arguments"])
+                        emit("response.function_call_arguments.done", item_id=item["id"],
+                             output_index=output_index, arguments=item["arguments"])
+                        emit("response.output_item.done", output_index=output_index, item=item)
+                    elif item["type"] == "message":
+                        pending_item = {
+                            "type": "message", "id": item["id"], "role": "assistant",
+                            "status": "in_progress", "content": [],
+                        }
+                        emit("response.output_item.added", output_index=output_index, item=pending_item)
+                        for content_index, content_part in enumerate(item["content"]):
+                            event_fields = {"item_id": item["id"], "output_index": output_index,
+                                            "content_index": content_index}
+                            emit("response.content_part.added", **event_fields, part={
+                                "type": "output_text", "text": "", "annotations": [],
+                                "logprobs": []})
+                            # `logprobs` is required on both text events (an empty
+                            # list: we never see upstream probabilities).
+                            emit("response.output_text.delta", **event_fields,
+                                 delta=content_part["text"], logprobs=[])
+                            emit("response.output_text.done", **event_fields,
+                                 text=content_part["text"], logprobs=[])
+                            emit("response.content_part.done", **event_fields, part=content_part)
+                        emit("response.output_item.done", output_index=output_index, item=item)
+                final_event = "response.incomplete" if truncated else "response.completed"
+                emit(final_event, response=response_fields(final_status, output, usage))
+                self.wfile.flush()
+            finally:
+                stop_ping()
         else:
             self.send_json(response_fields(final_status, output, usage))
 
@@ -1316,7 +1428,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
         m = re.match(r'/v1beta/models/([^:?]+)', self.path)
         model_name = m.group(1) if m else CONFIG["default_model"]
-        model_name, model_id, think_mode, err, extra = resolve_model(model_name)
+        model_name, model_id, think_mode, err, extra = resolve_model(
+            model_name, default=CONFIG["default_model"])
         if err:
             self.send_google_error(400, err, "INVALID_ARGUMENT")
             return
@@ -1402,9 +1515,47 @@ class GeminiHandler(BaseHTTPRequestHandler):
         required_tool = fc_mode == "ANY"
         retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
         attempts = _tool_retry_attempts(required_tool, has_tools)
+        grepeat = _google_repeatable(req.get("contents")) if has_tools else set()
+
+        # Stream + tools buffers the whole turn (retries included) before the
+        # first byte, so the head goes out before upstream starts -- same
+        # header-timeout rationale as the OpenAI streaming paths -- and
+        # retries are gated on the client still listening.
+        stop_ping, client_gone, sse_started = None, None, False
+        if stream and has_tools:
+            stop_ping, client_gone = self._start_sse_with_keepalive()
+            sse_started = True
+
+        def _google_stream_fail(exc):
+            """Report a buffered-turn failure on the already-open stream."""
+            status, message, gstatus = _map_google_error(exc)
+            try:
+                err_obj = {"error": {"code": status, "message": message,
+                                     "status": gstatus}}
+                self._sse_write(
+                    f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode())
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                if stop_ping is not None:
+                    stop_ping()
+
+        def _google_fail(status, message, gstatus):
+            if sse_started:
+                _google_stream_fail(GeminiError(message, status=status))
+            else:
+                self.send_google_error(status, message, gstatus)
 
         text, clean_text, function_calls = "", "", []
+        grepeat_nudge = ""
+        grepeats = 0
+        best_text, best_idx = "", -1
         for attempt in range(attempts):
+            if attempt > 0 and client_gone is not None and client_gone.is_set():
+                # Same rationale as the chat loop: no billing the account for
+                # an answer that reaches nobody.
+                log("Google tool retry skipped: client disconnected")
+                break
             call_prompt = prompt
             if attempt > 0:
                 nudge = (
@@ -1414,6 +1565,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "answering requires reading or changing something, call "
                     "the tool now; otherwise give your final answer."
                 )
+                if grepeat_nudge:
+                    nudge += grepeat_nudge
+                    grepeat_nudge = ""
                 call_prompt = prompt + "\n\n" + nudge
             try:
                 raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
@@ -1421,13 +1575,40 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if attempt + 1 < attempts:
                     log(f"Google tool retry after upstream error: {e}")
                     continue
+                if best_text and not required_tool:
+                    log(f"Google tool retry: final attempt failed ({e}); "
+                        f"returning best text from attempt {best_idx + 1}")
+                    text, clean_text, function_calls = best_text, best_text, []
+                    break
+                if sse_started:
+                    _google_stream_fail(e)
+                    return
                 raise
             text = raw
             clean_text, function_calls = "", []
             if has_tools and raw:
                 clean_text, function_calls = parse_google_function_calls(raw)
             if function_calls:
+                if all((fc.get("name"), _canonical_args(fc.get("args")))
+                       in grepeat for fc in function_calls):
+                    # Already answered upstream: re-emitting the call loops.
+                    if grepeats < 3 and attempt + 1 < attempts:
+                        grepeats += 1
+                        grepeat_nudge = (" The result of this exact function "
+                                         "call is already in the conversation "
+                                         "-- answer in plain text, do not call "
+                                         "it again.")
+                        log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                            "duplicate function call already answered, nudging")
+                        continue
+                    log("Google duplicate function call repeated 3 times (or no "
+                        "attempts left): returning the plain-text answer instead")
+                    function_calls = []
+                    text = clean_text or raw
+                    break
                 break
+            if (raw or "").strip() and not looks_like_upstream_error(raw):
+                best_text, best_idx = raw, attempt
             if attempt + 1 >= attempts:
                 break
             if not (raw or "").strip():
@@ -1448,17 +1629,27 @@ class GeminiHandler(BaseHTTPRequestHandler):
             break
 
         if not text:
-            self.send_google_error(502, "empty response from upstream", "UNAVAILABLE")
-            return
+            if best_text and not required_tool:
+                log(f"Google tool retry: final answer is empty; returning best "
+                    f"text from attempt {best_idx + 1}")
+                text = best_text
+            else:
+                _google_fail(502, "empty response from upstream", "UNAVAILABLE")
+                return
 
         # The canned sentence is an upstream failure, not something the model
         # said. Returning it as a candidate tells the client "answered".
         if looks_like_upstream_error(text):
-            status, message, gstatus = _map_google_error(GeminiError(
-                "upstream returned an error placeholder instead of a response; "
-                "please retry"))
-            self.send_google_error(status, message, gstatus)
-            return
+            if best_text and not required_tool:
+                log(f"Google tool retry: final answer is the upstream "
+                    f"placeholder; returning best text from attempt {best_idx + 1}")
+                text = best_text
+            else:
+                status, message, gstatus = _map_google_error(GeminiError(
+                    "upstream returned an error placeholder instead of a response; "
+                    "please retry"))
+                _google_fail(status, message, gstatus)
+                return
 
         response_parts = []
         if has_tools and function_calls:
@@ -1486,9 +1677,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
         }
 
         if stream:
-            self._start_sse()
-            self.wfile.write(f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n".encode())
-            self.wfile.flush()
+            try:
+                if not sse_started:
+                    self._start_sse()
+                self._sse_write(
+                    f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n".encode())
+            finally:
+                if stop_ping is not None:
+                    stop_ping()
         else:
             self.send_json(response_obj)
 

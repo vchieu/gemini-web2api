@@ -1,6 +1,8 @@
 """Multimodal: Scotty resumable upload for Gemini image input."""
 import json
 import base64
+import ipaddress
+import socket
 import urllib.request
 import urllib.parse
 import time
@@ -43,6 +45,13 @@ def _get_page_tokens() -> dict:
             m = re.search(pattern, html)
             if m:
                 tokens[key] = m.group(1)
+        # The xsrf token ages out like everything else on the page: refresh
+        # CONFIG from the same /app fetch the image path already does, so a
+        # stale `at` form field stops failing StreamGenerate with HTTP 400.
+        m = re.search(r'"SNlM0e":"([^"]+)"', html)
+        if m:
+            CONFIG["xsrf_token"] = m.group(1)
+            log("xsrf_token refreshed from the Gemini page")
         return tokens
     except Exception as e:
         log(f"Page token fetch failed: {e}")
@@ -152,11 +161,51 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
     return file_ref
 
 
+# Upper bound for a fetched image body. Without it one URL can eat unbounded
+# RAM while the server reads it; the caller turns b"" into "image fetch
+# failed", so oversize is a failed fetch, not a crash.
+_MAX_IMAGE_BYTES = 16 * 1024 * 1024
+
+
+def _host_is_private(hostname: str) -> bool:
+    """True when ``hostname`` resolves only to non-public IP addresses.
+
+    A literal IP is checked without any DNS; anything else goes through
+    ``getaddrinfo`` and every resolved address must be global. Blocks
+    loopback, private, link-local, multicast, reserved and unspecified
+    targets -- the fetch URL comes from the client, and without this the
+    server is an open proxy into the operator's own network.
+    """
+    if not hostname:
+        return True
+    host = hostname.strip().rstrip(".").strip("[]")
+    try:
+        return not ipaddress.ip_address(host).is_global
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        return True
+    if not infos:
+        return True
+    for info in infos:
+        try:
+            if not ipaddress.ip_address(info[4][0]).is_global:
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 def fetch_image_bytes(url: str) -> bytes:
     """Fetch image from URL."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         log(f"Image fetch skipped for unsupported URL scheme: {parsed.scheme or 'none'}")
+        return b""
+    if _host_is_private(parsed.hostname or ""):
+        log(f"Image fetch blocked for non-public target: {parsed.hostname or 'none'}")
         return b""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -169,7 +218,11 @@ def fetch_image_bytes(url: str) -> bytes:
             resp = opener.open(req, timeout=30)
         else:
             resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        return resp.read()
+        data = resp.read(_MAX_IMAGE_BYTES + 1)
+        if len(data) > _MAX_IMAGE_BYTES:
+            log(f"Image fetch failed: body exceeds {_MAX_IMAGE_BYTES} bytes")
+            return b""
+        return data
     except Exception as e:
         log(f"Image fetch failed: {e}")
         return b""

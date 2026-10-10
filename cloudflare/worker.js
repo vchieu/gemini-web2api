@@ -221,7 +221,7 @@ var DEFAULT_CONFIG = {
   // 示例: ["sk-my-random-secret", "sk-another"]
   // 留空 [] 表示不校验密钥 —— 请务必配合 API_KEYS 环境变量使用，
   // 否则任何知道你的 Worker 地址的人都能用你的 Google 会话。
-  apiKeys: [],
+  apiKeys: ["sk-gemini"],
 
   // ---- Cookie 认证 ----
   // Gemini 对匿名请求有严格的速率限制（容易触发 429 Too Many Requests）

@@ -5,7 +5,7 @@ import sys
 import uuid
 
 from .config import CONFIG, load_config, find_config
-from .models import MODELS
+from .models import MODELS, ticket_warnings
 from .gemini import HAS_HTTPX, fetch_latest_bl, log
 from .server import GeminiHandler, ThreadedServer
 from . import __version__
@@ -39,9 +39,12 @@ def _guard_bind(host, allow_insecure: bool) -> None:
         return
 
     # Generate a one-time key and require it; Docker users read it from
-    # the startup log and use it with Authorization: Bearer <key>.
+    # the startup log and use it with Authorization: Bearer <key>. Written to
+    # stderr directly, not through log(): with log_requests=false the key
+    # would otherwise be generated and required but never shown.
     key = uuid.uuid4().hex[:32] + uuid.uuid4().hex[:32]
-    log(f"Auto-generated API key (print this): {key}")
+    sys.stderr.write(f"Auto-generated API key (print this): {key}\n")
+    sys.stderr.flush()
     CONFIG["api_keys"] = [key]
 
 
@@ -110,6 +113,9 @@ def main():
           f"{'' if CONFIG.get('auto_update_bl', True) else ' (pinned)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
     print()
+    for warning in ticket_warnings():
+        sys.stderr.write(f"WARNING: {warning}\n")
+    sys.stderr.flush()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

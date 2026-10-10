@@ -361,8 +361,57 @@ _TOOL_REMINDER = ("\n\n[Reminder: you have working tools. To know what a file "
                   "answer from memory and do not claim to have read or run "
                   "anything you have not.]")
 
+# Appended instead of _TOOL_REMINDER when the conversation already ends in a
+# tool result. The model has just acted and tends to act again (read-read-read
+# loops); this tells it the result above is usable and a repeated identical
+# call is never the next step.
+_TOOL_RESULT_REMINDER = ("\n\n[Reminder: the tool result above is already in "
+                         "the conversation. If it is enough, answer now in "
+                         "plain text; otherwise call the next tool. Do not "
+                         "repeat a call whose result is already present.]")
 
-def _tool_use_block(tools_json: str, constraint: str) -> str:
+
+def _example_call(tool_defs: list) -> str:
+    """Render a copy-paste-shaped example call from the first declared tool.
+
+    Placeholders (``func_name``/``param``) taught weak models to emit the
+    placeholder itself as the call, so the example names a real tool and real
+    parameter keys: one entry per ``required`` parameter (fallback: the first
+    two declared properties; ``{}`` when the tool takes none), with values
+    typed by the schema type.
+    """
+    first = (tool_defs or [None])[0] or {}
+    name = first.get("name") if isinstance(first, dict) else None
+    name = name or "tool_name"
+    params = first.get("parameters") if isinstance(first, dict) else None
+    props = params.get("properties") if isinstance(params, dict) else None
+    props = props if isinstance(props, dict) else {}
+    required = params.get("required") if isinstance(params, dict) else None
+    if isinstance(required, list):
+        keys = [k for k in required if k in props]
+    else:
+        keys = []
+    if not keys:
+        keys = list(props)[:2]
+    example_args = {}
+    for key in keys:
+        spec = props.get(key) or {}
+        kind = spec.get("type") if isinstance(spec, dict) else None
+        if kind in ("integer", "number"):
+            example_args[key] = 0
+        elif kind == "boolean":
+            example_args[key] = False
+        elif kind == "array":
+            example_args[key] = []
+        elif kind == "object":
+            example_args[key] = {}
+        else:
+            example_args[key] = "value"
+    return json.dumps({"name": name, "arguments": example_args},
+                      ensure_ascii=False)
+
+
+def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) -> str:
     """The ``# Tool Use`` header the model must always be able to see.
 
     Pinned by ``_join_prompt_parts``: without it a large tool result can fill
@@ -375,9 +424,13 @@ def _tool_use_block(tools_json: str, constraint: str) -> str:
         "real the moment you call them. You have full access to them.\n\n"
         "Call format (use this exact format):\n"
         '```tool_call\n'
-        '{"name": "func_name", "arguments": {"param": "value"}}\n'
+        f'{_example_call(tool_defs)}\n'
         "```\n\n"
         "When calling tools:\n"
+        "- Each turn do exactly ONE of: (A) you need to read or change "
+        "something -> output ONLY tool_call block(s); (B) you already have "
+        "everything -> answer as plain text with NO block. Never both, and "
+        "never any prose after the block.\n"
         "- Output ONLY tool_call block(s): no prose, explanation or apology "
         "before or after them.\n"
         '- Every parameter belongs inside the "arguments" object, keyed exactly '
@@ -388,6 +441,8 @@ def _tool_use_block(tools_json: str, constraint: str) -> str:
         "file's contents or a command's output requires calling the tool.\n"
         "- Never claim the tools are unavailable, restricted, or that you lack "
         "permission: they are connected and will run.\n"
+        "- Never write [Tool result for ...] or [Assistant]: yourself, and "
+        "never invent a result: emit the block and stop.\n"
         "- Triple backticks inside a string argument (Markdown or code the user "
         "asked you to save) are literal text: keep all three of them. A fence "
         'inside the JSON never closes the "tool_call" block, so shortening '
@@ -446,7 +501,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                     "parameter names and types kept")
             else:
                 log(f"Tool definitions: {len(tool_defs)} tools, {tool_bytes} bytes")
-            tool_block = _tool_use_block(tools_json, constraint)
+            tool_block = _tool_use_block(tools_json, constraint, tool_defs)
 
     # Map tool_call ids -> function names so tool results can be labelled correctly.
     id_to_name = {}
@@ -469,6 +524,10 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         if role == "developer":
             role = "system"
         content = msg.get("content", "")
+        if content is None:
+            # An explicit ``content: null`` (legal JSON) must not reach the
+            # f-strings below as the literal text "None".
+            content = ""
 
         if isinstance(content, list):
             text_parts = []
@@ -550,7 +609,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             parts.append(_stringify_content(content))
 
     if tool_block:
-        parts.append(_TOOL_REMINDER)
+        last = messages[-1] if messages else None
+        last_role = last.get("role") if isinstance(last, dict) else None
+        # A turn that already ends in a tool result needs no push to act --
+        # it needs permission to stop acting and answer.
+        parts.append(_TOOL_RESULT_REMINDER if last_role == "tool"
+                     else _TOOL_REMINDER)
     return _join_prompt_parts(parts, max_bytes, pinned_head=tool_block), images
 
 
@@ -565,13 +629,19 @@ _ARGUMENT_KEYS = ("arguments", "args", "input")
 _NOTHING = object()
 
 
-def extract_arguments(data: dict):
+def extract_arguments(data: dict, props=None):
     """Pull a tool call's parameters out of a parsed payload.
 
     Handles the canonical ``{"name": ..., "arguments": {...}}`` shape and the
     variants models actually emit: ``args`` / ``input`` aliases, a
     ``parameters`` wrapper, and the flattened form where the parameters sit
     beside ``name``. Returns ``{}`` only when the payload carries none.
+
+    ``props`` is the declared parameter set for the resolved tool (or None
+    when unknown): a ``_CALL_META_KEYS`` entry that the schema declares --
+    opencode's ``bash`` really takes a ``description`` -- is a parameter, not
+    metadata, and survives. Without the schema every meta key is still
+    dropped, so a bare ``name``/``id``/``type`` never leaks into arguments.
     """
     for key in _ARGUMENT_KEYS:
         value = data.get(key)
@@ -579,7 +649,11 @@ def extract_arguments(data: dict):
             return value
         if isinstance(value, str) and value.strip():
             return value
-    rest = {k: v for k, v in data.items() if k not in _CALL_META_KEYS}
+    if props is None:
+        rest = {k: v for k, v in data.items() if k not in _CALL_META_KEYS}
+    else:
+        rest = {k: v for k, v in data.items()
+                if k not in _CALL_META_KEYS or k in props}
     if len(rest) == 1:
         key, value = next(iter(rest.items()))
         if key in ("parameters", "params") and isinstance(value, dict):
@@ -666,7 +740,129 @@ def _infer_tool_name(data: dict, tool_schemas) -> str:
     return matches[0] if len(matches) == 1 else None
 
 
-# Fences that may wrap a tool call. ``json`` is listed too because models reach
+# Conversation markers the model must never write itself. When the history
+# format teaches them (``[Assistant]: ...`` / ``[Tool result for ...]``), a
+# weak model copies the shape and fabricates results instead of calling.
+_FABRICATED_CUT_RE = re.compile(
+    r"^(?:\[Tool result for|\[System instruction\]:|\[Assistant\]:)",
+    re.MULTILINE,
+)
+
+
+def _strip_fabricated(text: str, has_calls: bool) -> str:
+    """Remove fabricated conversation markers from parsed model output.
+
+    ``has_calls`` documents the companion rule enforced by the caller: when
+    calls were accepted the tail after the last block is never appended to the
+    clean text, so anything the model wrote after its block (including a
+    self-written "result") cannot survive. What this function itself does,
+    with or without calls:
+
+    * a leading ``[Assistant]:`` prefix (position 0) is the history format
+      leaking into the answer, not content -- strip it plus following space;
+    * cut at the first line-start ``[Tool result for`` /
+      ``[System instruction]:`` / ``[Assistant]:`` -- from there on the model
+      is continuing the conversation by itself.
+    """
+    if text.startswith("[Assistant]:"):
+        text = text[len("[Assistant]:"):].lstrip()
+    cut = _FABRICATED_CUT_RE.search(text)
+    if cut:
+        text = text[:cut.start()]
+    return text
+
+
+def _normalize_tool_name(name, allowed) -> str:
+    """Resolve a model-written tool name against the declared ``allowed`` set.
+
+    Models prefix (``functions.read``, ``default_api.read``) and vary case
+    (``Read``); all of those used to be dropped as undeclared. Strip repeated
+    ``functions.`` / ``default_api.`` prefixes, then adopt an allowed name
+    only when exactly one candidate matches case-insensitively or by final
+    dotted segment -- an ambiguous shape is still dropped rather than routed
+    to the wrong tool. Returns None when nothing resolves.
+    """
+    if not isinstance(name, str) or not name:
+        return None
+    if allowed is None:
+        stripped = name
+        while True:
+            lowered = stripped.lower()
+            if lowered.startswith("functions.") or lowered.startswith("default_api."):
+                stripped = stripped.split(".", 1)[1]
+                if not stripped:
+                    return None
+            else:
+                break
+        return stripped or None
+    if name in allowed:
+        return name
+    stripped = name
+    while True:
+        lowered = stripped.lower()
+        if lowered.startswith("functions.") or lowered.startswith("default_api."):
+            stripped = stripped.split(".", 1)[1]
+            if not stripped:
+                return None
+        else:
+            break
+    if stripped in allowed:
+        return stripped
+    candidates = {a for a in allowed if a.lower() == stripped.lower()}
+    if not candidates and "." in stripped:
+        segment = stripped.split(".")[-1].lower()
+        candidates = {a for a in allowed
+                      if a.split(".")[-1].lower() == segment}
+    if len(candidates) == 1:
+        return next(iter(candidates))
+    return None
+
+
+def _recover_python_payload(body):
+    """Read a non-JSON fence body as a Python call or dict literal.
+
+    Returns ``(data, reason)``: a dict payload and ``""`` on success, else
+    ``(_NOTHING, reason)``. Only for fence kinds other than ``json`` -- a
+    ``json`` fence that does not parse is prose, not a call attempt.
+    ``read(path="x")`` yields ``{"name": "read", "arguments": {"path": "x"}}``;
+    anything with positional arguments cannot be mapped to parameters and is
+    dropped with its own reason.
+    """
+    if not isinstance(body, str):
+        return _NOTHING, "body is not valid JSON"
+    snippet = body.strip().strip("`").strip()
+    if not snippet:
+        return _NOTHING, "body is not valid JSON"
+    try:
+        expr = ast.parse(snippet, mode="eval").body
+    except (SyntaxError, ValueError, MemoryError, RecursionError):
+        expr = None
+    if isinstance(expr, ast.Call):
+        func = expr.func
+        if isinstance(func, ast.Name):
+            fname = func.id
+        elif isinstance(func, ast.Attribute):
+            fname = func.attr
+        else:
+            return _NOTHING, "body is not valid JSON"
+        if expr.args:
+            return _NOTHING, "python-style call with positional arguments"
+        if any(kw.arg is None for kw in expr.keywords):
+            return _NOTHING, "body is not valid JSON"
+        try:
+            kwargs = {kw.arg: ast.literal_eval(kw.value)
+                      for kw in expr.keywords}
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return _NOTHING, "body is not valid JSON"
+        return {"name": fname, "arguments": kwargs}, ""
+    if snippet.startswith("{"):
+        try:
+            value = ast.literal_eval(snippet)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return _NOTHING, "body is not valid JSON"
+        if isinstance(value, dict):
+            return value, ""
+    return _NOTHING, "body is not valid JSON"
 # for it routinely, but it is validated far more strictly below: an ordinary
 # JSON example in prose must never be mistaken for a real call.
 _FENCE_OPEN = re.compile(r'```(tool_call|function_call|tool_code|json)'
@@ -675,7 +871,7 @@ _FENCE_CLOSE = re.compile(r'\s*```')
 
 
 def _iter_tool_blocks(text: str):
-    """Yield ``(start, end, data, kind)`` for each tool-call-shaped fenced block.
+    """Yield ``(start, end, data, kind, body)`` for each tool-call-shaped block.
 
     The payload is located with ``JSONDecoder.raw_decode`` starting right after
     the opening fence, so a ``` that appears *inside* a string argument (the
@@ -685,7 +881,9 @@ def _iter_tool_blocks(text: str):
 
     ``data`` is ``_NOTHING`` for a block that declares a tool-call fence but
     whose body is not valid JSON; it is yielded anyway so the caller can log the
-    drop rather than silently leaving it in the text.
+    drop rather than silently leaving it in the text. ``body`` is the raw
+    payload text between the fences, for the AST recovery of Python-style
+    calls (``read(path="x")``) that never were JSON in the first place.
 
     The decoder runs non-strict: ``write``/``edit`` payloads carry the body of
     a file, and a model that pastes a multi-line string writes the newline
@@ -716,13 +914,15 @@ def _iter_tool_blocks(text: str):
             # the model actually wrote.
             close = text.find("```", m.end())
             span_end = close if close != -1 else m.end()
-            yield m.start(), (close + 3 if close != -1 else m.end()), _NOTHING, kind
+            body = text[j:close] if close != -1 else text[j:]
+            yield m.start(), (close + 3 if close != -1 else m.end()), _NOTHING, kind, body
             pos = span_end if close != -1 else m.end()
             continue
         c = _FENCE_CLOSE.match(text, end)
+        body = text[j:end]
         if c:
             end = c.end()
-        yield m.start(), end, data, kind
+        yield m.start(), end, data, kind, body
         pos = end
 
 
@@ -748,24 +948,35 @@ def _is_declared_call(data, allowed_names, tool_schemas) -> bool:
 
 
 def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list).
+    """Extract tool_call blocks. Returns (clean_text, tool_calls_list, dropped).
 
     ``allowed_names`` optionally restricts accepted function names.
     ``tool_schemas`` maps each declared name to its parameter names; when the
     model omits ``name`` a call is recovered only if its parameters point at
-    exactly one declared tool. Blocks that fail to parse, or that end up
-    unnamed, are left in the text so that no content is silently lost.
+    exactly one declared tool, and a flattened call keeps a meta-looking key
+    (``description``, say) only when the resolved tool's schema declares it.
+
+    ``dropped`` is a list of human-readable reasons, one per block that looked
+    like a call attempt but could not be used (undeclared name, unparsable
+    body, ...). Blocks that fail are left in the text so that no content is
+    silently lost; the caller retries with the reasons when nothing valid
+    came out of the turn.
     """
     from .gemini import log
 
     tool_calls = []
+    dropped = []
     clean_parts = []
     last_end = 0
-    for start, end, data, kind in _iter_tool_blocks(text):
+    for start, end, data, kind, body in _iter_tool_blocks(text):
         if kind == "json" and not _is_declared_call(data, allowed_names, tool_schemas):
             # Ordinary JSON in prose: leave it untouched and do not log it.
             continue
         reason = ""
+        if data is _NOTHING and kind != "json":
+            # A fence that declares a call but holds no JSON: maybe a
+            # Python-style call (``read(path="x")``) or a Python dict.
+            data, reason = _recover_python_payload(body)
         parsed = None
         if isinstance(data, dict):
             name = data.get("name")
@@ -775,31 +986,45 @@ def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
                     log(f"Inferred missing tool name '{name}' from its parameters")
             if not name:
                 reason = "no tool name"
-            elif allowed_names is not None and name not in allowed_names:
-                reason = f"undeclared tool '{name}'"
             else:
-                args, degraded = _arguments_json(extract_arguments(data))
-                if degraded:
-                    log(f"tool_call '{name}': arguments unusable ({degraded}), "
-                        "sending an empty object so the client can report it")
-                parsed = {
-                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                    "type": "function",
-                    "function": {"name": name, "arguments": args},
-                }
-        elif data is _NOTHING:
-            reason = "body is not valid JSON"
-        else:
-            reason = "unrecognised payload"
+                resolved = _normalize_tool_name(name, allowed_names)
+                if allowed_names is not None and resolved is None:
+                    valid = ", ".join(sorted(allowed_names))
+                    reason = f"undeclared tool '{name}' (valid: {valid})"
+                else:
+                    if resolved is not None:
+                        name = resolved
+                    props = (tool_schemas or {}).get(name)
+                    args, degraded = _arguments_json(
+                        extract_arguments(data, props))
+                    if degraded:
+                        log(f"tool_call '{name}': arguments unusable ({degraded}), "
+                            "sending an empty object so the client can report it")
+                    parsed = {
+                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                        "type": "function",
+                        "function": {"name": name, "arguments": args},
+                    }
+        elif not reason:
+            reason = ("body is not valid JSON" if data is _NOTHING
+                      else "unrecognised payload")
         if parsed is None:
+            dropped.append(reason or "unrecognised payload")
             log(f"Dropping tool_call block: {reason}: {text[start:end][:300]}")
             continue
         clean_parts.append(text[last_end:start])
         last_end = end
         tool_calls.append(parsed)
-    clean_parts.append(text[last_end:])
-    clean = "".join(clean_parts).strip()
-    return clean, tool_calls
+    if tool_calls:
+        # The two-state rule: a turn either calls or answers. Anything after
+        # the last block -- prose, and in particular a self-written
+        # "[Tool result ...]" -- is never part of the answer.
+        clean = "".join(clean_parts)
+    else:
+        clean_parts.append(text[last_end:])
+        clean = "".join(clean_parts)
+    clean = _strip_fabricated(clean, bool(tool_calls)).strip()
+    return clean, tool_calls, dropped
 
 
 def looks_like_tool_call(text: str) -> bool:
@@ -816,7 +1041,7 @@ def looks_like_tool_call(text: str) -> bool:
     rejected simply stays out of the running and the caller falls back to
     comparing lengths as before.
     """
-    for _start, _end, data, kind in _iter_tool_blocks(text):
+    for _start, _end, data, kind, _body in _iter_tool_blocks(text):
         if not isinstance(data, dict) or not data.get("name"):
             continue
         # ``{"name": ..., "arguments": ...}`` is a call under any fence; a
@@ -935,18 +1160,121 @@ _NON_FILE_NAMES = frozenset({
     "three.js", "ember.js", "backbone.js", "socket.js", "deno.js",
 })
 
-# "dùng tool", "đọc file", "review source", "use the tool", ... -- whitespace
-# is stripped before matching because folding Vietnamese silently glues words
-# together ("sử dụng" -> "sudung") while other clients leave the space.
+def _canonical_args(arguments) -> str:
+    """Normalise a call's arguments so repeats compare equal.
+
+    Argument key order is a serialisation accident, not a different call:
+    non-strict ``json.loads`` plus ``sort_keys`` dump. Anything that is not
+    JSON falls back to the stripped raw text.
+    """
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments, strict=False)
+        except (json.JSONDecodeError, ValueError):
+            return arguments.strip()
+        return json.dumps(parsed, ensure_ascii=False, sort_keys=True)
+    try:
+        return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return str(arguments)
+
+
+def _repeatable_calls(messages) -> set:
+    """``{(name, canonical_args)}`` this conversation already has results for.
+
+    Every assistant ``tool_calls`` entry paired with a later ``role: "tool"``
+    result carrying the same ``tool_call_id``. The retry loop uses this to
+    recognise a model that keeps emitting a call it already got the answer
+    to, instead of executing the same call again.
+    """
+    calls_by_id = {}
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            tcid = tc.get("id")
+            if tcid and isinstance(fn, dict):
+                calls_by_id[tcid] = (fn.get("name"),
+                                     _canonical_args(fn.get("arguments")))
+    done = set()
+    for msg in messages or []:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        key = calls_by_id.get(msg.get("tool_call_id", ""))
+        if key is not None:
+            done.add(key)
+    return done
+
+
+def _google_repeatable(contents) -> set:
+    """Chat-path :func:`_repeatable_calls` for Google native ``contents``.
+
+    Model parts carrying ``functionCall`` are paired with later
+    ``functionResponse`` parts by name (falling back to oldest-first when the
+    name matches nothing): each response completes one outstanding call, and
+    completed calls are what the retry loop must not emit again.
+    """
+    pending = []
+    done = set()
+    for content in contents or []:
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts", []) or []:
+            if not isinstance(part, dict):
+                continue
+            if isinstance(part.get("functionCall"), dict):
+                fc = part["functionCall"]
+                pending.append((fc.get("name"),
+                                _canonical_args(fc.get("args"))))
+            elif isinstance(part.get("functionResponse"), dict):
+                fr = part["functionResponse"]
+                idx = next((i for i, (pending_name, _a) in enumerate(pending)
+                            if pending_name == fr.get("name")), None)
+                if idx is None and pending:
+                    idx = 0
+                if idx is not None:
+                    done.add(pending.pop(idx))
+    return done
+
+
+# "dùng tool", "đọc file", "review source", "use the tool", ... -- matched
+# against the folded text with whitespace runs collapsed to single spaces
+# (never deleted: deleting them is what glued "because"+"tool" into a phrase
+# containing "use"+"tool"). Every alternative starts at a word boundary with
+# real whitespace between components, so intra-word lookalikes ("because
+# tool", "demo file", "thread files", "review file") stay silent while the
+# real demands still fire.
 _TOOL_DEMAND_RE = re.compile(
-    r"(?:dung|sudung|haydung|phaidung|batbuocdung|vanphaidung|phairadung)"
-    r"(?:la)?(?:tool|tools|congcu|caccongcu)"
-    r"|(?:doc|kiemtra|xem|mo)(?:rai)?(?:file|tep|thumuc|cacfile)"
-    r"|(?:review|kiemtra|doc)(?:la)?(?:source|code|masnguon|cacfile)"
-    r"|(?:use|call|run|invoke)(?:the)?s?(?:tool|tools)"
-    r"|(?:read|open|view|check|inspect)(?:the)?s?(?:file|files)",
+    r"\b(?:su\s+|hay\s+|phai\s+|van\s+phai\s+|bat\s+buoc\s+|co\s+)?dung\s+"
+    r"(?:la\s+)?(?:tool|tools|cong\s+cu|cac\s+cong\s+cu)"
+    r"|\b(?:doc|kiem\s+tra|xem|mo)(?:\s+rai)?\s+"
+    r"(?:file|files|tep|thu\s+muc|cac\s+file|cac\s+tep)"
+    r"|\b(?:review|kiem\s+tra|doc)(?:\s+la)?\s+"
+    r"(?:source|code|ma\s+nguon|cac\s+file)"
+    r"|\b(?:use|call|run|invoke)\s+(?:the\s+)?(?:tool|tools)"
+    r"|\b(?:read|open|view|check|inspect)\s+(?:the\s+)?(?:file|files)",
     re.IGNORECASE,
 )
+
+
+def _strip_code_spans(text: str) -> str:
+    """Remove fenced and inline code from ``text`` for demand/file scanning.
+
+    A pasted log or code block can name files (``server.py``) and use tool
+    words ("read the file" inside a comment) without the user asking for
+    anything -- scanning the raw text turns every paste into a phantom "never
+    read" retry. Paired fences are blanked; an unpaired opening fence blanks
+    everything to the end (the paste was cut off, not prose).
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    blanked = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    blanked = re.sub(r"```.*$", " ", blanked, flags=re.DOTALL)
+    blanked = re.sub(r"`[^`\n]+`", " ", blanked)
+    return blanked
 
 
 def _files_in(*chunks) -> set:
@@ -1017,14 +1345,19 @@ def pending_tool_request(messages) -> str:
         return None
 
     called_lower = {f.lower() for f in _conversation_called_files(messages)}
+    # Pasted logs and code name files the user never asked about; scan what
+    # remains after blanking them, for both the file check and the demand
+    # match below.
+    scannable = _strip_code_spans(last_user)
     uncovered = sorted(
-        f for f in _files_in(last_user)
+        f for f in _files_in(scannable)
         if f.lower() not in called_lower and f.lower() not in _NON_FILE_NAMES
     )
     if uncovered:
         return "requested file(s) never read: " + ", ".join(uncovered)
 
-    folded = _fold_diacritics(last_user).replace(" ", "").replace("\n", "")
+    folded = _fold_diacritics(scannable)
+    folded = re.sub(r"\s+", " ", folded).strip()
     if _TOOL_DEMAND_RE.search(folded):
         return "user demanded tool use and none happened"
     return None
@@ -1241,16 +1574,19 @@ def parse_google_function_calls(text: str) -> tuple:
     #    check (this endpoint parses before it knows what the client sent) an
     #    ordinary JSON example in prose would be taken for a call.
     parts, last_end = [], 0
-    for start, end, data, kind in _iter_tool_blocks(text):
+    for start, end, data, kind, _body in _iter_tool_blocks(text):
         if kind == "json" or not (isinstance(data, dict) and data.get("name")):
             continue
         function_calls.append({"name": data["name"], "args": _arguments_dict(data)})
         parts.append(text[last_end:start])
         last_end = end
-    parts.append(text[last_end:])
-    clean = "".join(parts)
+    # The tail stays scannable for stage 2 below (a bare marker may follow a
+    # fenced block); it is dropped from the final text when calls exist.
+    head, tail = "".join(parts), text[last_end:]
+    clean = head + tail
 
     # 2. The same payload with a bare marker and no fences.
+    before_bare = len(function_calls)
     parts, last_end = [], 0
     for start, end, data in _iter_bare_function_calls(clean):
         if not (isinstance(data, dict) and data.get("name")):
@@ -1258,8 +1594,17 @@ def parse_google_function_calls(text: str) -> tuple:
         function_calls.append({"name": data["name"], "args": _arguments_dict(data)})
         parts.append(clean[last_end:start])
         last_end = end
-    parts.append(clean[last_end:])
-    clean = "".join(parts).strip()
+    if len(function_calls) > before_bare:
+        clean = "".join(parts)
+    elif before_bare:
+        # Only fenced calls: a turn either calls or answers, so nothing after
+        # the last block -- prose, or a self-written "[Tool result ...]" --
+        # survives.
+        clean = head
+    else:
+        parts.append(clean[last_end:])
+        clean = "".join(parts)
+    clean = _strip_fabricated(clean, bool(function_calls)).strip()
 
     # 3. The whole answer is one bare JSON payload.
     if not function_calls and clean.startswith("{"):

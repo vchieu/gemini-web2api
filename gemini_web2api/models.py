@@ -1,4 +1,5 @@
 """Model definitions and mapping from Gemini frontend StreamGenerate payloads."""
+import json
 
 # Model selection uses TWO fields in the f.req inner array (decoded from live
 # browser captures, Sep 2026):
@@ -74,6 +75,54 @@ MODELS = {
 }
 
 
+# The (family, variant) each ticket key is expected to embed at ticket
+# indexes 14/15. When a configured ticket carries anything else the upstream
+# silently serves a different model (today: flash-thinking runs Flash-Lite
+# Extended), so startup warns instead of mis-routing quietly. Tickets cannot
+# be re-captured programmatically -- the owner refreshes them from a fresh
+# browser session.
+EXPECTED_TICKET_ROUTES = {
+    "flash": (1, 1),
+    "flash-thinking": (1, 2),
+    "lite": (6, 1),
+    "lite-thinking": (6, 2),
+    "pro": (3, 1),
+    "pro-thinking": (3, 2),
+}
+
+
+def ticket_warnings() -> list:
+    """Warning strings for configured tickets embedding an unexpected route.
+
+    Each ``CONFIG["model_tickets"]`` value is parsed and its indexes 14/15
+    compared against :data:`EXPECTED_TICKET_ROUTES`. Missing keys are skipped
+    (no ticket degrades to the body fields, which ``check_routing`` covers);
+    unparsable ones warn. Silent when everything matches.
+    """
+    from .config import CONFIG
+    warnings = []
+    tickets = CONFIG.get("model_tickets") or {}
+    for key, (want_fam, want_var) in EXPECTED_TICKET_ROUTES.items():
+        raw = tickets.get(key)
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+            fam, var = parsed[14], parsed[15]
+        except (json.JSONDecodeError, IndexError, TypeError):
+            warnings.append(
+                f"model ticket '{key}' could not be parsed -- refresh it from "
+                f"a fresh browser capture")
+            continue
+        if fam != want_fam or var != want_var:
+            warnings.append(
+                f"model ticket '{key}' embeds (family={fam}, variant={var}), "
+                f"expected (family={want_fam}, variant={want_var}) -- the "
+                f"upstream serves a different model until this ticket is "
+                f"refreshed from a fresh browser capture")
+    return warnings
+
+
 def ticket_for(model_name: str):
     """Return the upstream ticket header value for a model, or None.
 
@@ -97,6 +146,8 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
     since upstream clients may request arbitrary model identifiers.
     """
     think_override = None
+    if default not in MODELS:
+        default = "gemini-3.6-flash"
     if not isinstance(model_name, str) or not model_name:
         model_name = default
     if "@think=" in model_name:

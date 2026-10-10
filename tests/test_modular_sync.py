@@ -870,6 +870,7 @@ class StreamingEndpointTests(unittest.TestCase):
                     "function": {"name": "get_weather", "arguments": '{"city":"Shanghai"}'},
                 }
             ],
+            [],
         )
 
         status, _, body = self.post_json(
@@ -923,6 +924,7 @@ class StreamingEndpointTests(unittest.TestCase):
                 "type": "function",
                 "function": {"name": "get_weather", "arguments": '{"city":"Shanghai"}'},
             }],
+            [],
         )
 
         status, headers, body = self.post_json(
@@ -1094,6 +1096,115 @@ class StreamingEndpointTests(unittest.TestCase):
             release_upstream.set()
             sock.close()
         self.assertIn(b": ping\n\n", received)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_responses_stream_sends_head_before_upstream_finishes(self, generate):
+        """HTTP headers + response.created precede generate() completion.
+
+        The responses endpoint used to buffer the whole turn (retries
+        included) before the first byte, so a streaming client waited on
+        headers until upstream finished and aborted on its own timeout.
+        """
+        release_upstream = threading.Event()
+
+        def slow_generate(*args, **kwargs):
+            release_upstream.wait(timeout=5)
+            return "hello"
+
+        generate.side_effect = slow_generate
+
+        body = json.dumps({
+            "model": "gemini-3.6-flash",
+            "input": "hi",
+            "stream": True,
+        }).encode()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1/responses HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            sock.settimeout(3)
+            received = b""
+            while b"response.created" not in received:
+                received += sock.recv(4096)
+            # generate() is still blocked: the head and the opening events
+            # arrived before upstream finished.
+            self.assertFalse(release_upstream.is_set())
+            self.assertIn(b"200", received.split(b"\r\n", 1)[0])
+        finally:
+            release_upstream.set()
+            sock.close()
+
+    @mock.patch("gemini_web2api.server.generate", side_effect=RuntimeError("boom"))
+    def test_responses_stream_failure_emits_failed_event(self, generate):
+        """An upstream failure mid-stream is a response.failed, not a hang."""
+        status, _, body = self.post_json(
+            "/v1/responses",
+            {"model": "gemini-3.6-flash", "input": "hi", "stream": True},
+        )
+
+        self.assertEqual(status, 200)
+        events = _decode_sse(body)
+        kinds = [event_type for event_type, _ in events]
+        self.assertEqual(kinds[:2], ["response.created", "response.in_progress"])
+        self.assertEqual(kinds[-1], "response.failed")
+        self.assertIn("boom", events[-1][1]["response"]["error"]["message"])
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_google_tools_stream_sends_head_before_upstream_finishes(self, generate):
+        """The buffered tools turn must not hold the response head hostage."""
+        release_upstream = threading.Event()
+
+        def slow_generate(*args, **kwargs):
+            release_upstream.wait(timeout=5)
+            return "hello"
+
+        generate.side_effect = slow_generate
+
+        body = json.dumps({
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "tools": [{"functionDeclarations": [{"name": "read"}]}],
+        }).encode()
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        try:
+            sock.sendall(
+                b"POST /v1beta/models/gemini-3.6-flash:streamGenerateContent HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {len(body)}\r\n\r\n".encode()
+                + body
+            )
+            sock.settimeout(3)
+            received = b""
+            # Only the head is early on this path (frames follow upstream);
+            # the status line arriving while generate() is blocked is the
+            # assertion.
+            while b"\r\n\r\n" not in received:
+                received += sock.recv(1)
+            self.assertFalse(release_upstream.is_set())
+            self.assertIn(b"200", received.split(b"\r\n", 1)[0])
+        finally:
+            release_upstream.set()
+            sock.close()
+
+    @mock.patch("gemini_web2api.server.generate", side_effect=RuntimeError("boom"))
+    def test_google_tools_stream_failure_emits_error_frame(self, generate):
+        """A buffered-turn failure is a Google error frame on the open stream."""
+        status, _, body = self.post_json(
+            "/v1beta/models/gemini-3.6-flash:streamGenerateContent",
+            {"contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+             "tools": [{"functionDeclarations": [{"name": "read"}]}]},
+        )
+
+        self.assertEqual(status, 200)
+        frames = [json.loads(line[len("data: "):])
+                  for line in body.splitlines() if line.startswith("data: {")]
+        self.assertEqual(len(frames), 1)
+        self.assertIn("boom", frames[0]["error"]["message"])
 
     def test_chat_stream_midstream_error_emits_error_event_and_done(self):
         def flaky_stream(*args, **kwargs):
@@ -1913,6 +2024,17 @@ class StartupGuardTests(unittest.TestCase):
         self.assertIsInstance(CONFIG["api_keys"][0], str)
         self.assertEqual(len(CONFIG["api_keys"][0]), 64)
 
+    def test_generated_key_shown_even_with_logging_off(self):
+        CONFIG["api_keys"] = []
+        CONFIG["log_requests"] = False
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            _guard_bind("0.0.0.0", allow_insecure=False)
+
+        self.assertIn("Auto-generated API key", buf.getvalue())
+        self.assertTrue(CONFIG.get("api_keys"))
+
     def test_allows_non_loopback_with_keys(self):
         CONFIG["api_keys"] = ["secret"]
 
@@ -2001,7 +2123,7 @@ class HostCheckTests(unittest.TestCase):
 
 class ToolParsingTests(unittest.TestCase):
     def test_parse_tool_calls_handles_single_line_block(self):
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```tool_call {"name": "foo", "arguments": {"x": 1}}```')
 
         self.assertEqual(len(calls), 1)
@@ -2010,7 +2132,7 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(clean, "")
 
     def test_parse_tool_calls_rejects_undeclared_function(self):
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```tool_call\n{"name": "bogus", "arguments": {}}\n```', allowed_names={"real"})
 
         self.assertEqual(calls, [])
@@ -2019,7 +2141,7 @@ class ToolParsingTests(unittest.TestCase):
     def test_parse_tool_calls_keeps_unparsable_block(self):
         text = "before\n```tool_call\nnot json\n```\nafter"
 
-        clean, calls = parse_tool_calls(text, allowed_names={"known"})
+        clean, calls, _dropped = parse_tool_calls(text, allowed_names={"known"})
 
         self.assertEqual(calls, [])
         self.assertIn("not json", clean)
@@ -2027,7 +2149,7 @@ class ToolParsingTests(unittest.TestCase):
         self.assertIn("after", clean)
 
     def test_parse_tool_calls_passes_through_string_arguments(self):
-        _, calls = parse_tool_calls(
+        _, calls, _dropped = parse_tool_calls(
             '```tool_call\n{"name": "foo", "arguments": "{\\"a\\": 1}"}\n```',
             allowed_names={"foo"},
         )
@@ -2041,7 +2163,7 @@ class ToolParsingTests(unittest.TestCase):
         enough; reading only ``arguments``/``args`` silently turned every such
         call into ``{}``, which clients reject with "Invalid input".
         """
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```tool_call\n{"name": "run_commands", "commands": ["npm test"]}\n```',
             allowed_names={"run_commands"},
         )
@@ -2057,13 +2179,13 @@ class ToolParsingTests(unittest.TestCase):
             ("parameters", '{"name": "foo", "parameters": {"x": 1}}'),
         ):
             with self.subTest(alias=alias):
-                _, calls = parse_tool_calls(
+                _, calls, _dropped = parse_tool_calls(
                     f"```tool_call\n{payload}\n```", allowed_names={"foo"})
 
                 self.assertEqual(calls[0]["function"]["arguments"], '{"x": 1}')
 
     def test_parse_tool_calls_keeps_name_only_meta_keys_out_of_arguments(self):
-        _, calls = parse_tool_calls(
+        _, calls, _dropped = parse_tool_calls(
             '```tool_call\n{"name": "foo", "description": "run it", "x": 1}\n```',
             allowed_names={"foo"},
         )
@@ -2071,7 +2193,7 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["arguments"], '{"x": 1}')
 
     def test_parse_tool_calls_recovers_python_literal_arguments(self):
-        _, calls = parse_tool_calls(
+        _, calls, _dropped = parse_tool_calls(
             "```tool_call\n{\"name\": \"foo\", \"arguments\": \"{'x': 1}\"}\n```",
             allowed_names={"foo"},
         )
@@ -2084,7 +2206,7 @@ class ToolParsingTests(unittest.TestCase):
         Passing a non-JSON string through made every client fail before it
         could even report which parameter was missing.
         """
-        _, calls = parse_tool_calls(
+        _, calls, _dropped = parse_tool_calls(
             '```tool_call\n{"name": "foo", "arguments": "npm test"}\n```',
             allowed_names={"foo"},
         )
@@ -2092,7 +2214,7 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["arguments"], "{}")
 
     def test_parse_tool_calls_drops_call_without_name(self):
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```tool_call\n{"commands": ["npm test"]}\n```', allowed_names={"foo"})
 
         self.assertEqual(calls, [])
@@ -2112,7 +2234,7 @@ class ToolParsingTests(unittest.TestCase):
             "arguments": {"path": "notes.md",
                           "content": "# Title\n```python\nprint(1)\n```\nafter"},
         })
-        clean, calls = parse_tool_calls(f"```tool_call\n{payload}\n```",
+        clean, calls, _dropped = parse_tool_calls(f"```tool_call\n{payload}\n```",
                                         allowed_names={"write"})
 
         self.assertEqual(len(calls), 1)
@@ -2122,7 +2244,7 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(clean, "")
 
     def test_parse_tool_calls_accepts_function_call_fence(self):
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```function_call\n{"name": "read", "args": {"path": "a.py"}}\n```',
             allowed_names={"read"},
         )
@@ -2133,7 +2255,7 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(clean, "")
 
     def test_parse_tool_calls_accepts_json_fence_for_declared_tool(self):
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```json\n{"name": "read", "arguments": {"path": "a.py"}}\n```',
             allowed_names={"read"},
         )
@@ -2144,7 +2266,7 @@ class ToolParsingTests(unittest.TestCase):
 
     def test_parse_tool_calls_keeps_json_fence_for_undeclared_tool(self):
         """A JSON block naming a tool the client never declared is prose."""
-        clean, calls = parse_tool_calls(
+        clean, calls, _dropped = parse_tool_calls(
             '```json\n{"name": "bogus", "arguments": {}}\n```',
             allowed_names={"read"},
         )
@@ -2156,7 +2278,7 @@ class ToolParsingTests(unittest.TestCase):
         """JSON quoted while explaining something must never become a call."""
         text = 'Here is the config:\n```json\n{"port": 8081}\n```\nDone.'
 
-        clean, calls = parse_tool_calls(text, allowed_names={"read", "write"})
+        clean, calls, _dropped = parse_tool_calls(text, allowed_names={"read", "write"})
 
         self.assertEqual(calls, [])
         self.assertIn('{"port": 8081}', clean)
@@ -2165,7 +2287,7 @@ class ToolParsingTests(unittest.TestCase):
         """Bare JSON with no fence is not a call -- the format needs a fence."""
         text = '{"name": "read", "arguments": {"path": "a.py"}}'
 
-        clean, calls = parse_tool_calls(text, allowed_names={"read"})
+        clean, calls, _dropped = parse_tool_calls(text, allowed_names={"read"})
 
         self.assertEqual(calls, [])
         self.assertIn('"read"', clean)
@@ -2184,7 +2306,7 @@ class ToolParsingTests(unittest.TestCase):
             '\n```'
         )
 
-        clean, calls = parse_tool_calls(text, allowed_names={"write"})
+        clean, calls, _dropped = parse_tool_calls(text, allowed_names={"write"})
 
         self.assertEqual(len(calls), 1)
         self.assertNotIn("tool_call", clean)
@@ -2200,7 +2322,7 @@ class ToolParsingTests(unittest.TestCase):
             '\n```'
         )
 
-        _, calls = parse_tool_calls(text, allowed_names={"write"})
+        _, calls, _dropped = parse_tool_calls(text, allowed_names={"write"})
 
         self.assertEqual(len(calls), 1)
         # Re-serialised, so the client gets valid JSON rather than the raw
@@ -2412,7 +2534,12 @@ class PendingToolRequestTests(unittest.TestCase):
                     "commands": {"type": "array"}}}}}],
         )
 
-        self.assertIn('{"name": "func_name", "arguments": {"param": "value"}}', prompt)
+        # The example names a real declared tool (never a func_name/param
+        # placeholder a weak model would copy verbatim), with values typed by
+        # the schema (array -> []).
+        self.assertIn('"run_commands"', prompt)
+        self.assertIn('"commands": []', prompt)
+        self.assertNotIn("func_name", prompt)
         self.assertIn('never beside "name"', prompt)
         self.assertIn('"commands"', prompt)
 
@@ -2457,7 +2584,9 @@ class GoogleFunctionCallParsingTests(unittest.TestCase):
                          "# Title\n\n```python\nprint(1)\n```")
         self.assertNotIn("function_call", clean)
         self.assertIn("Truoc", clean)
-        self.assertIn("Sau", clean)
+        # A turn either calls or answers: prose after the last block -- the
+        # two-state rule -- is not part of the answer.
+        self.assertNotIn("Sau", clean)
 
     def test_unreadable_block_stays_in_the_text(self):
         """Nothing the model wrote may be deleted on the way to a parse error."""
@@ -2615,6 +2744,433 @@ class HttpClientThreadSafetyTests(unittest.TestCase):
         self.assertEqual(len(results), 8)
         self.assertEqual(len(built), 1)
         self.assertTrue(all(r is sentinel for r in results))
+
+
+class PromptRewriteTests(unittest.TestCase):
+    """Task A: state-aware tool prompt with a real example, no fabrication."""
+
+    _READ_TOOL = [{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"},
+                                          "mode": {"type": "string"}},
+                           "required": ["path"]},
+        },
+    }]
+
+    def test_block_has_two_state_rule_real_example_no_fabrication(self):
+        prompt, _ = messages_to_prompt([{"role": "user", "content": "hi"}],
+                                       self._READ_TOOL)
+
+        self.assertIn("do exactly ONE of", prompt)
+        self.assertIn('{"name": "read", "arguments": {"path": "value"}}',
+                      prompt)
+        self.assertNotIn("func_name", prompt)
+        self.assertNotIn('"param"', prompt)
+        self.assertIn("never invent a result", prompt)
+        # Every pre-existing rule stays.
+        self.assertIn("Triple backticks inside a string argument", prompt)
+        self.assertIn('never beside "name"', prompt)
+
+    def test_reminder_differs_by_last_message_role(self):
+        with_tool_result, _ = messages_to_prompt(
+            [{"role": "user", "content": "read a"},
+             {"role": "assistant", "content": "",
+              "tool_calls": [{"id": "c1", "type": "function",
+                              "function": {"name": "read",
+                                           "arguments": "{}"}}]},
+             {"role": "tool", "content": "data", "tool_call_id": "c1"}],
+            self._READ_TOOL)
+        user_last, _ = messages_to_prompt(
+            [{"role": "user", "content": "hi"}], self._READ_TOOL)
+
+        self.assertIn("already in the conversation", with_tool_result)
+        self.assertIn("answer from memory", user_last)
+        self.assertNotIn("already in the conversation", user_last)
+
+    def test_fabricated_markers_cut_from_text_only_answer(self):
+        clean, calls, _dropped = parse_tool_calls(
+            "hello\n[Tool result for read]: fake", allowed_names={"read"})
+        self.assertEqual(calls, [])
+        self.assertEqual(clean, "hello")
+
+        clean, _, _ = parse_tool_calls("[Assistant]: hi",
+                                       allowed_names={"read"})
+        self.assertEqual(clean, "hi")
+
+    def test_tail_after_last_block_dropped_when_calls_exist(self):
+        clean, calls, _dropped = parse_tool_calls(
+            "Q\n```tool_call\n{\"name\": \"read\", \"arguments\": {}}\n```\n"
+            "trailing prose",
+            allowed_names={"read"})
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(clean, "Q")
+
+    def test_content_none_never_prints_none(self):
+        prompt, _ = messages_to_prompt(
+            [{"role": "user", "content": None},
+             {"role": "assistant", "content": None}],
+            self._READ_TOOL)
+
+        self.assertNotIn("None", prompt)
+
+
+class ToolNameNormalisationTests(unittest.TestCase):
+    """Task B: prefix/case-tolerant names, python-style calls, drop reasons."""
+
+    def test_case_and_prefix_variants_resolve(self):
+        for written in ("Read", "READ", "functions.read",
+                        "default_api.read", "default_api.READ",
+                        "functions.functions.read"):
+            with self.subTest(written=written):
+                _c, calls, dropped = parse_tool_calls(
+                    '```tool_call\n{"name": "%s", "arguments": {"path": "x"}}\n```'
+                    % written,
+                    allowed_names={"read"})
+
+                self.assertEqual(dropped, [])
+                self.assertEqual(calls[0]["function"]["name"], "read")
+
+    def test_python_style_call_in_tool_code_parses(self):
+        _c, calls, dropped = parse_tool_calls(
+            '```tool_code\nread(path="x")\n```', allowed_names={"read"})
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(calls[0]["function"]["name"], "read")
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"path": "x"})
+
+    def test_python_dict_body_parses(self):
+        _c, calls, dropped = parse_tool_calls(
+            "```tool_call\n{'name': 'read', 'arguments': {'path': 'x'}}\n```",
+            allowed_names={"read"})
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(calls[0]["function"]["name"], "read")
+
+    def test_positional_python_call_dropped_with_reason(self):
+        clean, calls, dropped = parse_tool_calls(
+            '```tool_code\nread("x")\n```', allowed_names={"read"})
+
+        self.assertEqual(calls, [])
+        self.assertEqual(dropped,
+                         ["python-style call with positional arguments"])
+        self.assertIn('read("x")', clean)
+
+    def test_unknown_tool_still_dropped_with_valid_names(self):
+        clean, calls, dropped = parse_tool_calls(
+            '```tool_call\n{"name": "bogus", "arguments": {}}\n```',
+            allowed_names={"read"})
+
+        self.assertEqual(calls, [])
+        self.assertEqual(dropped, ["undeclared tool 'bogus' (valid: read)"])
+        self.assertIn("bogus", clean)
+
+
+class ToolRetryLoopGuardTests(unittest.TestCase):
+    """Tasks B4/C1/C3: drop reasons retried, repeats capped, best text kept."""
+
+    _READ_TOOL = [{
+        "type": "function",
+        "function": {
+            "name": "read",
+            "description": "Read a file",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}},
+                           "required": ["path"]},
+        },
+    }]
+
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+        CONFIG["tool_retry_on_miss"] = True
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    def _handler(self):
+        return GeminiHandler.__new__(GeminiHandler)
+
+    def _retry(self, generate, messages, **kwargs):
+        params = dict(prompt="p", model_id=2, think_mode=1, file_refs=None,
+                      extra=None, tools_active=True, allowed_names={"read"},
+                      tool_schemas={"read": {"path"}}, required_tool=False,
+                      messages=messages, ticket=None,
+                      tool_required={"read": {"path"}},
+                      client_gone=threading.Event())
+        params.update(kwargs)
+        return self._handler()._generate_with_tool_retry(**params)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_dropped_fence_retried_with_reason_then_recovers(self, generate):
+        generate.side_effect = [
+            '```tool_call\n{"name": "bogus", "arguments": {}}\n```',
+            '```tool_call\n{"name": "read", "arguments": {"path": "a.py"}}\n```',
+        ]
+
+        text, tool_calls = self._retry(
+            generate, [{"role": "user", "content": "read the readme"}])
+
+        self.assertEqual(generate.call_count, 2)
+        nudge = generate.call_args_list[1].args[0]
+        self.assertIn("undeclared tool 'bogus'", nudge)
+        self.assertIn("Valid tool names: read", nudge)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read")
+        self.assertFalse(text)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_dropped_fence_returned_as_is_when_attempts_run_out(self, generate):
+        CONFIG["tool_retry_attempts"] = 0
+        generate.side_effect = [
+            '```tool_call\n{"name": "bogus", "arguments": {}}\n```']
+
+        text, tool_calls = self._retry(
+            generate, [{"role": "user", "content": "read the readme"}])
+
+        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(tool_calls, [])
+        self.assertIn("bogus", text)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_duplicate_call_nudged_then_answered(self, generate):
+        history = [
+            {"role": "user", "content": "read a.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "read",
+                                          "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "data", "tool_call_id": "c1"},
+            {"role": "user", "content": "and now?"},
+        ]
+        dup = ('```tool_call\n{"name": "read", '
+               '"arguments": {"path": "a.py"}}\n```')
+        generate.side_effect = [dup, "done"]
+
+        text, tool_calls = self._retry(generate, history)
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("already in the conversation",
+                      generate.call_args_list[1].args[0])
+        self.assertFalse(tool_calls)
+        self.assertEqual(text, "done")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_duplicate_call_capped_at_three_nudges(self, generate):
+        CONFIG["tool_retry_attempts"] = 3
+        history = [
+            {"role": "user", "content": "read a.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "read",
+                                          "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "data", "tool_call_id": "c1"},
+            {"role": "user", "content": "and now?"},
+        ]
+        dup = ('thinking\n```tool_call\n{"name": "read", '
+               '"arguments": {"path": "a.py"}}\n```')
+        generate.side_effect = [dup, dup, dup, dup]
+
+        text, tool_calls = self._retry(generate, history)
+
+        self.assertEqual(generate.call_count, 4)
+        self.assertFalse(tool_calls)
+        self.assertEqual(text, "thinking")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_duplicate_call_forced_to_text_under_required(self, generate):
+        CONFIG["tool_retry_attempts"] = 0
+        history = [
+            {"role": "user", "content": "read a.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "read",
+                                          "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "data", "tool_call_id": "c1"},
+        ]
+        dup = ('```tool_call\n{"name": "read", '
+               '"arguments": {"path": "a.py"}}\n```')
+        generate.side_effect = [dup]
+
+        text, tool_calls = self._retry(generate, history, required_tool=True)
+
+        self.assertFalse(tool_calls)
+        self.assertIsInstance(text, str)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_best_text_returned_when_retry_raises(self, generate):
+        generate.side_effect = ["The README is a doc.", RuntimeError("boom")]
+
+        text, tool_calls = self._retry(
+            generate, [{"role": "user",
+                        "content": "Doc README.md va ke 3 diem chinh."}])
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertFalse(tool_calls)
+        self.assertEqual(text, "The README is a doc.")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_best_text_returned_when_retry_hits_placeholder(self, generate):
+        generate.side_effect = [
+            "The README is a doc.",
+            "I encountered an error doing what you asked. Could you try again?",
+        ]
+
+        text, tool_calls = self._retry(
+            generate, [{"role": "user",
+                        "content": "Doc README.md va ke 3 diem chinh."}])
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertFalse(tool_calls)
+        self.assertEqual(text, "The README is a doc.")
+
+    def test_demand_false_positives_stay_silent(self):
+        for prose in ("because tool", "demo file", "thread files",
+                      "review file"):
+            with self.subTest(prose=prose):
+                self.assertIsNone(pending_tool_request(
+                    [{"role": "user", "content": prose}]))
+
+    def test_demand_true_cases_still_fire(self):
+        for text in ("đọc file README.md", "sử dụng tool", "use the tool",
+                     "read the file", "review source code"):
+            with self.subTest(text=text):
+                self.assertIsNotNone(pending_tool_request(
+                    [{"role": "user", "content": text}]))
+
+    def test_pasted_code_names_no_unread_file(self):
+        self.assertIsNone(pending_tool_request(
+            [{"role": "user", "content": "look at this:\n```\nserver.py is big\n```"}]))
+
+
+class TicketAndModelTests(unittest.TestCase):
+    """Tasks D1/D2: startup ticket warnings, config default-model fallback."""
+
+    def setUp(self):
+        self.original_config = dict(CONFIG)
+
+    def tearDown(self):
+        CONFIG.clear()
+        CONFIG.update(self.original_config)
+
+    @staticmethod
+    def _ticket(family, variant):
+        inner = [None] * 16
+        inner[14], inner[15] = family, variant
+        return json.dumps(inner)
+
+    def test_mismatched_tickets_warn(self):
+        from gemini_web2api.models import ticket_warnings
+        CONFIG["model_tickets"] = {
+            "flash": self._ticket(1, 1),
+            "flash-thinking": self._ticket(6, 2),
+            "lite": self._ticket(6, 1),
+            "lite-thinking": self._ticket(6, 4),
+            "pro": self._ticket(3, 1),
+            "pro-thinking": self._ticket(3, 2),
+        }
+
+        warnings = ticket_warnings()
+
+        joined = "\n".join(warnings)
+        self.assertIn("flash-thinking", joined)
+        self.assertIn("lite-thinking", joined)
+        self.assertNotIn("'flash'", joined)
+        self.assertNotIn("'lite'", joined)
+        self.assertNotIn("'pro'", joined)
+
+    def test_matching_tickets_stay_silent(self):
+        from gemini_web2api.models import ticket_warnings
+        CONFIG["model_tickets"] = {
+            "flash": self._ticket(1, 1),
+            "flash-thinking": self._ticket(1, 2),
+            "lite": self._ticket(6, 1),
+            "lite-thinking": self._ticket(6, 2),
+            "pro": self._ticket(3, 1),
+            "pro-thinking": self._ticket(3, 2),
+        }
+
+        self.assertEqual(ticket_warnings(), [])
+
+    def test_config_default_model_honoured_for_unknown_model(self):
+        CONFIG["default_model"] = "gemini-3.5-flash"
+
+        name, _mode, _think, err, _extra = resolve_model(
+            "totally-unknown", default=CONFIG["default_model"])
+
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-3.5-flash")
+
+    def test_bogus_default_model_does_not_raise(self):
+        name, _mode, _think, err, _extra = resolve_model("x", default="bogus")
+
+        self.assertIsNone(err)
+        self.assertEqual(name, "gemini-3.6-flash")
+
+
+class SchemaAwareArgsTests(unittest.TestCase):
+    """Task E1: a declared meta-looking key survives, an undeclared one goes."""
+
+    def test_declared_description_survives(self):
+        from gemini_web2api.tools import extract_arguments
+
+        args = extract_arguments(
+            {"name": "bash", "description": "list files", "command": "ls"},
+            props={"command", "description"})
+
+        self.assertEqual(args, {"description": "list files", "command": "ls"})
+
+    def test_undeclared_description_still_dropped(self):
+        from gemini_web2api.tools import extract_arguments
+
+        args = extract_arguments(
+            {"name": "bash", "description": "list files", "command": "ls"})
+
+        self.assertEqual(args, {"command": "ls"})
+
+    def test_flattened_bash_call_keeps_description_end_to_end(self):
+        _c, calls, _d = parse_tool_calls(
+            '```tool_call\n{"name": "bash", "description": "list", '
+            '"command": "ls"}\n```',
+            allowed_names={"bash"},
+            tool_schemas={"bash": {"command", "description"}})
+
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"description": "list", "command": "ls"})
+
+
+class ImageFetchSafetyTests(unittest.TestCase):
+    """Task E4: private targets blocked, oversized bodies rejected."""
+
+    def test_loopback_url_blocked_without_network(self):
+        from gemini_web2api import multimodal
+
+        with mock.patch("urllib.request.urlopen") as open_:
+            self.assertEqual(
+                multimodal.fetch_image_bytes("http://127.0.0.1/x.png"), b"")
+            open_.assert_not_called()
+
+    def test_localhost_blocked_without_network(self):
+        from gemini_web2api import multimodal
+
+        with mock.patch("urllib.request.urlopen") as open_:
+            self.assertEqual(
+                multimodal.fetch_image_bytes("http://localhost/x.png"), b"")
+            open_.assert_not_called()
+
+    def test_oversize_body_rejected(self):
+        from gemini_web2api import multimodal
+
+        big = b"x" * (multimodal._MAX_IMAGE_BYTES + 1)
+        resp = mock.Mock()
+        resp.read = lambda limit=None: big
+        with mock.patch("urllib.request.urlopen", return_value=resp):
+            self.assertEqual(
+                multimodal.fetch_image_bytes("http://8.8.8.8/x.png"), b"")
 
 
 if __name__ == "__main__":

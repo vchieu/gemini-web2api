@@ -80,7 +80,8 @@ class CookieExportSyncTests(unittest.TestCase):
 
     def setUp(self):
         self._saved = {k: CONFIG.get(k) for k in
-                       ("cookie_file", "xsrf_token", "auth_user", "gemini_bl")}
+                       ("cookie_file", "xsrf_token", "auth_user", "gemini_bl",
+                        "auto_update_bl")}
         self._cache = gemini._cookie_cache
         gemini._cookie_cache = ("", None, 0)
         fd, self.path = tempfile.mkstemp(suffix=".json")
@@ -96,8 +97,11 @@ class CookieExportSyncTests(unittest.TestCase):
             json.dump({"cookie": "SSID=x; SAPISID=y", "sapisid": "y",
                        "auth_user": 2, "xsrf_token": "TOKEN:123",
                        "gemini_bl": CURRENT_LABEL}, fh)
+        # The export's build label only fills the gap when auto-update is off
+        # and nothing was ever configured (see the fresh-label test below).
         CONFIG.update({"cookie_file": self.path, "xsrf_token": None,
-                       "auth_user": None, "gemini_bl": LEGACY_LABEL})
+                       "auth_user": None, "gemini_bl": LEGACY_LABEL,
+                       "auto_update_bl": False})
 
         cookie, sapisid = load_cookie()
 
@@ -130,6 +134,65 @@ class CookieExportSyncTests(unittest.TestCase):
 
         self.assertEqual(CONFIG["xsrf_token"], "KEEP")
         self.assertEqual(CONFIG["gemini_bl"], LEGACY_LABEL)
+
+    def test_export_bl_does_not_clobber_a_fresh_label(self):
+        # The startup fetch (or the 405 auto-refresh) already wrote a live
+        # label: an export touched afterwards must not reinstall its stale one.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"cookie": "SSID=x; SAPISID=y", "sapisid": "y",
+                       "gemini_bl": CURRENT_LABEL}, fh)
+        CONFIG.update({"cookie_file": self.path,
+                       "gemini_bl": "boq_gemini-web-uiserver_20261201.01_p0",
+                       "auto_update_bl": True})
+
+        cookie, _sapisid = load_cookie()
+
+        self.assertIn("SSID=x", cookie)
+        self.assertEqual(CONFIG["gemini_bl"],
+                         "boq_gemini-web-uiserver_20261201.01_p0")
+
+    def test_export_bl_applies_when_nothing_was_configured(self):
+        from gemini_web2api.config import DEFAULT_CONFIG
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"cookie": "SSID=x", "gemini_bl": CURRENT_LABEL}, fh)
+        CONFIG.update({"cookie_file": self.path,
+                       "gemini_bl": DEFAULT_CONFIG["gemini_bl"],
+                       "auto_update_bl": False})
+
+        load_cookie()
+
+        self.assertEqual(CONFIG["gemini_bl"], CURRENT_LABEL)
+
+
+class PageTokenRefreshTests(unittest.TestCase):
+    """The /app page fetch also refreshes the xsrf token from SNlM0e."""
+
+    def setUp(self):
+        self._saved = CONFIG.get("xsrf_token")
+
+    def tearDown(self):
+        CONFIG["xsrf_token"] = self._saved
+
+    def test_snlm0e_refreshes_xsrf_token(self):
+        from gemini_web2api.multimodal import _get_page_tokens
+        html = ('<html>"qKIAYe":"push-1","Ylro7b":"pctx-1",'
+                '"SNlM0e":"fresh-xsrf-token"</html>')
+        CONFIG["xsrf_token"] = "stale"
+        with mock.patch("urllib.request.urlopen",
+                        return_value=_FakeResponse(html.encode())):
+            tokens = _get_page_tokens()
+
+        self.assertEqual(CONFIG["xsrf_token"], "fresh-xsrf-token")
+        self.assertEqual(tokens.get("push_id"), "push-1")
+
+    def test_missing_snlm0e_keeps_existing_token(self):
+        from gemini_web2api.multimodal import _get_page_tokens
+        CONFIG["xsrf_token"] = "stale"
+        with mock.patch("urllib.request.urlopen",
+                        return_value=_FakeResponse(b"<html>nothing</html>")):
+            _get_page_tokens()
+
+        self.assertEqual(CONFIG["xsrf_token"], "stale")
 
 
 class BardErrorDetectionTests(unittest.TestCase):

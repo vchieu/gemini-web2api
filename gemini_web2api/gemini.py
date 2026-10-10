@@ -17,7 +17,7 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
-from .config import CONFIG
+from .config import CONFIG, DEFAULT_CONFIG
 from .tools import looks_like_tool_call
 
 _ssl_ctx = None
@@ -216,8 +216,16 @@ def load_cookie() -> tuple:
                 CONFIG["xsrf_token"] = data["xsrf_token"]
             if data.get("auth_user") not in (None, ""):
                 CONFIG["auth_user"] = data["auth_user"]
+            # The export's build label loses to a live one: the startup fetch
+            # and the 405 auto-refresh both write CONFIG first, and an
+            # operator-pinned label (anything but the built-in default) is
+            # deliberate. Only when auto-update is off and nothing was ever
+            # configured does the export fill the gap -- otherwise every
+            # cookie-file touch re-installs a stale label over a fresh one.
             if data.get("gemini_bl"):
-                CONFIG["gemini_bl"] = data["gemini_bl"]
+                if (not CONFIG.get("auto_update_bl", True)
+                        and CONFIG.get("gemini_bl") == DEFAULT_CONFIG.get("gemini_bl")):
+                    CONFIG["gemini_bl"] = data["gemini_bl"]
         else:
             cookie_str = content
             pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
