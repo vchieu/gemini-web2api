@@ -217,12 +217,27 @@ Create `config.json` in the same directory:
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,
-  "temporary_chats": false
+  "temporary_chats": false,
+  "prompt_max_bytes": 262144,
+  "debug_trace": false,
+  "trace_file": "gemini-trace.log"
 }
 ```
 
 Set `temporary_chats` to `true` to use Gemini Web temporary chats instead of
 persisting conversations to the account history.
+
+`prompt_max_bytes` caps the assembled prompt (bytes) before it goes upstream.
+Agent clients send tens of KB per file read, so the default is deliberately
+generous (upstream accepted 500 KB+ probes); truncation drops the *middle* of
+the history only when a conversation exceeds it. Lower it to shrink payloads.
+
+Set `debug_trace` to `true` to append a four-leg raw trace to `trace_file`:
+what the client sent (`CLIENT -> PROXY`), the prompt the proxy built
+(`PROXY -> MODEL`), the raw upstream bytes (`MODEL -> PROXY`) and what went
+back (`PROXY -> CLIENT`). Companion to `debug_raw`, which dumps only the two
+model legs. Both carry conversation content -- turn them off after
+investigating.
 
 When `api_keys` is `[]`, authentication is disabled. When one or more keys are set, `/v1/*` endpoints require `Authorization: Bearer <key>` or `x-api-key: <key>`.
 

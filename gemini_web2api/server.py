@@ -10,7 +10,7 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model, ticket_for
-from .gemini import generate, generate_stream, log, GeminiError
+from .gemini import generate, generate_stream, log, GeminiError, trace
 from .tools import (
     messages_to_prompt,
     parse_tool_calls,
@@ -295,6 +295,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode()
+        trace(f"PROXY -> CLIENT (HTTP {status})", body)
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self._send_cors_headers()
@@ -337,7 +338,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
             # stream_options.include_usage: every chunk carries a usage field,
             # null until the final usage chunk.
             chunk["usage"] = None
-        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        frame = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        trace("PROXY -> CLIENT (SSE frame)", frame)
+        self.wfile.write(frame.encode())
         self.wfile.flush()
 
     def _sse_usage(self, cid, model, prompt, text):
@@ -349,15 +352,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
             "choices": [],
             "usage": _usage(prompt, text),
         }
-        self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+        frame = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        trace("PROXY -> CLIENT (SSE usage)", frame)
+        self.wfile.write(frame.encode())
         self.wfile.flush()
 
     def _sse_event_error(self, status, message, type_=ERR_API, code=None):
         payload = {"error": {"message": message, "type": type_, "param": None, "code": code}}
-        self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+        frame = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        trace("PROXY -> CLIENT (SSE error)", frame)
+        self.wfile.write(frame.encode())
         self.wfile.flush()
 
     def _sse_done(self):
+        trace("PROXY -> CLIENT (SSE done)", "data: [DONE]\n\n")
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
 
@@ -540,6 +548,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 self.send_api_error(415, "Content-Type must be application/json", ERR_INVALID_REQUEST)
                 return
             body = self._read_request_body()
+            trace(f"CLIENT -> PROXY ({path})", body)
             if path in ("/v1/chat/completions", "/chat/completions"):
                 self._handle_chat(body)
             elif path in ("/v1/responses", "/responses"):

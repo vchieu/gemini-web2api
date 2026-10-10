@@ -8,9 +8,26 @@ import binascii
 import unicodedata
 from urllib.parse import unquote_to_bytes
 
-# Upper bound for the generated prompt. Keeps large tool lists / long histories
-# from being rejected by the upstream web endpoint.
+# Fallback bound for the generated prompt when config carries no
+# ``prompt_max_bytes``. Keeps large tool lists / long histories from being
+# rejected by the upstream web endpoint. The live default lives in
+# config.DEFAULT_CONFIG (well above this): 60000 was a single file read away
+# from exhaustion in agent sessions, which cost the pending question.
 PROMPT_MAX_BYTES = 60000
+
+
+def _prompt_max_bytes() -> int:
+    """Effective prompt budget in bytes: config override, else the fallback.
+
+    Read from CONFIG at call time (not import time) so a config reload or a
+    test patching ``CONFIG["prompt_max_bytes"]`` takes effect immediately.
+    """
+    from .config import CONFIG
+    try:
+        value = int(CONFIG.get("prompt_max_bytes", PROMPT_MAX_BYTES))
+    except (TypeError, ValueError):
+        return PROMPT_MAX_BYTES
+    return value if value > 0 else PROMPT_MAX_BYTES
 
 
 def _build_tool_choice_instruction(tool_choice, tool_defs: list) -> str:
@@ -197,6 +214,34 @@ def missing_required_params(tool_calls, required) -> list:
 _TRUNCATION_MARKER = "[...truncated...]"
 
 
+def _squeeze_part(part: str, cap: int) -> str:
+    """Reduce one message to ~``cap`` bytes, keeping both its ends.
+
+    A combined part starts with the ``[Assistant]:`` / ``[Tool result for
+    read ...]`` labels that say *what* this blob is and ends with the newest
+    lines of the file or a trailing question. Keeping only the tail (the old
+    behaviour) handed the model an unattributed slab of code: it could not
+    tell which file it came from, re-read files it had already read, and --
+    once older messages were evicted too -- answered with no idea what the
+    task was. Head keeps the labels, tail keeps the question/last lines, and
+    the marker in between shows content was dropped.
+    """
+    raw = part.encode("utf-8")
+    if len(raw) <= cap:
+        return part
+    marker = _TRUNCATION_MARKER.encode("utf-8")
+    # Head 1/3 (labels + opening context), tail the rest (newest content).
+    head_len = max(0, cap // 3 - len(marker) - 2)
+    tail_len = max(0, cap - head_len - len(marker) - 2)
+    if head_len <= 0 or tail_len <= 0:
+        # Degenerate cap: fall back to keeping the tail end only, which at
+        # least preserves a question asked at the end of the message.
+        return raw[-cap:].decode("utf-8", errors="ignore")
+    squeezed = (raw[:head_len] + b"\n" + marker + b"\n"
+                + raw[-tail_len:])
+    return squeezed.decode("utf-8", errors="ignore")
+
+
 def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> str:
     """Join message parts into a prompt, dropping the *middle* when too long.
 
@@ -251,22 +296,18 @@ def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> 
         return full.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
     # 1. Keep the newest messages first: they carry the pending question and
-    #    the latest tool results.
+    #    the latest tool results. No single message may claim more than half
+    #    the budget: when one giant part (a 46 KB file read) was allowed to
+    #    take everything, it evicted every older message including the user's
+    #    original request, and only its tail -- stripped of the
+    #    "[Tool result for read ...]" label at its head -- reached the model.
     tail = []
     used = 0
+    part_cap = max(1, budget // 2)
     for part in reversed(items):
-        if not tail:
-            if nbytes(part) > budget:
-                # Keep the tail (end) of oversized messages, not the head (beginning)
-                # This preserves questions at the end of user messages
-                part = part.encode("utf-8")[-budget:].decode("utf-8", errors="ignore")
-                tail.append(part)
-                used = budget
-                break
-            tail.append(part)
-            used = nbytes(part)
-            continue
-        cost = nbytes(part) + 2
+        if nbytes(part) > part_cap:
+            part = _squeeze_part(part, part_cap)
+        cost = nbytes(part) + (2 if tail else 0)
         if used + cost > budget:
             break
         tail.append(part)
@@ -363,6 +404,8 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     """
     from .gemini import log
 
+    max_bytes = _prompt_max_bytes()
+
     parts = []
     images = []
     tool_block = None
@@ -391,12 +434,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             # If still too large, trade description prose for space while
             # keeping every name, parameter, type and required flag: a model
             # that cannot see a parameter calls the tool with the wrong shape.
-            if tool_bytes > PROMPT_MAX_BYTES // 3:
+            if tool_bytes > max_bytes // 3:
                 for desc_max in (300, 150, 80):
                     tools_json = "\n".join(_compact_tool(t, desc_max)
                                            for t in tool_defs)
                     tool_bytes = len(tools_json.encode("utf-8"))
-                    if tool_bytes <= PROMPT_MAX_BYTES // 3:
+                    if tool_bytes <= max_bytes // 3:
                         break
                 log(f"Tool definitions compacted to signatures "
                     f"(descriptions cut to {desc_max} chars, {tool_bytes} bytes): "
@@ -508,7 +551,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
 
     if tool_block:
         parts.append(_TOOL_REMINDER)
-    return _join_prompt_parts(parts, PROMPT_MAX_BYTES, pinned_head=tool_block), images
+    return _join_prompt_parts(parts, max_bytes, pinned_head=tool_block), images
 
 
 # Keys that describe the call itself rather than its parameters. Models emit

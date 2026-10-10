@@ -3,6 +3,8 @@ import base64
 import contextlib
 import io
 import json
+import os
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -335,8 +337,14 @@ class MessageParsingTests(unittest.TestCase):
 class PromptTruncationTests(unittest.TestCase):
     """Oversized prompts must drop the *middle*, never the pending question."""
 
+    def _shrink_budget(self):
+        """Pin the budget at the old 60000 default so these tests exercise
+        truncation even though config now ships a much larger prompt_max_bytes.
+        """
+        return mock.patch.dict(CONFIG, {"prompt_max_bytes": 60000})
+
     def test_over_long_prompt_keeps_latest_user_message(self):
-        filler = "Old history line " * 4000  # ~68 KB, past PROMPT_MAX_BYTES
+        filler = "Old history line " * 4000  # ~68 KB, past the 60 KB budget
         messages = [
             {"role": "system", "content": "You are helpful."},
             {"role": "user", "content": filler},
@@ -344,12 +352,13 @@ class PromptTruncationTests(unittest.TestCase):
             {"role": "user", "content": "THE FINAL QUESTION"},
         ]
 
-        prompt, _ = messages_to_prompt(messages)
+        with self._shrink_budget():
+            prompt, _ = messages_to_prompt(messages)
 
         self.assertIn("THE FINAL QUESTION", prompt)
         self.assertIn("[System instruction]: You are helpful.", prompt)
         self.assertIn("[...truncated...]", prompt)
-        self.assertLessEqual(len(prompt.encode("utf-8")), PROMPT_MAX_BYTES)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 60000)
 
     def test_over_long_prompt_keeps_tool_definitions(self):
         tools = [
@@ -364,11 +373,60 @@ class PromptTruncationTests(unittest.TestCase):
             {"role": "user", "content": "THE FINAL QUESTION"},
         ]
 
-        prompt, _ = messages_to_prompt(messages, tools)
+        with self._shrink_budget():
+            prompt, _ = messages_to_prompt(messages, tools)
 
         self.assertIn("# Tool Use", prompt)
         self.assertIn("THE FINAL QUESTION", prompt)
-        self.assertLessEqual(len(prompt.encode("utf-8")), PROMPT_MAX_BYTES)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 60000)
+
+    def test_giant_tool_result_keeps_label_and_older_messages(self):
+        # Regression: one 46 KB file read used to be allowed to claim the whole
+        # budget. Only its tail reached the model -- no "[Tool result ...]"
+        # label, no original request -- so it re-read files it had already read
+        # and finally answered the wrong question entirely.
+        filler = "def line_of_code(): pass  # " * 2600  # ~73 KB, over the 60 KB budget
+        messages = [
+            {"role": "user", "content": "REVIEW THE SOURCE AND LIST CRITICAL BUGS"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {
+                    "name": "read", "arguments": '{"path": "server.py"}'}}]},
+            {"role": "tool", "tool_call_id": "call_1",
+             "content": "[Tool result for read (id=call_1)]: server.py contents\n" + filler},
+        ]
+
+        with self._shrink_budget():
+            prompt, _ = messages_to_prompt(messages)
+
+        self.assertIn("REVIEW THE SOURCE AND LIST CRITICAL BUGS", prompt)
+        self.assertIn("[Tool result for read (id=call_1)]", prompt)
+        self.assertIn("[...truncated...]", prompt)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 60000)
+
+    def test_config_override_raises_budget(self):
+        # The fix: default budget comes from config, not a 60 KB constant, so
+        # a normal agent conversation (several file reads) is never truncated.
+        filler = "Old history line " * 4000  # ~68 KB: over 60000, under 262144
+        messages = [
+            {"role": "user", "content": filler},
+            {"role": "user", "content": "THE FINAL QUESTION"},
+        ]
+
+        prompt, _ = messages_to_prompt(messages)
+
+        self.assertNotIn("[...truncated...]", prompt)
+        self.assertIn("THE FINAL QUESTION", prompt)
+        self.assertLessEqual(len(prompt.encode("utf-8")),
+                             CONFIG["prompt_max_bytes"])
+
+    def test_prompt_max_bytes_helper_ignores_garbage(self):
+        from gemini_web2api.tools import _prompt_max_bytes
+        with mock.patch.dict(CONFIG, {"prompt_max_bytes": "not-a-number"}):
+            self.assertEqual(_prompt_max_bytes(), PROMPT_MAX_BYTES)
+        with mock.patch.dict(CONFIG, {"prompt_max_bytes": 0}):
+            self.assertEqual(_prompt_max_bytes(), PROMPT_MAX_BYTES)
+        with mock.patch.dict(CONFIG, {"prompt_max_bytes": 1234}):
+            self.assertEqual(_prompt_max_bytes(), 1234)
 
     def test_short_prompt_is_not_truncated(self):
         prompt, _ = messages_to_prompt([{"role": "user", "content": "hello"}])
@@ -389,6 +447,45 @@ class PromptTruncationTests(unittest.TestCase):
         prompt, _ = messages_to_prompt([{"role": "user", "content": "hi"}], tools)
 
         self.assertIn("Triple backticks inside a string argument", prompt)
+
+
+class RawTraceTests(unittest.TestCase):
+    """debug_trace captures every leg of the exchange; off by default."""
+
+    def test_trace_writes_all_legs_when_enabled(self):
+        from gemini_web2api.gemini import trace
+        fd, path = tempfile.mkstemp(prefix="gw2a-trace-", suffix=".log")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            with mock.patch.dict(CONFIG, {"debug_trace": True, "trace_file": path}):
+                trace("CLIENT -> PROXY (/v1/chat/completions)", '{"messages": []}')
+                trace("PROXY -> MODEL", b"bytes body")
+                trace("MODEL -> PROXY", {"inner": 4})
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn("CLIENT -> PROXY (/v1/chat/completions)", text)
+            self.assertIn('{"messages": []}', text)
+            self.assertIn("PROXY -> MODEL", text)
+            self.assertIn("bytes body", text)
+            self.assertIn("MODEL -> PROXY", text)
+            self.assertIn('"inner": 4', text)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_trace_is_silent_when_disabled(self):
+        from gemini_web2api.gemini import trace
+        fd, path = tempfile.mkstemp(prefix="gw2a-trace-", suffix=".log")
+        os.close(fd)
+        os.unlink(path)
+        try:
+            with mock.patch.dict(CONFIG, {"debug_trace": False, "trace_file": path}):
+                trace("PROXY -> CLIENT", "should not appear")
+            self.assertFalse(os.path.exists(path))
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 class StreamingEndpointTests(unittest.TestCase):

@@ -17,5 +17,8 @@
   "proxy": null,
   "log_requests": true,
   "temporary_chats": false,
+  "prompt_max_bytes": 262144,
+  "debug_trace": false,
+  "trace_file": "gemini-trace.log",
   "model_tickets": {}
 }

@@ -59,11 +59,26 @@ DEFAULT_CONFIG = {
     # extra attempt only ever costs a call that was already failing, never one
     # that succeeded.
     "tool_retry_attempts": 1,
+    # Upper bound for the assembled prompt (bytes) sent upstream. Agent
+    # sessions (opencode/cursor) send tens of KB per file read; at 60000 a
+    # single read of a 1000-line file filled the budget, the joiner kept only
+    # that message's tail (dropping its "[Tool result ...]" label and the
+    # pending question), and the model answered from memory. Live probes
+    # against the real upstream accepted prompts well past 500 KB, so the
+    # default is much larger; lower it only to shrink request payloads.
+    "prompt_max_bytes": 262144,
     # Diagnostics: dump every raw upstream response to debug_raw_file so the
     # payload shape (thinking vs answer vs tool call) can be inspected. Off by
     # default -- raw responses can be large and carry conversation content.
     "debug_raw": False,
     "debug_raw_file": "gemini-raw.log",
+    # Four-leg raw trace for deep investigation: CLIENT -> PROXY (do_POST body),
+    # PROXY -> MODEL (built prompt), MODEL -> PROXY (raw upstream bytes) and
+    # PROXY -> CLIENT (JSON/SSE frames), appended to trace_file. Gated
+    # separately from debug_raw because it also captures client conversation
+    # content on both ends.
+    "debug_trace": False,
+    "trace_file": "gemini-trace.log",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

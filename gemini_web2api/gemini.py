@@ -58,6 +58,34 @@ class GeminiError(Exception):
         self.status = status
 
 
+def trace(leg: str, data) -> None:
+    """Append one leg of a request's journey to ``trace_file``.
+
+    Four legs are traced when ``debug_trace`` is on: CLIENT -> PROXY (the raw
+    do_POST body), PROXY -> MODEL (the prompt as assembled), MODEL -> PROXY
+    (the raw upstream bytes) and PROXY -> CLIENT (JSON body or each SSE
+    frame). debug_raw already covers the two model legs; this exists so a
+    single file shows what the client sent *and* what it received, which is
+    what distinguishes "model answered with nothing" from "proxy dropped it".
+    Failures are silent: this is diagnostics and must never break a request.
+    """
+    if not CONFIG.get("debug_trace"):
+        return
+    path = CONFIG.get("trace_file") or "gemini-trace.log"
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    elif not isinstance(data, str):
+        data = json.dumps(data, ensure_ascii=False)
+    try:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"\n===== [{time.strftime('%Y-%m-%d %H:%M:%S')}] {leg} "
+                     f"({len(data)} chars) =====\n")
+            fh.write(data)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
 def _dump_raw(raw: str):
     """Write one unfiltered upstream response to ``debug_raw_file``.
 
@@ -295,6 +323,7 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
         # between client request and upstream text is visible right here.
         _dump_raw("REQUEST >>>\n" + json.dumps(inner, ensure_ascii=False)
                   + "\n<<< REQUEST")
+    trace("PROXY -> MODEL", json.dumps(inner, ensure_ascii=False))
     return urllib.parse.urlencode(params)
 
 
@@ -523,6 +552,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
             raw = resp.read().decode("utf-8", errors="replace")
             if CONFIG.get("debug_raw"):
                 _dump_raw(raw)
+            trace("MODEL -> PROXY", raw)
             check_routing(raw, model_id, extra_fields, ticket)
             return extract_response_text(raw)
         except urllib.error.HTTPError as e:
@@ -629,6 +659,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 # Mirror generate(): the stream path also dumps the raw
                 # upstream frames so prefix/delta handling can be audited.
                 _dump_raw(raw_full)
+            trace("MODEL -> PROXY (stream)", raw_full)
             check_routing(raw_full, model_id, extra_fields, ticket)
             return
         except httpx.HTTPStatusError as e:
