@@ -35,6 +35,7 @@ from gemini_web2api.tools import (
     parse_google_function_calls,
     parse_tool_calls,
     pending_tool_request,
+    SOURCE_REVIEW_OWED,
     tool_required_params,
 )
 
@@ -2434,14 +2435,14 @@ class PendingToolRequestTests(unittest.TestCase):
             {"role": "tool", "content": "...", "tool_call_id": "c1"},
         ]))
 
-    def test_a_call_that_names_no_file_still_counts_as_tool_use(self):
-        """``glob {"pattern": "**/*"}`` proves the model is acting.
+    def test_glob_only_source_review_still_owes_a_read(self):
+        """A ``glob`` lists names; a source review needs contents.
 
-        Its arguments contain no file-shaped token, so keying "tool use
-        happened" off the file names would report a phantom demand and burn
-        a retry on a turn that is already doing what the user asked.
+        Listing file names is not reading them: answering a source-review
+        request from a ``glob`` alone is a fabricated review, so the turn
+        stays owed and the retry fires.
         """
-        self.assertIsNone(pending_tool_request([
+        reason = pending_tool_request([
             {"role": "user",
              "content": "Review source code thu muc. Bat buoc dung tool."},
             {"role": "assistant", "content": "", "tool_calls": [{
@@ -2449,7 +2450,8 @@ class PendingToolRequestTests(unittest.TestCase):
                     "name": "glob",
                     "arguments": '{"path": "src", "pattern": "**/*"}'}}]},
             {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
-        ]))
+        ])
+        self.assertEqual(reason, SOURCE_REVIEW_OWED)
 
     def test_runtime_names_are_not_mistaken_for_files(self):
         """`Node.js` matches the ``.js`` pattern but no tool ever opens it.
@@ -2482,14 +2484,14 @@ class PendingToolRequestTests(unittest.TestCase):
             {"role": "user", "content": "Doc readme.md roi tong ket nhe."},
         ]))
 
-    def test_a_tool_call_this_turn_ends_the_check(self):
-        """After the model has acted, whatever it writes is a real answer.
+    def test_a_glob_does_not_end_a_source_review_turn(self):
+        """A read ends the check; a glob does not.
 
-        Even if it names a file that call did not spell out -- the summary of
-        a review legitimately mentions files it never listed -- chasing it
-        would replace a finished answer with the retry's output.
+        The model listed names but never opened ``server.py`` -- the file
+        the newest turn asks about -- so the reason names it instead of
+        treating the listing as the review.
         """
-        self.assertIsNone(pending_tool_request([
+        reason = pending_tool_request([
             {"role": "user",
              "content": "Review README.md va server.py trong du an."},
             {"role": "assistant", "content": "", "tool_calls": [{
@@ -2504,6 +2506,75 @@ class PendingToolRequestTests(unittest.TestCase):
                              "arguments": '{"pattern": "**/*"}'}}]},
             {"role": "tool", "content": "server.py\nmodels.py",
              "tool_call_id": "c2"},
+        ])
+        self.assertIn("server.py", reason)
+
+    def test_source_review_glob_only_with_no_file_named_is_owed(self):
+        reason = pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "glob",
+                    "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+        ])
+        self.assertEqual(reason, SOURCE_REVIEW_OWED)
+
+    def test_source_review_read_this_turn_ends_the_check(self):
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "print('hi')", "tool_call_id": "c1"},
+        ]))
+
+    def test_source_review_grep_without_a_path_still_counts_as_reading(self):
+        """A ``grep`` with no path in its args still read content.
+
+        Keying "content was read" off file names alone would miss it and
+        retry a turn that already did the work.
+        """
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review source va tim bug gium"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "grep",
+                    "arguments": '{"pattern": "eval"}'}}]},
+            {"role": "tool", "content": "a.py:1: eval(x)", "tool_call_id": "c1"},
+        ]))
+
+    def test_non_source_demand_glob_only_stays_silent(self):
+        """Only source-review turns treat a listing as still owed.
+
+        Any other demand keeps today's rule: a call this turn ends the
+        check, even one that names no file.
+        """
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "Hay dung tool de xem ket qua."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "glob",
+                    "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+        ]))
+
+    def test_review_verb_without_a_file_stays_silent_after_a_glob(self):
+        """A review verb alone names nothing to read.
+
+        "review file" carries no file-shaped token, so it is neither a
+        source review nor a file review: a `glob` this turn ends the check.
+        Guards the docstring contract -- a truthiness slip here would turn
+        every review-verb turn into an owed retry.
+        """
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review file"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "glob",
+                    "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
         ]))
 
     def test_plain_chitchat_and_empty_input_report_nothing(self):
@@ -2774,6 +2845,8 @@ class PromptRewriteTests(unittest.TestCase):
         # Every pre-existing rule stays.
         self.assertIn("Triple backticks inside a string argument", prompt)
         self.assertIn('never beside "name"', prompt)
+        # A source review must read contents: listing names is not reading.
+        self.assertIn("Listing or globbing file names is not reading", prompt)
 
     def test_reminder_differs_by_last_message_role(self):
         with_tool_result, _ = messages_to_prompt(
@@ -3027,6 +3100,30 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 2)
         self.assertFalse(tool_calls)
         self.assertEqual(text, "The README is a doc.")
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_glob_only_source_review_retries_with_a_read_directive(self, generate):
+        history = [
+            {"role": "user",
+             "content": "review source và cho biết critical bugs nếu có"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "glob",
+                             "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+        ]
+        generate.side_effect = [
+            "The code looks fine overall.",
+            '```tool_call\n{"name": "read", "arguments": {"path": "a.py"}}\n```',
+        ]
+
+        text, tool_calls = self._retry(generate, history)
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read")
+        nudge = generate.call_args_list[1].args[0]
+        self.assertIn("listing file names is not reading", nudge)
+        self.assertIn("a.py", nudge)
 
     def test_demand_false_positives_stay_silent(self):
         for prose in ("because tool", "demo file", "thread files",

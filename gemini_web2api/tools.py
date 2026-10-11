@@ -431,6 +431,11 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "something -> output ONLY tool_call block(s); (B) you already have "
         "everything -> answer as plain text with NO block. Never both, and "
         "never any prose after the block.\n"
+        "- Before answering a request to review, audit, inspect or find bugs in "
+        "source code, you MUST read the actual contents of the relevant files with "
+        "a read/search tool first. Listing or globbing file names is not reading: "
+        "if you have only listed files, read the most relevant ones before you "
+        "answer.\n"
         "- Output ONLY tool_call block(s): no prose, explanation or apology "
         "before or after them.\n"
         '- Every parameter belongs inside the "arguments" object, keyed exactly '
@@ -1259,6 +1264,115 @@ _TOOL_DEMAND_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A request to review/audit/inspect source code (matched against folded,
+# whitespace-collapsed text, like _TOOL_DEMAND_RE). Kept separate because a
+# listing-only turn (glob/list) must still count as owed here, while every
+# other demand keeps the old "any call ends the check" rule.
+_SOURCE_REVIEW_VERB_RE = re.compile(
+    r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim|xem\s+xet|doc)\b",
+    re.IGNORECASE,
+)
+_SOURCE_NOUN_RE = re.compile(
+    r"\b(?:source|code|codebase|ma\s+nguon|implementation|repository|repo)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_source_review(folded: str) -> bool:
+    """True when folded text asks for a review of source/code."""
+    return bool(_SOURCE_REVIEW_VERB_RE.search(folded)
+                and _SOURCE_NOUN_RE.search(folded))
+
+
+def _is_file_review(folded: str, scannable: str) -> bool:
+    """True when folded text aims a review verb at a named file.
+
+    "Tiep tuc review server.py di." carries no source noun, so
+    :func:`_is_source_review` misses it -- yet answering it from a glob
+    listing alone is the same fabrication. A review verb plus a file-shaped
+    token counts as a review of that file ("review file" with no file named
+    stays silent; runtime names like ``Node.js`` never count as files).
+    """
+    if not _SOURCE_REVIEW_VERB_RE.search(folded):
+        return False
+    return any(f for f in _files_in(scannable)
+               if f.lower() not in _NON_FILE_NAMES)
+
+
+# Tool names that read content (not just list names). A grep/search with no
+# path in its args still read something, so the name alone ends the check.
+_READER_TOOL_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:read|cat|view|open|show|grep|ripgrep|search|head|tail|less|sed|fetch)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+
+# A glob-only turn answered from filenames alone is the failure this guards:
+# the model listed names but never opened one.
+SOURCE_REVIEW_OWED = ("source review requested but no file content was read "
+                      "(only listed)")
+
+
+def is_read_retry_reason(reason) -> bool:
+    """True when a retry reason means "no file content was read yet"."""
+    return bool(reason) and ("never read" in reason
+                             or reason == SOURCE_REVIEW_OWED)
+
+
+def _last_user_index(messages) -> int:
+    """Index of the last ``role == "user"`` dict, else -1."""
+    idx = -1
+    for i, msg in enumerate(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            idx = i
+    return idx
+
+
+def _turn_tool_calls(messages, start_idx) -> list:
+    """Every ``tool_calls`` dict in messages after ``start_idx``."""
+    calls = []
+    for msg in (messages or [])[start_idx + 1:]:
+        if not isinstance(msg, dict):
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if isinstance(tc, dict):
+                calls.append(tc)
+    return calls
+
+
+def _content_read_this_turn(messages) -> bool:
+    """True when this turn read content rather than only listing names."""
+    start_idx = _last_user_index(messages)
+    for tc in _turn_tool_calls(messages, start_idx):
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        if _files_in(str(args or "")):
+            return True
+        if isinstance(name, str) and _READER_TOOL_RE.search(name):
+            return True
+    return False
+
+
+def listed_turn_files(messages) -> list:
+    """File names from ``role == "tool"`` contents since the last user turn.
+
+    Ordered and unique: the retry nudge names these so the model reads what
+    it just listed instead of guessing.
+    """
+    start_idx = _last_user_index(messages)
+    seen = []
+    for msg in (messages or [])[start_idx + 1:]:
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        for f in _files_in(_stringify_content(msg.get("content", ""))):
+            if f.lower() in _NON_FILE_NAMES:
+                continue
+            if f not in seen:
+                seen.append(f)
+    return seen
+
 
 def _strip_code_spans(text: str) -> str:
     """Remove fenced and inline code from ``text`` for demand/file scanning.
@@ -1337,18 +1451,27 @@ def pending_tool_request(messages) -> str:
             last_user_idx = i
             last_user = _stringify_content(msg.get("content", ""))
 
-    # A tool call after the newest user message means this turn already acted.
-    if any(isinstance(msg, dict) and msg.get("tool_calls")
-           for msg in messages[last_user_idx + 1:]):
-        return None
     if not last_user:
         return None
 
-    called_lower = {f.lower() for f in _conversation_called_files(messages)}
     # Pasted logs and code name files the user never asked about; scan what
     # remains after blanking them, for both the file check and the demand
     # match below.
     scannable = _strip_code_spans(last_user)
+    folded = _fold_diacritics(scannable)
+    folded = re.sub(r"\s+", " ", folded).strip()
+    # A listing-only turn (glob/list) on a source-review request must stay
+    # owed: filenames alone are not content, and answering from them is the
+    # hallucinated review this check exists to prevent.
+    source_review = (_is_source_review(folded)
+                     or _is_file_review(folded, scannable))
+    turn_has_call = any(isinstance(msg, dict) and msg.get("tool_calls")
+                        for msg in messages[last_user_idx + 1:])
+    turn_read = _content_read_this_turn(messages)
+    if turn_has_call and (turn_read or not source_review):
+        return None
+
+    called_lower = {f.lower() for f in _conversation_called_files(messages)}
     uncovered = sorted(
         f for f in _files_in(scannable)
         if f.lower() not in called_lower and f.lower() not in _NON_FILE_NAMES
@@ -1356,8 +1479,9 @@ def pending_tool_request(messages) -> str:
     if uncovered:
         return "requested file(s) never read: " + ", ".join(uncovered)
 
-    folded = _fold_diacritics(scannable)
-    folded = re.sub(r"\s+", " ", folded).strip()
+    if source_review and turn_has_call and not turn_read:
+        return SOURCE_REVIEW_OWED
+
     if _TOOL_DEMAND_RE.search(folded):
         return "user demanded tool use and none happened"
     return None

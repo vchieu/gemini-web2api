@@ -30,6 +30,9 @@ from .tools import (
     looks_like_missed_tool_call,
     looks_like_upstream_error,
     pending_tool_request,
+    SOURCE_REVIEW_OWED,
+    is_read_retry_reason,
+    listed_turn_files,
 )
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -713,6 +716,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
         attempts = _tool_retry_attempts(required_tool, tools_active)
         # Computed once: it inspects the whole conversation, not the reply.
         owed = pending_tool_request(messages) if tools_active else None
+        # Files the model just listed but never opened: the read-directive
+        # nudge names these so the retry reads instead of guessing.
+        files = listed_turn_files(messages) if tools_active else []
         # Calls this conversation already has results for: emitting one again
         # is a loop, not progress.
         repeatable = _repeatable_calls(messages) if tools_active else set()
@@ -737,13 +743,23 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 # summary into a call nobody asked for -- and an agent happily
                 # runs that, then asks again. Conditional wording still pushes
                 # an acting model to act while letting a genuine answer stand.
-                nudge = (
-                    "IMPORTANT: Respond with a tool_call block ONLY."
-                    if required_tool else
-                    "IMPORTANT: Do not describe a tool call -- make it. If "
-                    "answering requires reading or changing something, call "
-                    "the tool now; otherwise give your final answer."
-                )
+                # A source-review turn that only listed files gets a directive
+                # instead: the permissive "otherwise give your final answer"
+                # is what let the model answer from filenames alone.
+                if not required_tool and is_read_retry_reason(owed):
+                    nudge = ("IMPORTANT: You have not read any file's contents yet -- "
+                             "listing file names is not reading them. Call the read tool now "
+                             "on the most relevant file(s) and answer from what you actually read.")
+                    if files:
+                        nudge += " Read these first: " + ", ".join(files[:8]) + "."
+                else:
+                    nudge = (
+                        "IMPORTANT: Respond with a tool_call block ONLY."
+                        if required_tool else
+                        "IMPORTANT: Do not describe a tool call -- make it. If "
+                        "answering requires reading or changing something, call "
+                        "the tool now; otherwise give your final answer."
+                    )
                 if missing:
                     # A model that omitted a parameter believes its call is
                     # complete, so it has to be told which fields were absent.
