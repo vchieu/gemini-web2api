@@ -1099,10 +1099,16 @@ _MISSED_TOOL_RE = re.compile(
     r"|no\s+(?:file\s+|tool\s+)?access"
     r"|not\s+(?:permitted|allowed)\s+to\s+read"
     r"|de\s+minh\s+doc|de\s+minh\s+kiem\s+tra"
+    r"|let'?s\s+(?:read|check|look|see|examine|inspect)"
+    r"|let\s+us\s+(?:read|check|look|see|examine|inspect)"
     r"|let\s+me\s+(?:read|check|look|see|examine|inspect)"
     r"|i(?:'ll|\s+will)\s+(?:read|check|look|see|examine|inspect))",
     re.IGNORECASE,
 )
+
+# Longer guard for verbose models that explain before emitting tool_call.
+# Raised from 600 to 1200 to catch models that write a paragraph before the block.
+_MAX_MISSED_TOOL_CHARS = 1200
 
 # Anything at or above this is a real answer rather than a stalled first turn.
 _MAX_MISSED_TOOL_CHARS = 600
