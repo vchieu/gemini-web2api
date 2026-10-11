@@ -25,7 +25,9 @@ from gemini_web2api.models import TICKET_HEADER, resolve_model, ticket_for
 from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
+    declared_unread,
     google_contents_to_prompt,
+    is_read_retry_reason,
     is_required_tool_choice,
     looks_like_missed_tool_call,
     looks_like_tool_call,
@@ -2556,6 +2558,89 @@ class PendingToolRequestTests(unittest.TestCase):
             {"role": "tool", "content": "print('b')", "tool_call_id": "c2"},
         ]))
 
+    def test_declared_but_unread_files_stay_owed(self):
+        """A file the model names as reviewed but never read stays owed.
+
+        One read is done but the listing shows two candidates, so the
+        floor alone would already owe -- the reason must name the declared
+        file ``b.py`` specifically, proving the new branch fired first.
+        """
+        reason = pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+            {"role": "assistant",
+             "content": "Da review a.py va b.py, ca hai deu on."},
+        ])
+        self.assertEqual(reason, "declared file(s) never read: b.py")
+
+    def test_declared_files_all_read_end_the_check(self):
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c2", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "b.py"}'}}]},
+            {"role": "tool", "content": "print('b')", "tool_call_id": "c2"},
+            {"role": "assistant",
+             "content": "Da review a.py va b.py, ca hai deu on."},
+        ]))
+
+    def test_declared_files_ignored_outside_review(self):
+        """Identical prose on a non-review demand owes nothing."""
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "Hay dung tool de xem ket qua."},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "print('a')", "tool_call_id": "c1"},
+            {"role": "assistant",
+             "content": "Da xem a.py va b.py roi nhe."},
+        ]))
+
+    def test_pasted_code_naming_files_is_not_a_declaration(self):
+        """``b.py`` inside a fenced block is a paste, not a declaration."""
+        messages = [
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py", "tool_call_id": "c1"},
+            {"role": "assistant",
+             "content": "Da review a.py.\n```\nb.py has a bug\n```"},
+        ]
+        self.assertEqual(declared_unread(messages), [])
+        self.assertIsNone(pending_tool_request(messages))
+
+    def test_runtime_name_in_prose_is_not_a_declaration(self):
+        """``Node.js`` in prose is a runtime, never an owed file."""
+        messages = [
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py", "tool_call_id": "c1"},
+            {"role": "assistant",
+             "content": "Da review a.py. Du an chay tren Node.js."},
+        ]
+        self.assertEqual(declared_unread(messages), [])
+        self.assertIsNone(pending_tool_request(messages))
+
+    def test_declared_retry_reason_counts_as_read_retry_reason(self):
+        self.assertTrue(
+            is_read_retry_reason("declared file(s) never read: b.py"))
+
     def test_source_review_one_read_with_one_candidate_ends_the_check(self):
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
@@ -3177,6 +3262,29 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         nudge = generate.call_args_list[1].args[0]
         self.assertTrue("not read enough" in nudge or "not a review" in nudge)
         self.assertIn("a.py", nudge)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_loop_retries_when_reply_names_unread_file(self, generate):
+        history = [
+            {"role": "user",
+             "content": "review source và cho biết critical bugs nếu có"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "read",
+                             "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "print('a')", "tool_call_id": "c1"},
+        ]
+        generate.side_effect = [
+            "Da review a.py va b.py, ca hai deu on.",
+            '```tool_call\n{"name": "read", "arguments": {"path": "b.py"}}\n```',
+        ]
+
+        text, tool_calls = self._retry(generate, history)
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read")
+        nudge = generate.call_args_list[1].args[0]
+        self.assertIn("b.py", nudge)
 
     def test_demand_false_positives_stay_silent(self):
         for prose in ("because tool", "demo file", "thread files",

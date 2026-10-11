@@ -436,7 +436,8 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "a read/search tool first -- reading one file is not reviewing a codebase. "
         "Listing or globbing file names is not reading: "
         "if you have only listed or opened one file, read the other relevant ones before you "
-        "answer.\n"
+        "answer. If you name files as part of the review, read every one of them -- "
+        "a file you only mentioned is a file you have not reviewed.\n"
         "- Output ONLY tool_call block(s): no prose, explanation or apology "
         "before or after them.\n"
         '- Every parameter belongs inside the "arguments" object, keyed exactly '
@@ -1340,25 +1341,89 @@ def _turn_tool_calls(messages, start_idx) -> list:
     return calls
 
 
-def _reads_this_turn(messages) -> int:
-    """Number of distinct content reads in this turn."""
+def files_read_in_turn(messages) -> set:
+    """Lowercased file names whose content this turn's tool calls opened."""
     start_idx = _last_user_index(messages)
     files = set()
-    unnamed = False
     for tc in _turn_tool_calls(messages, start_idx):
         fn = tc.get("function") or {}
-        name = fn.get("name") or ""
         args = fn.get("arguments")
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False)
         found = {f.lower() for f in _files_in(str(args or ""))}
         if found:
             files |= found
-        elif isinstance(name, str) and _READER_TOOL_RE.search(name):
-            unnamed = True
+    return files
+
+
+def _reads_this_turn(messages) -> int:
+    """Number of distinct content reads in this turn."""
+    files = files_read_in_turn(messages)
     if files:
         return len(files)
-    return 1 if unnamed else 0
+    start_idx = _last_user_index(messages)
+    for tc in _turn_tool_calls(messages, start_idx):
+        fn = tc.get("function") or {}
+        name = fn.get("name") or ""
+        if isinstance(name, str) and _READER_TOOL_RE.search(name):
+            return 1
+    return 0
+
+
+def review_demanded(messages) -> bool:
+    """True when the newest user turn asks for a source/code review."""
+    last_user = None
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = _stringify_content(msg.get("content", ""))
+    if not last_user:
+        return False
+    scannable = _strip_code_spans(last_user)
+    folded = _fold_diacritics(scannable)
+    folded = re.sub(r"\s+", " ", folded).strip()
+    return bool(_is_source_review(folded)
+                or _is_file_review(folded, scannable))
+
+
+def declared_unread(messages) -> list:
+    """Files the model named in this turn's prose but never read, else ``[]``.
+
+    Ordered and unique: file-shaped tokens in assistant ``content`` since the
+    last user turn (code spans blanked first, so pasted logs/code do not
+    count; runtime names like ``Node.js`` never count), minus the files this
+    turn's tool calls opened (compared case-insensitively).
+    """
+    start_idx = _last_user_index(messages)
+    read_lower = files_read_in_turn(messages)
+    seen = []
+    for msg in (messages or [])[start_idx + 1:]:
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for f in _files_in(_strip_code_spans(
+                _stringify_content(msg.get("content", "")))):
+            if f.lower() in _NON_FILE_NAMES or f.lower() in read_lower:
+                continue
+            if f not in seen:
+                seen.append(f)
+    return sorted(seen)
+
+
+def fresh_declared_unread(text, messages) -> list:
+    """Like :func:`declared_unread` but for one fresh reply string.
+
+    The retry loop calls this on the reply it just received, before that
+    reply is appended to ``messages``.
+    """
+    if not isinstance(text, str) or not text:
+        return []
+    read_lower = files_read_in_turn(messages)
+    seen = []
+    for f in _files_in(_strip_code_spans(text)):
+        if f.lower() in _NON_FILE_NAMES or f.lower() in read_lower:
+            continue
+        if f not in seen:
+            seen.append(f)
+    return sorted(seen)
 
 
 def listed_turn_files(messages) -> list:
@@ -1469,12 +1534,13 @@ def pending_tool_request(messages) -> str:
     # A listing-only turn (glob/list) on a source-review request must stay
     # owed: filenames alone are not content, and answering from them is the
     # hallucinated review this check exists to prevent.
-    source_review = (_is_source_review(folded)
-                     or _is_file_review(folded, scannable))
+    is_generic_source_review = _is_source_review(folded)
+    is_file_review = _is_file_review(folded, scannable)
+    source_review = is_generic_source_review or is_file_review
     turn_has_call = any(isinstance(msg, dict) and msg.get("tool_calls")
                         for msg in messages[last_user_idx + 1:])
     required_reads = 1
-    if (_is_source_review(folded) and not _is_file_review(folded, scannable)
+    if (is_generic_source_review and not is_file_review
             and len(listed_turn_files(messages)) >= 2):
         required_reads = 2
     reads = _reads_this_turn(messages)
@@ -1488,6 +1554,13 @@ def pending_tool_request(messages) -> str:
     )
     if uncovered:
         return "requested file(s) never read: " + ", ".join(uncovered)
+
+    # Only generic source reviews ("review source") enforce reading every
+    # file the model names in its prose. Named-file reviews are handled by
+    # the `uncovered` branch above (user-named files from the latest message).
+    declared = declared_unread(messages)
+    if is_generic_source_review and declared and turn_has_call:
+        return "declared file(s) never read: " + ", ".join(declared)
 
     if source_review and turn_has_call and reads < required_reads:
         return SOURCE_REVIEW_OWED

@@ -33,6 +33,13 @@ from .tools import (
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
     listed_turn_files,
+    fresh_declared_unread,
+    review_demanded,
+    _is_source_review,
+    _is_file_review,
+    _strip_code_spans,
+    _fold_diacritics,
+    _stringify_content,
 )
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
@@ -723,6 +730,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # is a loop, not progress.
         repeatable = _repeatable_calls(messages) if tools_active else set()
 
+        # Generic source review ("review source" without a named file) --
+        # computed from the last user message, same way as pending_tool_request.
+        last_user = None
+        if messages:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    last_user = _stringify_content(msg.get("content", ""))
+                    break
+        is_generic_source_review = False
+        if last_user:
+            scannable = _strip_code_spans(last_user)
+            folded = _fold_diacritics(scannable)
+            folded = re.sub(r"\s+", " ", folded).strip()
+            if _is_source_review(folded) and not _is_file_review(folded, scannable):
+                is_generic_source_review = True
+
         text, tool_calls, missing = "", None, []
         dropped = []
         nudge_extra = ""
@@ -850,6 +873,16 @@ class GeminiHandler(BaseHTTPRequestHandler):
                                "used: " + "; ".join(dropped) +
                                ". Valid tool names: "
                                + ", ".join(sorted(allowed_names or [])) + ".")
+                continue
+            fresh = (fresh_declared_unread(text, messages)
+                     if tools_active else [])
+            if tools_active and fresh and is_generic_source_review:
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): reply "
+                    f"named unread file(s): {', '.join(fresh)}")
+                nudge_extra = (" You named these file(s) as part of the review "
+                               "but have not read them: " + ", ".join(fresh) +
+                               ". Call the read tool on each of them now, then "
+                               "answer from what you actually read.")
                 continue
             if retry_on_miss and owed:
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
