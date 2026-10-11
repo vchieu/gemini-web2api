@@ -17,10 +17,13 @@ try:
 except ImportError:
     HAS_HTTPX = False
 
-from .config import CONFIG, DEFAULT_CONFIG
+from .config import CONFIG, DEFAULT_CONFIG, _config_lock_ctx
 from .tools import looks_like_tool_call
 
 _ssl_ctx = None
+# Maximum bytes to accumulate in the stream line buffer before forcing a flush.
+# Prevents unbounded memory growth if upstream sends a huge line without newlines.
+_MAX_STREAM_LINE_BYTES = 10 * 1024 * 1024  # 10 MB
 # A cache entry is a single immutable tuple, never a dict of separate keys:
 # readers grab one reference (atomic under the GIL), so `str` from one file
 # generation can never be paired with `sapisid`/`mtime` from another while a
@@ -31,6 +34,23 @@ _httpx_client = None
 # requests racing on the `None` check would each build an httpx.Client and one
 # of them would be dropped without ever being closed.
 _httpx_lock = threading.Lock()
+
+# Track config values used to create the httpx client so we can detect
+# changes and rebuild the client when needed.
+_httpx_client_config = {"proxy": None, "timeout": None}
+
+# Lock for CONFIG mutations that touch multiple fields or depend on prior reads.
+# Separate from _bl_lock to avoid cross-lock contention with BL auto-refresh.
+_config_mutex = threading.Lock()
+
+# Lock for cookie file reads to avoid redundant I/O under high concurrency.
+_cookie_file_lock = threading.Lock()
+
+# Minimum interval (seconds) between cookie file mtime checks to avoid
+# redundant I/O on filesystems with coarse mtime granularity.
+_COOKIE_MTIME_MIN_INTERVAL = 1.0
+# Last time cookie mtime was checked.
+_cookie_last_mtime_check = 0.0
 
 
 def log(msg: str):
@@ -119,10 +139,11 @@ def fetch_latest_bl():
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                 urllib.request.HTTPSHandler(context=ctx),
             )
-            resp = opener.open(req, timeout=15)
+            with opener.open(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
         else:
-            resp = urllib.request.urlopen(req, context=ctx, timeout=15)
-        html = resp.read().decode("utf-8", errors="replace")
+            with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
         # The label family is not stable: Google renamed
         # ``boq_assistant-bard-web-server_20260716.08_p0`` to
         # ``boq_gemini-web-uiserver_20261007.12_p0`` when the UI was rebuilt,
@@ -162,7 +183,8 @@ def update_bl_if_needed() -> bool:
         new_bl = fetch_latest_bl()
         if new_bl and new_bl != CONFIG["gemini_bl"]:
             log(f"BL auto-updated: {CONFIG['gemini_bl']} -> {new_bl}")
-            CONFIG["gemini_bl"] = new_bl
+            with _config_mutex:
+                CONFIG["gemini_bl"] = new_bl
             return True
         return False
     finally:
@@ -177,59 +199,93 @@ def _get_ssl_ctx():
 
 
 def _get_httpx_client():
-    global _httpx_client
-    if _httpx_client is None and HAS_HTTPX:
-        with _httpx_lock:
-            # Re-checked inside the lock: only the thread that created the
-            # client assigns it, the rest reuse the same one.
-            if _httpx_client is None:
-                proxy = CONFIG.get("proxy")
-                transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-                _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
-    return _httpx_client
+    """Get or create the httpx client, rebuilding if proxy/timeout config changed.
+
+    All reads/writes of shared state are inside the lock to prevent races.
+    """
+    global _httpx_client, _httpx_client_config
+    if not HAS_HTTPX:
+        return None
+    with _httpx_lock:
+        proxy = CONFIG.get("proxy")
+        timeout = CONFIG.get("request_timeout_sec")
+        need_rebuild = (
+            _httpx_client is None
+            or _httpx_client_config["proxy"] != proxy
+            or _httpx_client_config["timeout"] != timeout
+        )
+        if need_rebuild:
+            # Close old client if exists.
+            if _httpx_client is not None:
+                try:
+                    _httpx_client.close()
+                except Exception:
+                    pass
+            transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+            _httpx_client = httpx.Client(transport=transport, timeout=timeout, verify=True)
+            _httpx_client_config["proxy"] = proxy
+            _httpx_client_config["timeout"] = timeout
+        return _httpx_client
 
 
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
-    global _cookie_cache
+    global _cookie_cache, _cookie_last_mtime_check
     cookie_file = CONFIG.get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     cached_str, cached_sapisid, cached_mtime = _cookie_cache
     try:
+        # Throttle mtime checks to avoid redundant I/O on filesystems with
+        # coarse mtime granularity (e.g., FAT, some network mounts).
+        now = time.time()
+        if now - _cookie_last_mtime_check < _COOKIE_MTIME_MIN_INTERVAL:
+            # Return cached value without hitting disk.
+            if cached_str:
+                return cached_str, cached_sapisid
+        _cookie_last_mtime_check = now
         mtime = os.path.getmtime(cookie_file)
         if mtime == cached_mtime and cached_str:
             return cached_str, cached_sapisid
-        with open(cookie_file, "r") as f:
-            content = f.read().strip()
-        if content.startswith("{"):
-            data = json.loads(content)
-            cookie_str = data.get("cookie", "")
-            sapisid = data.get("sapisid", "")
-            # The bundled extension exports {cookie, sapisid, auth_user,
-            # xsrf_token, gemini_bl} in one file. Ignore the extra fields and
-            # StreamGenerate goes out without its `at` form field (HTTP 400)
-            # and with whatever stale build label happens to be configured,
-            # so sync them here: pointing cookie_file at the export must be
-            # enough on its own.
-            if data.get("xsrf_token"):
-                CONFIG["xsrf_token"] = data["xsrf_token"]
-            if data.get("auth_user") not in (None, ""):
-                CONFIG["auth_user"] = data["auth_user"]
-            # The export's build label loses to a live one: the startup fetch
-            # and the 405 auto-refresh both write CONFIG first, and an
-            # operator-pinned label (anything but the built-in default) is
-            # deliberate. Only when auto-update is off and nothing was ever
-            # configured does the export fill the gap -- otherwise every
-            # cookie-file touch re-installs a stale label over a fresh one.
-            if data.get("gemini_bl"):
-                if (not CONFIG.get("auto_update_bl", True)
-                        and CONFIG.get("gemini_bl") == DEFAULT_CONFIG.get("gemini_bl")):
-                    CONFIG["gemini_bl"] = data["gemini_bl"]
-        else:
-            cookie_str = content
-            pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
-            sapisid = pairs.get("SAPISID", "")
+        # Serialize file reads and associated CONFIG updates to avoid
+        # redundant I/O, partial reads, and interleaved config mutations
+        # under concurrent requests.
+        with _cookie_file_lock:
+            # Re-check mtime after acquiring lock (another thread may have updated).
+            mtime = os.path.getmtime(cookie_file)
+            if mtime == cached_mtime and cached_str:
+                return cached_str, cached_sapisid
+            with open(cookie_file, "r") as f:
+                content = f.read().strip()
+            if content.startswith("{"):
+                data = json.loads(content)
+                cookie_str = data.get("cookie", "")
+                sapisid = data.get("sapisid", "")
+                # The bundled extension exports {cookie, sapisid, auth_user,
+                # xsrf_token, gemini_bl} in one file. Ignore the extra fields and
+                # StreamGenerate goes out without its `at` form field (HTTP 400)
+                # and with whatever stale build label happens to be configured,
+                # so sync them here: pointing cookie_file at the export must be
+                # enough on its own.
+                with _config_lock_ctx():
+                    if data.get("xsrf_token"):
+                        CONFIG["xsrf_token"] = data["xsrf_token"]
+                    if data.get("auth_user") not in (None, ""):
+                        CONFIG["auth_user"] = data["auth_user"]
+                    # The export's build label loses to a live one: the startup fetch
+                    # and the 405 auto-refresh both write CONFIG first, and an
+                    # operator-pinned label (anything but the built-in default) is
+                    # deliberate. Only when auto-update is off and nothing was ever
+                    # configured does the export fill the gap -- otherwise every
+                    # cookie-file touch re-installs a stale label over a fresh one.
+                    if data.get("gemini_bl"):
+                        if (not CONFIG.get("auto_update_bl", True)
+                                and CONFIG.get("gemini_bl") == DEFAULT_CONFIG.get("gemini_bl")):
+                            CONFIG["gemini_bl"] = data["gemini_bl"]
+            else:
+                cookie_str = content
+                pairs = dict(p.split("=", 1) for p in cookie_str.split("; ") if "=" in p)
+                sapisid = pairs.get("SAPISID", "")
         # One atomic swap: a reader either sees the whole old entry or the
         # whole new one.
         _cookie_cache = (cookie_str, sapisid or None, mtime)
@@ -415,7 +471,9 @@ def _extract_texts_from_line(line: str) -> list:
 # bracket -- so the rejection used to fall through as an empty reply and the
 # real reason (often transient: the same request succeeds minutes later)
 # never reached the log or the client.
-_BARD_ERROR_RE = re.compile(r'BardErrorInfo["\]]*[\s,]*\[(\d+)\]')
+# Match: BardErrorInfo followed by any punctuation/quotes, then optional
+# whitespace/commas, then [CODE] or "CODE" or just CODE digits.
+_BARD_ERROR_RE = re.compile(r'BardErrorInfo[^0-9]*[\[,]?\s*["\]]?\s*(\d+)')
 
 # Codes Google is known to return, appended as a human-readable hint.
 BARD_ERROR_HINTS = {
@@ -554,10 +612,11 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                with opener.open(req, timeout=CONFIG["request_timeout_sec"]) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
-            raw = resp.read().decode("utf-8", errors="replace")
+                with urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"]) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
             if CONFIG.get("debug_raw"):
                 _dump_raw(raw)
             trace("MODEL -> PROXY", raw)
@@ -614,6 +673,45 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 for chunk in resp.iter_text():
                     buf += chunk
                     raw_full += chunk
+                    # Enforce max line buffer to prevent unbounded memory growth
+                    # if upstream sends a massive line without newlines.
+                    if len(buf) > _MAX_STREAM_LINE_BYTES:
+                        log(f"Stream line buffer exceeded {_MAX_STREAM_LINE_BYTES} bytes, forcing flush")
+                        # Process what we have as a pseudo-line.
+                        texts = _extract_texts_from_line(buf)
+                        for index, t in enumerate(texts):
+                            if t == emitted_raw_text or emitted_raw_text.startswith(t):
+                                continue
+                            if index:
+                                block = clean_text(t, strip=False)
+                                if block:
+                                    emitted_any = True
+                                    yield block
+                                continue
+                            if t.startswith(emitted_raw_text):
+                                clean_buf += t[len(emitted_raw_text):]
+                                emitted_raw_text = t
+                            else:
+                                common_len = 0
+                                min_len = min(len(t), len(emitted_raw_text))
+                                while common_len < min_len and t[common_len] == emitted_raw_text[common_len]:
+                                    common_len += 1
+                                if common_len > 0:
+                                    clean_buf = t[common_len:]
+                                    emitted_raw_text = t
+                                else:
+                                    clean_buf = t
+                                    emitted_raw_text = t
+                        if _holds_scaffold(clean_buf):
+                            # Hold incomplete scaffold blocks.
+                            pass
+                        else:
+                            delta = clean_text(clean_buf, strip=False)
+                            clean_buf = ""
+                            if delta:
+                                emitted_any = True
+                                yield delta
+                        buf = ""  # Force clear buffer after processing.
                     if "BardErrorInfo" in buf:
                         raise_bard_error(buf)
                     while "\n" in buf:
@@ -639,12 +737,25 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 emitted_raw_text = t
                             else:
                                 # First text of the line disagrees with everything
-                                # emitted so far, i.e. upstream restarted. Keep the
-                                # stream alive rather than failing the request; the
-                                # sample lets a real payload be inspected later.
-                                log(f"Stream segment without prefix relation, "
-                                    f"skipping: {t[:120]!r}")
-                                continue
+                                # emitted so far. Upstream may have reset or corrected.
+                                # Try to find the longest common prefix to salvage
+                                # continuity; if none, reset tracking and continue
+                                # from the new text to avoid dropping data.
+                                common_len = 0
+                                min_len = min(len(t), len(emitted_raw_text))
+                                while common_len < min_len and t[common_len] == emitted_raw_text[common_len]:
+                                    common_len += 1
+                                if common_len > 0:
+                                    # Salvage the delta after the common prefix.
+                                    clean_buf = t[common_len:]
+                                    emitted_raw_text = t
+                                    log(f"Stream prefix reset at {common_len} chars, continuing")
+                                else:
+                                    # No common prefix: full reset. Emit the new text
+                                    # from scratch rather than dropping it.
+                                    clean_buf = t
+                                    emitted_raw_text = t
+                                    log(f"Stream full reset, emitting new segment: {t[:120]!r}")
                             if _holds_scaffold(clean_buf):
                                 # Inside an open upstream scaffolding block:
                                 # hold until it closes so clean_text can drop it
@@ -656,10 +767,18 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                                 emitted_any = True
                                 yield delta
             if clean_buf:
-                # If the stream ended inside an open scaffolding fence, strip it
+                # If the stream ended inside an open scaffolding fence, handle it.
                 if _holds_scaffold(clean_buf):
                     open_at = clean_buf.rfind("```")
-                    clean_buf = clean_buf[:open_at]
+                    # If we have an opening fence but no closing, emit content
+                    # before the fence and log the truncation. This preserves
+                    # legitimate text that appeared before the malformed block.
+                    if open_at >= 0:
+                        before_fence = clean_buf[:open_at]
+                        log(f"Stream ended with unclosed scaffolding fence, emitting content before fence ({len(before_fence)} chars)")
+                        clean_buf = before_fence
+                    else:
+                        clean_buf = ""
                 delta = clean_text(clean_buf, strip=False)
                 if delta:
                     yield delta

@@ -10,7 +10,7 @@ import ssl
 import re
 from urllib.parse import urlparse
 
-from .config import CONFIG
+from .config import CONFIG, _config_lock_ctx
 from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
 
 
@@ -50,7 +50,8 @@ def _get_page_tokens() -> dict:
         # stale `at` form field stops failing StreamGenerate with HTTP 400.
         m = re.search(r'"SNlM0e":"([^"]+)"', html)
         if m:
-            CONFIG["xsrf_token"] = m.group(1)
+            with _config_lock_ctx():
+                CONFIG["xsrf_token"] = m.group(1)
             log("xsrf_token refreshed from the Gemini page")
         return tokens
     except Exception as e:
@@ -167,35 +168,46 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 _MAX_IMAGE_BYTES = 16 * 1024 * 1024
 
 
-def _host_is_private(hostname: str) -> bool:
-    """True when ``hostname`` resolves only to non-public IP addresses.
+def _resolve_public_ip(hostname: str) -> str | None:
+    """Resolve hostname and return a single public IP, or None if blocked.
 
-    A literal IP is checked without any DNS; anything else goes through
-    ``getaddrinfo`` and every resolved address must be global. Blocks
-    loopback, private, link-local, multicast, reserved and unspecified
-    targets -- the fetch URL comes from the client, and without this the
-    server is an open proxy into the operator's own network.
+    This resolves DNS *once* and validates all addresses are global.
+    The caller must then connect directly to this IP to prevent
+    DNS-rebinding / TOCTOU attacks.
     """
     if not hostname:
-        return True
+        return None
     host = hostname.strip().rstrip(".").strip("[]")
+    # Literal IP: check directly.
     try:
-        return not ipaddress.ip_address(host).is_global
+        return host if ipaddress.ip_address(host).is_global else None
     except ValueError:
         pass
+    # Hostname: resolve and validate all addresses.
     try:
         infos = socket.getaddrinfo(host, None)
     except (socket.gaierror, UnicodeError):
-        return True
+        return None
     if not infos:
-        return True
+        return None
+    public_ip = None
     for info in infos:
         try:
-            if not ipaddress.ip_address(info[4][0]).is_global:
-                return True
+            addr = ipaddress.ip_address(info[4][0])
+            if not addr.is_global:
+                return None  # Any non-global address blocks the whole host.
+            public_ip = str(addr)  # Remember first global address.
         except ValueError:
-            return True
-    return False
+            return None
+    return public_ip
+
+
+def _host_is_private(hostname: str) -> bool:
+    """True when ``hostname`` resolves only to non-public IP addresses.
+
+    Delegates to ``_resolve_public_ip`` for the actual check.
+    """
+    return _resolve_public_ip(hostname) is None
 
 
 def fetch_image_bytes(url: str) -> bytes:
@@ -207,18 +219,36 @@ def fetch_image_bytes(url: str) -> bytes:
     if _host_is_private(parsed.hostname or ""):
         log(f"Image fetch blocked for non-public target: {parsed.hostname or 'none'}")
         return b""
+    # Resolve IP once and connect directly to prevent DNS-rebinding / TOCTOU.
+    target_ip = _resolve_public_ip(parsed.hostname or "")
+    if not target_ip:
+        log(f"Image fetch blocked: could not resolve public IP for {parsed.hostname}")
+        return b""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        # Reconstruct URL with resolved IP, keeping original Host header.
+        # This avoids fragile string replacement on the full URL.
+        netloc = f"{target_ip}:{parsed.port}" if parsed.port else target_ip
+        reconstructed = parsed._replace(netloc=netloc).geturl()
+        req = urllib.request.Request(
+            reconstructed,
+            headers={"User-Agent": "Mozilla/5.0", "Host": parsed.hostname},
+            method="GET",
+        )
         proxy = CONFIG.get("proxy")
         if proxy:
+            # With proxy, we can't pin the IP; rely on proxy's DNS.
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                 urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
             )
-            resp = opener.open(req, timeout=30)
+            with opener.open(req, timeout=30) as resp:
+                data = resp.read(_MAX_IMAGE_BYTES + 1)
         else:
-            resp = urllib.request.urlopen(req, context=_get_ssl_ctx(), timeout=30)
-        data = resp.read(_MAX_IMAGE_BYTES + 1)
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=_get_ssl_ctx()),
+            )
+            with opener.open(req, timeout=30) as resp:
+                data = resp.read(_MAX_IMAGE_BYTES + 1)
         if len(data) > _MAX_IMAGE_BYTES:
             log(f"Image fetch failed: body exceeds {_MAX_IMAGE_BYTES} bytes")
             return b""

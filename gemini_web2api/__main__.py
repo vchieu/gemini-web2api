@@ -4,7 +4,7 @@ import os
 import sys
 import uuid
 
-from .config import CONFIG, load_config, find_config
+from .config import CONFIG, load_config, find_config, _config_lock_ctx
 from .models import MODELS, ticket_warnings
 from .gemini import HAS_HTTPX, fetch_latest_bl, log
 from .server import GeminiHandler, ThreadedServer
@@ -45,7 +45,17 @@ def _guard_bind(host, allow_insecure: bool) -> None:
     key = uuid.uuid4().hex[:32] + uuid.uuid4().hex[:32]
     sys.stderr.write(f"Auto-generated API key (print this): {key}\n")
     sys.stderr.flush()
-    CONFIG["api_keys"] = [key]
+    # Also write to log file if configured, so Docker users can find it even
+    # when stderr is swallowed by the launcher.
+    log_path = CONFIG.get("log_file")
+    if log_path:
+        try:
+            with open(log_path, "a", encoding="utf-8") as fh:
+                fh.write(f"Auto-generated API key (print this): {key}\n")
+        except OSError:
+            pass
+    with _config_lock_ctx():
+        CONFIG["api_keys"] = [key]
 
 
 def _maybe_refresh_bl() -> None:
@@ -58,7 +68,8 @@ def _maybe_refresh_bl() -> None:
         return
     new_bl = fetch_latest_bl()
     if new_bl:
-        CONFIG["gemini_bl"] = new_bl
+        with _config_lock_ctx():
+            CONFIG["gemini_bl"] = new_bl
 
 
 def main():
@@ -81,13 +92,17 @@ def main():
         load_config(config_path)
 
     if args.host:
-        CONFIG["host"] = args.host
+        with _config_lock_ctx():
+            CONFIG["host"] = args.host
     if args.port:
-        CONFIG["port"] = args.port
+        with _config_lock_ctx():
+            CONFIG["port"] = args.port
     if args.cookie_file:
-        CONFIG["cookie_file"] = args.cookie_file
+        with _config_lock_ctx():
+            CONFIG["cookie_file"] = args.cookie_file
     if args.proxy:
-        CONFIG["proxy"] = args.proxy
+        with _config_lock_ctx():
+            CONFIG["proxy"] = args.proxy
 
     # Refresh the Gemini build label; stale labels make every request fail.
     _maybe_refresh_bl()

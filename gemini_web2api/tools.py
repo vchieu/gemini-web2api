@@ -708,7 +708,20 @@ def _arguments_json(args) -> tuple:
         except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
             recovered = _NOTHING
         if isinstance(recovered, dict):
-            return json.dumps(recovered, ensure_ascii=False), None
+            try:
+                return json.dumps(recovered, ensure_ascii=False), None
+            except (TypeError, ValueError):
+                # recovered contains non-JSON-serializable types (set, tuple,
+                # bytes, etc.). Convert to a best-effort JSON-safe dict.
+                def json_safe(obj):
+                    if isinstance(obj, dict):
+                        return {str(k): json_safe(v) for k, v in obj.items()}
+                    if isinstance(obj, (list, tuple, set)):
+                        return [json_safe(v) for v in obj]
+                    if isinstance(obj, (str, int, float, bool)) or obj is None:
+                        return obj
+                    return str(obj)
+                return json.dumps(json_safe(recovered), ensure_ascii=False), None
         return "{}", "not a JSON object"
     if args is None:
         return "{}", "missing"

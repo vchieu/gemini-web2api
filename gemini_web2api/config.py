@@ -1,6 +1,7 @@
 """Configuration management."""
 import json
 import os
+import threading
 
 DEFAULT_CONFIG = {
     "port": 8081,
@@ -82,6 +83,18 @@ DEFAULT_CONFIG = {
 }
 
 CONFIG = dict(DEFAULT_CONFIG)
+
+# Global lock for CONFIG mutations across threads. Acquire before reading
+# multiple interdependent fields or writing any field. Not needed for single
+# reads under the GIL, but required when: (1) multiple fields must be read
+# atomically, (2) a write depends on a prior read, or (3) code modifies
+# CONFIG outside this module.
+_config_lock = threading.Lock()
+
+
+def _config_lock_ctx():
+    """Context manager for CONFIG mutations (keeps call sites clean)."""
+    return _config_lock
 
 
 def load_config(path: str = None):

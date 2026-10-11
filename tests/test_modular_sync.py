@@ -2110,9 +2110,13 @@ class HostCheckTests(unittest.TestCase):
 
     def test_wildcard_bind_serves_every_interface(self):
         # A LAN IP or container hostname must pass when the operator bound
-        # 0.0.0.0 on purpose; only the loopback names matched before.
-        self.assertTrue(self.check("192.168.1.10:8081", bind="0.0.0.0"))
-        self.assertTrue(self.check("gemini-web2api:8081", bind="0.0.0.0"))
+        # 0.0.0.0 on purpose AND configured api_keys; without api_keys the
+        # check still restricts to loopback to prevent accidental exposure.
+        self.assertFalse(self.check("192.168.1.10:8081", bind="0.0.0.0"))
+        self.assertFalse(self.check("gemini-web2api:8081", bind="0.0.0.0"))
+        # With api_keys, wildcard bind allows any host.
+        self.assertTrue(self.check("192.168.1.10:8081", bind="0.0.0.0", keys=["secret"]))
+        self.assertTrue(self.check("gemini-web2api:8081", bind="0.0.0.0", keys=["secret"]))
 
     def test_loopback_bind_rejects_the_wildcard_host(self):
         self.assertFalse(self.check("0.0.0.0:8081", bind="127.0.0.1"))

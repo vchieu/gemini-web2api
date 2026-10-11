@@ -48,6 +48,12 @@ class _FakeResponse:
     def read(self):
         return self._body
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
 
 class FetchLatestBlTests(unittest.TestCase):
     """The label pattern must survive Google renaming the boq_* family."""

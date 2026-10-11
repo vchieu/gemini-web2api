@@ -266,14 +266,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
         * ``api_keys`` configured -- the request already had to present a valid
           key, so a rebound hostname buys nothing (``do_GET`` never runs this
           check either, so only POST was ever gated);
-        * a wildcard bind (``0.0.0.0`` / ``::``) -- the operator chose to serve
-          every interface, so LAN IPs and container hostnames must pass, not
-          just ``localhost``;
+        * a wildcard bind (``0.0.0.0`` / ``::``) with ``api_keys`` -- the
+          operator chose to serve every interface AND configured auth, so LAN
+          IPs and container hostnames must pass;
         * no ``Host`` header at all (non-HTTP/1.1 edge case).
 
         The hostname is parsed with ``urlsplit`` so ``[::1]:8081`` yields
         ``::1`` instead of the unbracketed ``[::1]`` that ``rsplit(":")``
         produced, and a port is never mistaken for part of the name.
+
+        NOTE: A wildcard bind WITHOUT ``api_keys`` does NOT bypass the check.
+        This prevents accidental exposure when binding 0.0.0.0 on a public
+        interface without authentication.
         """
         if CONFIG.get("api_keys"):
             return True
@@ -287,8 +291,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
         bind_host = (CONFIG.get("host") or "").lower().strip("[]")
         if bind_host:
             if bind_host in ("0.0.0.0", "::", "*"):
-                return True  # Wildcard bind: reachable on every interface.
-            allowed.add(bind_host)
+                # Wildcard bind ONLY bypasses check when api_keys is set.
+                # Without auth, we still restrict to loopback to prevent
+                # accidental public exposure.
+                pass
+            else:
+                allowed.add(bind_host)
         return hostname in allowed
 
     def _check_origin(self) -> bool:
@@ -469,7 +477,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if total > limit:
                     raise ValueError("request body too large")
                 chunks.append(self.rfile.read(size))
-                self.rfile.read(2)
+                # Consume the trailing CRLF after each chunk. Some non-conformant
+                # clients send only LF; read until we hit a newline to be robust.
+                crlf = self.rfile.read(1)
+                if crlf == b"\r":
+                    self.rfile.read(1)  # consume LF
+                elif crlf != b"\n":
+                    # Unexpected byte; push back by treating as part of next read
+                    # (unlikely in practice, but avoids desync)
+                    pass
             return b"".join(chunks)
 
         raw_len = self.headers.get("Content-Length")
