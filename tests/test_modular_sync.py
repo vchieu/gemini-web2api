@@ -2530,6 +2530,58 @@ class PendingToolRequestTests(unittest.TestCase):
             {"role": "tool", "content": "print('hi')", "tool_call_id": "c1"},
         ]))
 
+    def test_source_review_one_read_with_two_candidates_still_owed(self):
+        reason = pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+        ])
+        self.assertEqual(reason, SOURCE_REVIEW_OWED)
+
+    def test_source_review_two_distinct_reads_end_the_check(self):
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c2", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "b.py"}'}}]},
+            {"role": "tool", "content": "print('b')", "tool_call_id": "c2"},
+        ]))
+
+    def test_source_review_one_read_with_one_candidate_ends_the_check(self):
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "a.py", "tool_call_id": "c1"},
+        ]))
+
+    def test_source_review_dot_path_does_not_count_as_a_file(self):
+        reason = pending_tool_request([
+            {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "."}'}}]},
+            {"role": "tool", "content": "a.py\nb.py", "tool_call_id": "c1"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c2", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": '{"path": "a.py"}'}}]},
+            {"role": "tool", "content": "print('a')", "tool_call_id": "c2"},
+        ])
+        self.assertEqual(reason, SOURCE_REVIEW_OWED)
+
     def test_source_review_grep_without_a_path_still_counts_as_reading(self):
         """A ``grep`` with no path in its args still read content.
 
@@ -2613,6 +2665,7 @@ class PendingToolRequestTests(unittest.TestCase):
         self.assertNotIn("func_name", prompt)
         self.assertIn('never beside "name"', prompt)
         self.assertIn('"commands"', prompt)
+        self.assertIn("reading one file is not reviewing a codebase", prompt)
 
 
 class GoogleFunctionCallParsingTests(unittest.TestCase):
@@ -3122,7 +3175,7 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         self.assertEqual(generate.call_count, 2)
         self.assertEqual(tool_calls[0]["function"]["name"], "read")
         nudge = generate.call_args_list[1].args[0]
-        self.assertIn("listing file names is not reading", nudge)
+        self.assertTrue("not read enough" in nudge or "not a review" in nudge)
         self.assertIn("a.py", nudge)
 
     def test_demand_false_positives_stay_silent(self):

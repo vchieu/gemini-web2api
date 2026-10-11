@@ -747,9 +747,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 # instead: the permissive "otherwise give your final answer"
                 # is what let the model answer from filenames alone.
                 if not required_tool and is_read_retry_reason(owed):
-                    nudge = ("IMPORTANT: You have not read any file's contents yet -- "
-                             "listing file names is not reading them. Call the read tool now "
-                             "on the most relevant file(s) and answer from what you actually read.")
+                    nudge = ("IMPORTANT: You have not read enough of the source yet -- "
+                             "listing file names, or opening a single file, is not a review. Call the read tool now "
+                             "on the other relevant module(s) and answer from what you actually read.")
                     if files:
                         nudge += " Read these first: " + ", ".join(files[:8]) + "."
                 else:

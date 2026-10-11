@@ -433,8 +433,9 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "never any prose after the block.\n"
         "- Before answering a request to review, audit, inspect or find bugs in "
         "source code, you MUST read the actual contents of the relevant files with "
-        "a read/search tool first. Listing or globbing file names is not reading: "
-        "if you have only listed files, read the most relevant ones before you "
+        "a read/search tool first -- reading one file is not reviewing a codebase. "
+        "Listing or globbing file names is not reading: "
+        "if you have only listed or opened one file, read the other relevant ones before you "
         "answer.\n"
         "- Output ONLY tool_call block(s): no prose, explanation or apology "
         "before or after them.\n"
@@ -1339,20 +1340,25 @@ def _turn_tool_calls(messages, start_idx) -> list:
     return calls
 
 
-def _content_read_this_turn(messages) -> bool:
-    """True when this turn read content rather than only listing names."""
+def _reads_this_turn(messages) -> int:
+    """Number of distinct content reads in this turn."""
     start_idx = _last_user_index(messages)
+    files = set()
+    unnamed = False
     for tc in _turn_tool_calls(messages, start_idx):
         fn = tc.get("function") or {}
         name = fn.get("name") or ""
         args = fn.get("arguments")
         if not isinstance(args, str):
             args = json.dumps(args, ensure_ascii=False)
-        if _files_in(str(args or "")):
-            return True
-        if isinstance(name, str) and _READER_TOOL_RE.search(name):
-            return True
-    return False
+        found = {f.lower() for f in _files_in(str(args or ""))}
+        if found:
+            files |= found
+        elif isinstance(name, str) and _READER_TOOL_RE.search(name):
+            unnamed = True
+    if files:
+        return len(files)
+    return 1 if unnamed else 0
 
 
 def listed_turn_files(messages) -> list:
@@ -1467,8 +1473,12 @@ def pending_tool_request(messages) -> str:
                      or _is_file_review(folded, scannable))
     turn_has_call = any(isinstance(msg, dict) and msg.get("tool_calls")
                         for msg in messages[last_user_idx + 1:])
-    turn_read = _content_read_this_turn(messages)
-    if turn_has_call and (turn_read or not source_review):
+    required_reads = 1
+    if (_is_source_review(folded) and not _is_file_review(folded, scannable)
+            and len(listed_turn_files(messages)) >= 2):
+        required_reads = 2
+    reads = _reads_this_turn(messages)
+    if turn_has_call and (reads >= required_reads or not source_review):
         return None
 
     called_lower = {f.lower() for f in _conversation_called_files(messages)}
@@ -1479,7 +1489,7 @@ def pending_tool_request(messages) -> str:
     if uncovered:
         return "requested file(s) never read: " + ", ".join(uncovered)
 
-    if source_review and turn_has_call and not turn_read:
+    if source_review and turn_has_call and reads < required_reads:
         return SOURCE_REVIEW_OWED
 
     if _TOOL_DEMAND_RE.search(folded):
