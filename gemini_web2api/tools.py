@@ -1555,7 +1555,15 @@ def pending_tool_request(messages) -> str:
     required_reads = 1
     if (is_generic_source_review and not is_file_review
             and len(listed_turn_files(messages)) >= 2):
-        required_reads = 2
+        # Require reading most of the listed files for a genuine source review.
+        # Not just 2 -- model would read minimum and hallucinate the rest.
+        listed = listed_turn_files(messages)
+        # Core module files in gemini_web2api/ (exclude __pycache__, tests, etc.)
+        core_files = [f for f in listed if f.startswith("gemini_web2api/") and f.endswith(".py")]
+        if len(core_files) >= 5:
+            required_reads = max(5, len(core_files) - 1)
+        else:
+            required_reads = 2
     reads = _reads_this_turn(messages)
     if turn_has_call and (reads >= required_reads or not source_review):
         return None
