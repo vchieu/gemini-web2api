@@ -1290,11 +1290,11 @@ _TOOL_DEMAND_RE = re.compile(
 # listing-only turn (glob/list) must still count as owed here, while every
 # other demand keeps the old "any call ends the check" rule.
 _SOURCE_REVIEW_VERB_RE = re.compile(
-    r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim|xem\s+xet|doc)\b",
+    r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim|xem\s+xet|doc|danh\s+gia|danhgia)\b",
     re.IGNORECASE,
 )
 _SOURCE_NOUN_RE = re.compile(
-    r"\b(?:source|code|codebase|ma\s+nguon|implementation|repository|repo)\b",
+    r"\b(?:source|code|codebase|ma\s+nguon|implementation|repository|repo|ke\s+hoach|kehoach|plan|document|tai\s+lieu|tai-lieu|thiet\s+ke|thietke|design|specification|spec)\b",
     re.IGNORECASE,
 )
 
@@ -1386,6 +1386,23 @@ def _reads_this_turn(messages) -> int:
         name = fn.get("name") or ""
         if isinstance(name, str) and _READER_TOOL_RE.search(name):
             return 1
+    return 0
+
+
+def _source_reads_this_turn(messages) -> int:
+    """Number of distinct SOURCE CODE (.py) reads in this turn."""
+    files = files_read_in_turn(messages)
+    if files:
+        return len({f for f in files if f.lower().endswith(".py")})
+    start_idx = _last_user_index(messages)
+    for tc in _turn_tool_calls(messages, _last_user_index(messages)):
+        fn = tc.get("function") or {}
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            args = json.dumps(args, ensure_ascii=False)
+        found = {f for f in _files_in(str(args or "")) if f.lower().endswith(".py")}
+        if found:
+            return len(found)
     return 0
 
 
@@ -1559,18 +1576,32 @@ def pending_tool_request(messages) -> str:
     turn_has_call = any(isinstance(msg, dict) and msg.get("tool_calls")
                         for msg in messages[last_user_idx + 1:])
     required_reads = 1
-    if (is_generic_source_review and not is_file_review
-            and len(listed_turn_files(messages)) >= 2):
+    if (is_generic_source_review and len(listed_turn_files(messages)) >= 2):
         # Require reading most of the listed files for a genuine source review.
         # Not just 2 -- model would read minimum and hallucinate the rest.
+        # File reviews (review a specific file) are handled by the `uncovered` branch.
+        # Generic source reviews (review source/code/plan) require reading source code.
         listed = listed_turn_files(messages)
-        # Core module files in gemini_web2api/ (exclude __pycache__, tests, etc.)
-        core_files = [f for f in listed if f.startswith("gemini_web2api/") and f.endswith(".py")]
-        if len(core_files) >= 5:
-            required_reads = max(5, len(core_files) - 1)
+        # Detect project root from listed files (first path component).
+        # Count Python files in each project root, use the one with most files.
+        from collections import Counter
+        project_counts = Counter()
+        for f in listed:
+            if f.endswith(".py") and not f.startswith("__pycache__/"):
+                parts = f.split("/")
+                if len(parts) > 1:
+                    project_counts[parts[0]] += 1
+        if project_counts:
+            main_project = project_counts.most_common(1)[0][0]
+            core_files = [f for f in listed if f.startswith(main_project + "/") and f.endswith(".py")]
+            if len(core_files) >= 5:
+                required_reads = max(5, len(core_files) - 1)
+            else:
+                required_reads = 2
         else:
             required_reads = 2
     reads = _reads_this_turn(messages)
+    source_reads = _source_reads_this_turn(messages)
     if turn_has_call and (reads >= required_reads or not source_review):
         return None
 
@@ -1589,7 +1620,10 @@ def pending_tool_request(messages) -> str:
     if is_generic_source_review and declared and turn_has_call:
         return "declared file(s) never read: " + ", ".join(declared)
 
-    if source_review and turn_has_call and reads < required_reads:
+    # For generic source reviews, require reading source code files (.py).
+    # Use source_reads (only .py files) instead of total reads.
+    effective_reads = source_reads if is_generic_source_review else reads
+    if source_review and turn_has_call and effective_reads < required_reads:
         return SOURCE_REVIEW_OWED
 
     if _TOOL_DEMAND_RE.search(folded):

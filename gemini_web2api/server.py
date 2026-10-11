@@ -948,6 +948,28 @@ class GeminiHandler(BaseHTTPRequestHandler):
         if not isinstance(messages, list):
             self.send_api_error(400, "messages must be a list", ERR_INVALID_REQUEST)
             return
+
+        # Inject system instruction for source code review behavior.
+        # This teaches the model when to read source files before answering.
+        source_review_instruction = (
+            "When asked to review, audit, inspect, or evaluate a plan/document/design, "
+            "you MUST first read the relevant source code files to verify claims. "
+            "If a plan says 'Source: reading full code + diff', read the actual source files "
+            "mentioned before answering. Never answer based only on the plan document - "
+            "ground your review in the actual codebase. Use the read tool on each relevant "
+            "file before providing your evaluation.\n\n"
+            "To find relevant source files: FIRST use glob with patterns like "
+            "**/hand*.py, **/hand3d.py, **/handmesh.py, **/handspec.py, **/vkeyboard.py, "
+            "**/audio.py, **/scorereader.py, **/utils.py, **/scorer/*.py, **/player/*.py "
+            "to discover the codebase structure. THEN read each relevant file. "
+            "A plan review is NOT complete until you have read the source files it references."
+        )
+        if not messages or messages[0].get("role") != "system":
+            messages = [{"role": "system", "content": source_review_instruction}] + messages
+        elif "review" in (messages[0].get("content", "").lower()):
+            # Prepend to existing system instruction if it's about review
+            messages[0]["content"] = source_review_instruction + "\n\n" + messages[0]["content"]
+
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
 
         rf_instruction = build_response_format_instruction(req.get("response_format"))
@@ -1503,6 +1525,42 @@ class GeminiHandler(BaseHTTPRequestHandler):
         tool_config = req.get("toolConfig", {})
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
+
+        # Inject system instruction for source code review behavior (same as OpenAI path).
+        source_review_instruction = (
+            "When asked to review, audit, inspect, or evaluate a plan/document/design, "
+            "you MUST first read the relevant source code files to verify claims. "
+            "If a plan says 'Source: reading full code + diff', read the actual source files "
+            "mentioned before answering. Never answer based only on the plan document - "
+            "ground your review in the actual codebase. Use the read tool on each relevant "
+            "file before providing your evaluation.\n\n"
+            "To find relevant source files: FIRST use glob with patterns like "
+            "**/hand*.py, **/hand3d.py, **/handmesh.py, **/handspec.py, **/vkeyboard.py, "
+            "**/audio.py, **/scorereader.py, **/utils.py, **/scorer/*.py, **/player/*.py "
+            "to discover the codebase structure. THEN read each relevant file. "
+            "A plan review is NOT complete until you have read the source files it references."
+        )
+        sys_inst = req.get("systemInstruction")
+        if sys_inst:
+            sys_parts = sys_inst.get("parts", [])
+            sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
+            if sys_text and "review" in sys_text.lower():
+                # Prepend to existing system instruction
+                for p in sys_parts:
+                    if p.get("text"):
+                        p["text"] = source_review_instruction + "\n\n" + p["text"]
+                        break
+            elif sys_text:
+                # Replace with our instruction
+                for p in sys_parts:
+                    if p.get("text"):
+                        p["text"] = source_review_instruction
+                        break
+        else:
+            req["systemInstruction"] = {
+                "parts": [{"text": source_review_instruction}]
+            }
+
         prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_google_error(400, "empty content", "INVALID_ARGUMENT")
