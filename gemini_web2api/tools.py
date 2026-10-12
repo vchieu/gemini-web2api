@@ -214,6 +214,37 @@ def missing_required_params(tool_calls, required) -> list:
 _TRUNCATION_MARKER = "[...truncated...]"
 
 
+def _utf8_safe_slice(data: bytes, start: int, end: int) -> bytes:
+    """Slice bytes, snapping to valid UTF-8 character boundaries.
+
+    Raw byte slicing cuts multi-byte characters in half; ``decode``
+    with ``errors="ignore"`` then silently drops the fragments.
+    Snapping to boundaries keeps whole characters intact.
+    """
+    if start >= end:
+        return b""
+    # Advance past any partial continuation byte at the start.
+    while start < end and (data[start] & 0xC0) == 0x80:
+        start += 1
+    # Find the first byte of the character that ends at end-1.
+    pos = end - 1
+    while pos > start and (data[pos] & 0xC0) == 0x80:
+        pos -= 1
+    first = data[pos]
+    if first & 0xE0 == 0xC0:
+        char_len = 2
+    elif first & 0xF0 == 0xE0:
+        char_len = 3
+    elif first & 0xF8 == 0xF0:
+        char_len = 4
+    else:
+        char_len = 1
+    # If the character extends past end, it is cut off: drop it.
+    if pos + char_len > end:
+        end = pos
+    return data[start:end]
+
+
 def _squeeze_part(part: str, cap: int) -> str:
     """Reduce one message to ~``cap`` bytes, keeping both its ends.
 
@@ -236,9 +267,10 @@ def _squeeze_part(part: str, cap: int) -> str:
     if head_len <= 0 or tail_len <= 0:
         # Degenerate cap: fall back to keeping the tail end only, which at
         # least preserves a question asked at the end of the message.
-        return raw[-cap:].decode("utf-8", errors="ignore")
-    squeezed = (raw[:head_len] + b"\n" + marker + b"\n"
-                + raw[-tail_len:])
+        return _utf8_safe_slice(raw, len(raw) - cap, len(raw)).decode(
+            "utf-8", errors="ignore")
+    squeezed = (_utf8_safe_slice(raw, 0, head_len) + b"\n" + marker + b"\n"
+                + _utf8_safe_slice(raw, len(raw) - tail_len, len(raw)))
     return squeezed.decode("utf-8", errors="ignore")
 
 
@@ -598,7 +630,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                             elif isinstance(c.get("text"), str):
                                 text_parts.append(c["text"])
                         next_content = " ".join(p for p in text_parts if p)
-                    name = next_msg.get("name") or id_to_name.get(tcid, "")
+                    name = next_msg.get("name") or id_to_name.get(tcid) or "tool"
                     body = _stringify_content(next_content)
                     combined += f"\n[Tool result for {name} (id={tcid})]: {body}"
                 parts.append(combined)
@@ -609,7 +641,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             # Skip if already combined with assistant tool_call
             if tcid in combined_tool_result_ids:
                 continue
-            name = msg.get("name") or id_to_name.get(tcid, "")
+            name = msg.get("name") or id_to_name.get(tcid) or "tool"
             body = _stringify_content(content)
             parts.append(f"[Tool result for {name} (id={tcid})]: {body}")
         else:
