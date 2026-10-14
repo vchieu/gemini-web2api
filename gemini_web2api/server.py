@@ -191,6 +191,32 @@ def _tool_retry_attempts(required_tool: bool, tools_active: bool) -> int:
     return 1 + max(0, extra)
 
 
+def _google_declared(req) -> tuple:
+    """``(allowed_names, schemas, required)`` from a Google native request.
+
+    Mirrors :func:`tool_names` / :func:`tool_parameters` /
+    :func:`tool_required_params` for ``functionDeclarations`` so the retry
+    loop can normalise names, infer nothing silently, and demand required
+    parameters -- the parity the OpenAI path already has.
+    """
+    allowed, schemas, required = set(), {}, {}
+    for tool_group in req.get("tools") or []:
+        if not isinstance(tool_group, dict):
+            continue
+        for fn in tool_group.get("functionDeclarations", []) or []:
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            name = fn["name"]
+            allowed.add(name)
+            params = fn.get("parameters") or fn.get("parametersJsonSchema") or {}
+            props = params.get("properties") if isinstance(params, dict) else None
+            schemas[name] = set(props) if isinstance(props, dict) else set()
+            req_list = params.get("required") if isinstance(params, dict) else None
+            if isinstance(req_list, list):
+                required[name] = {n for n in req_list if isinstance(n, str)}
+    return allowed or None, schemas or None, required or None
+
+
 def _log_tool_trace(raw_text: str, tool_calls) -> None:
     """Log what the model emitted and what was parsed out of it.
 
@@ -198,6 +224,11 @@ def _log_tool_trace(raw_text: str, tool_calls) -> None:
     indistinguishable, from the client's side, from a model that simply wrote
     ``{"arguments": {}}``. The raw block is the only place that shows whether
     the model or the parser is at fault, so log it whenever tools are involved.
+
+    Argument values are truncated (per-call and per-value caps): a ``write``
+    call carries a whole file body, and logging it verbatim to stderr or
+    ``log_file`` under plain ``log_requests=true`` leaks file content into
+    logs the README only warns about for the debug flags.
     """
     blocks = raw_text.count("```tool_call")
     log(f"upstream: {len(raw_text)} chars, {blocks} tool_call marker(s)")
@@ -206,7 +237,29 @@ def _log_tool_trace(raw_text: str, tool_calls) -> None:
     if blocks and not tool_calls:
         log("tool_call marker(s) present but no tool call was parsed")
     if tool_calls:
-        log(f"parsed tool_calls: {json.dumps(tool_calls, ensure_ascii=False)}")
+        redacted = []
+        for tc in tool_calls:
+            try:
+                fn = (tc or {}).get("function") or {}
+                args_text = fn.get("arguments") or "{}"
+                args = json.loads(args_text) if isinstance(args_text, str) else args_text
+                if isinstance(args, dict):
+                    short = {}
+                    for k, v in args.items():
+                        s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                        short[k] = (s[:200] + "…[truncated]"
+                                    if len(s) > 200 else s)
+                    redacted.append({"name": fn.get("name"), "arguments": short})
+                else:
+                    redacted.append({"name": fn.get("name"),
+                                     "arguments": str(args)[:200]})
+            except (json.JSONDecodeError, ValueError, TypeError):
+                redacted.append({"name": (tc.get("function") or {}).get("name"),
+                                 "arguments": "[unparsable]"})
+            if len(json.dumps(redacted, ensure_ascii=False)) > 2000:
+                redacted.append("[... further calls truncated ...]")
+                break
+        log(f"parsed tool_calls: {json.dumps(redacted, ensure_ascii=False)}")
     if not tool_calls:
         # With tools offered and nothing parsed, the raw text is the only place
         # that distinguishes "model answered in prose" from "model used a fence
@@ -767,6 +820,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         nudge_extra = ""
         repeat_nudge = ""
         repeats = 0
+        saw_call = False
         best_text, best_idx = "", -1
         for attempt in range(attempts):
             if attempt > 0 and client_gone is not None and client_gone.is_set():
@@ -829,6 +883,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 text, tool_calls, dropped = parse_tool_calls(text, allowed_names, tool_schemas)
                 _log_tool_trace(raw, tool_calls)
             if tool_calls:
+                saw_call = True
                 if all(((tc.get("function") or {}).get("name"),
                         _canonical_args((tc.get("function") or {}).get("arguments")))
                        in repeatable for tc in tool_calls):
@@ -923,6 +978,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 log(f"Tool retry: final answer is empty; returning best text "
                     f"from attempt {best_idx + 1}")
                 return best_text, None
+        if required_tool and not tool_calls and not saw_call:
+            # `tool_choice: required` is a contract: prose with no call ever
+            # emitted is not a result. Raise so the endpoint reports 503
+            # instead of a 200 that silently ends an agent turn. (A duplicate
+            # loop that fell back to prose keeps its fallback: a loop is
+            # worse than one prose turn.)
+            raise GeminiError("model did not emit the required tool call; "
+                              "please retry")
         return text, tool_calls
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
@@ -949,27 +1012,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_api_error(400, "messages must be a list", ERR_INVALID_REQUEST)
             return
 
-        # Inject system instruction for source code review behavior.
-        # This teaches the model when to read source files before answering.
-        source_review_instruction = (
-            "When asked to review, audit, inspect, or evaluate a plan/document/design, "
-            "you MUST first read the relevant source code files to verify claims. "
-            "If a plan says 'Source: reading full code + diff', read the actual source files "
-            "mentioned before answering. Never answer based only on the plan document - "
-            "ground your review in the actual codebase. Use the read tool on each relevant "
-            "file before providing your evaluation.\n\n"
-            "To find relevant source files: FIRST use glob with patterns like "
-            "**/hand*.py, **/hand3d.py, **/handmesh.py, **/handspec.py, **/vkeyboard.py, "
-            "**/audio.py, **/scorereader.py, **/utils.py, **/scorer/*.py, **/player/*.py "
-            "to discover the codebase structure. THEN read each relevant file. "
-            "A plan review is NOT complete until you have read the source files it references."
-        )
-        if not messages or messages[0].get("role") != "system":
-            messages = [{"role": "system", "content": source_review_instruction}] + messages
-        elif "review" in (messages[0].get("content", "").lower()):
-            # Prepend to existing system instruction if it's about review
-            messages[0]["content"] = source_review_instruction + "\n\n" + messages[0]["content"]
-
+        # Review behaviour ("read the file before reviewing it") lives in the
+        # shared `_tool_use_block` appended by `messages_to_prompt` whenever
+        # tools are active -- not as a per-request injected system message.
+        # (A hard-coded injection here previously shipped another project's
+        # filenames, replaced clients' system prompts, and crashed on
+        # list-shaped `content`.)
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
 
         rf_instruction = build_response_format_instruction(req.get("response_format"))
@@ -1526,41 +1574,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
         fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
         has_tools = bool(req.get("tools")) and fc_mode != "NONE"
 
-        # Inject system instruction for source code review behavior (same as OpenAI path).
-        source_review_instruction = (
-            "When asked to review, audit, inspect, or evaluate a plan/document/design, "
-            "you MUST first read the relevant source code files to verify claims. "
-            "If a plan says 'Source: reading full code + diff', read the actual source files "
-            "mentioned before answering. Never answer based only on the plan document - "
-            "ground your review in the actual codebase. Use the read tool on each relevant "
-            "file before providing your evaluation.\n\n"
-            "To find relevant source files: FIRST use glob with patterns like "
-            "**/hand*.py, **/hand3d.py, **/handmesh.py, **/handspec.py, **/vkeyboard.py, "
-            "**/audio.py, **/scorereader.py, **/utils.py, **/scorer/*.py, **/player/*.py "
-            "to discover the codebase structure. THEN read each relevant file. "
-            "A plan review is NOT complete until you have read the source files it references."
-        )
-        sys_inst = req.get("systemInstruction")
-        if sys_inst:
-            sys_parts = sys_inst.get("parts", [])
-            sys_text = " ".join(p.get("text", "") for p in sys_parts if p.get("text"))
-            if sys_text and "review" in sys_text.lower():
-                # Prepend to existing system instruction
-                for p in sys_parts:
-                    if p.get("text"):
-                        p["text"] = source_review_instruction + "\n\n" + p["text"]
-                        break
-            elif sys_text:
-                # Replace with our instruction
-                for p in sys_parts:
-                    if p.get("text"):
-                        p["text"] = source_review_instruction
-                        break
-        else:
-            req["systemInstruction"] = {
-                "parts": [{"text": source_review_instruction}]
-            }
-
+        # The review nudge lives in the shared tool block (see _handle_chat);
+        # never rewrite the client's own system instruction here.
         prompt, images = google_contents_to_prompt(req)
         if not prompt.strip():
             self.send_google_error(400, "empty content", "INVALID_ARGUMENT")
@@ -1639,6 +1654,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
         retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
         attempts = _tool_retry_attempts(required_tool, has_tools)
         grepeat = _google_repeatable(req.get("contents")) if has_tools else set()
+        # Declared names + schemas for parity with the OpenAI path, plus the
+        # mode=ANY allowlist: a call outside `allowedFunctionNames` is not a
+        # usable call and must be retried, not returned.
+        g_allowed, g_schemas, g_required = None, None, None
+        g_allowlist = None
+        if has_tools:
+            g_allowed, g_schemas, g_required = _google_declared(req)
+            fc_config = (req.get("toolConfig", {}) or {}).get(
+                "functionCallingConfig", {}) or {}
+            allowed_list = fc_config.get("allowedFunctionNames")
+            if fc_mode == "ANY" and isinstance(allowed_list, list) and allowed_list:
+                g_allowlist = {n for n in allowed_list if isinstance(n, str)}
+                g_allowed = ({n for n in (g_allowed or set()) if n in g_allowlist}
+                             or g_allowlist)
 
         # Stream + tools buffers the whole turn (retries included) before the
         # first byte, so the head goes out before upstream starts -- same
@@ -1710,8 +1739,29 @@ class GeminiHandler(BaseHTTPRequestHandler):
             text = raw
             clean_text, function_calls = "", []
             if has_tools and raw:
-                clean_text, function_calls = parse_google_function_calls(raw)
+                clean_text, function_calls = parse_google_function_calls(
+                    raw, allowed_names=g_allowed, tool_schemas=g_schemas)
+                function_calls = [
+                    fc for fc in function_calls
+                    if g_allowlist is None or fc.get("name") in g_allowlist
+                ]
             if function_calls:
+                if g_required:
+                    g_missing = missing_required_params(
+                        [{"function": {
+                            "name": fc.get("name"),
+                            "arguments": json.dumps(fc.get("args") or {},
+                                                   ensure_ascii=False)}}
+                         for fc in function_calls], g_required)
+                    if g_missing:
+                        log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                            f"missing required parameter(s): {', '.join(g_missing)}")
+                        if attempt + 1 < attempts:
+                            grepeat_nudge = (
+                                " The previous function call was missing required "
+                                f"parameter(s): {', '.join(g_missing)} -- include "
+                                "every required parameter.")
+                            continue
                 if all((fc.get("name"), _canonical_args(fc.get("args")))
                        in grepeat for fc in function_calls):
                     # Already answered upstream: re-emitting the call loops.
@@ -1773,6 +1823,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     "please retry"))
                 _google_fail(status, message, gstatus)
                 return
+
+        if required_tool and not function_calls:
+            # mode=ANY is a contract, like tool_choice=required: prose ends
+            # an agent turn that asked for action. Report, don't answer.
+            status, message, gstatus = _map_google_error(GeminiError(
+                "model did not emit the required function call; please retry"))
+            _google_fail(status, message, gstatus)
+            return
 
         response_parts = []
         if has_tools and function_calls:

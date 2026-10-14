@@ -1406,7 +1406,9 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("valid JSON object only", generate.call_args.args[0])
 
-    @mock.patch("gemini_web2api.server.generate", return_value="done")
+    @mock.patch("gemini_web2api.server.generate",
+                 return_value='```tool_call\n{"name": "get_weather", '
+                              '"arguments": {}}\n```')
     def test_responses_tool_choice_function_form_builds_instruction(self, generate):
         status, _, _ = self.post_json(
             "/v1/responses",
@@ -1851,13 +1853,17 @@ class StreamingEndpointTests(unittest.TestCase):
         calls = [o for o in json.loads(body)["output"] if o["type"] == "function_call"]
         self.assertEqual(calls[0]["name"], "read")
 
-    @mock.patch("gemini_web2api.server.generate", return_value="plain text, no call")
+    @mock.patch("gemini_web2api.server.generate")
     def test_responses_flattened_tool_choice_still_requires_a_call(self, generate):
         """The Responses API names the target without nesting it under ``function``.
 
         Reading only ``tool_choice["function"]`` made this shape look like plain
         ``auto``, so the required-tool retry never ran for Responses clients.
         """
+        generate.side_effect = [
+            "plain text, no call",
+            '```tool_call\n{"name": "read", "arguments": {"path": "a.py"}}\n```',
+        ]
         status, _, _ = self.post_json(
             "/v1/responses",
             {"model": "gemini-3.6-flash", "input": "doc README",
@@ -2357,8 +2363,8 @@ class MissedToolCallDetectionTests(unittest.TestCase):
                 self.assertTrue(looks_like_missed_tool_call(text))
 
     def test_long_answer_is_never_a_miss(self):
-        text = "Let me read " + "noi dung rat dai. " * 60
-        self.assertGreater(len(text), 600)
+        text = "Let me read " + "noi dung rat dai. " * 90
+        self.assertGreater(len(text), 1200)
         self.assertFalse(looks_like_missed_tool_call(text))
 
     def test_response_with_a_tool_fence_is_not_a_miss(self):
@@ -2979,7 +2985,7 @@ class PromptRewriteTests(unittest.TestCase):
                                        self._READ_TOOL)
 
         self.assertIn("do exactly ONE of", prompt)
-        self.assertIn('{"name": "read", "arguments": {"path": "value"}}',
+        self.assertIn('{"name": "read", "arguments": {"path": "EXAMPLE_path"}}',
                       prompt)
         self.assertNotIn("func_name", prompt)
         self.assertNotIn('"param"', prompt)

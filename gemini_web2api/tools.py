@@ -274,7 +274,8 @@ def _squeeze_part(part: str, cap: int) -> str:
     return squeezed.decode("utf-8", errors="ignore")
 
 
-def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> str:
+def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None,
+                       pinned_first: str = None) -> str:
     """Join message parts into a prompt, dropping the *middle* when too long.
 
     Slicing the assembled prompt from the front (the obvious way) keeps the
@@ -288,6 +289,11 @@ def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> 
     own, leaving nothing for the leading block -- and a prompt with no tool
     definitions makes the model answer in prose instead of calling a tool,
     which is indistinguishable from the model simply refusing to act.
+
+    ``pinned_first`` is the first user message (the plan/task in agent
+    sessions). It gets its own reservation so long middle histories cannot
+    evict it: losing the plan while keeping tool definitions produces a model
+    that calls tools correctly but for a forgotten task.
     """
     items = [p for p in parts if p]
 
@@ -296,15 +302,39 @@ def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> 
 
     # Cap the pin so a pathological tool list cannot consume the budget on its
     # own; ~40% leaves the majority for the history and the pending question.
-    pinned = ""
-    if pinned_head:
-        cap = max_bytes * 2 // 5
-        pinned = (pinned_head if nbytes(pinned_head) <= cap
-                  else pinned_head.encode("utf-8")[:cap].decode("utf-8", errors="ignore"))
-        pinned = pinned.strip()
-        if not pinned:
-            pinned = ""
+    # Squeezing (head+tail) keeps the header and the trailing constraint;
+    # byte-slicing cut the constraint off first. Pins are only squeezed when
+    # the prompt actually overflows: squeezing unconditionally would stamp a
+    # "[...truncated...]" marker into a prompt that fits untouched.
+    pinned = (pinned_head.strip() if pinned_head else "")
+    first_pin = (pinned_first.strip() if pinned_first else "")
+    first_idx = -1
+    if first_pin:
+        for i, p in enumerate(items):
+            if p == pinned_first:
+                first_idx = i
+                break
 
+    full = "\n\n".join(([pinned] if pinned else []) + items)
+    if nbytes(full) <= max_bytes:
+        return full
+
+    if pinned:
+        cap = max_bytes * 2 // 5
+        if nbytes(pinned) > cap:
+            pinned = _squeeze_part(pinned, cap).strip() or pinned
+    if first_pin:
+        fcap = max(1, max_bytes // 7)
+        if nbytes(first_pin) > fcap:
+            first_pin = _squeeze_part(first_pin, fcap).strip() or first_pin
+        # Squeeze the original in place so the head loop below (which fills
+        # from the start in order) can afford it inside its reservation.
+        # Order is preserved: system stays before the first user message.
+        if first_idx != -1:
+            items[first_idx] = first_pin
+
+    # Squeezing the pins alone may have been enough (a huge tool block with
+    # a short history): re-check before dropping any middle.
     full = "\n\n".join(([pinned] if pinned else []) + items)
     if nbytes(full) <= max_bytes:
         return full
@@ -314,6 +344,8 @@ def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> 
     if pinned:
         log(f"Tool block pinned: {nbytes(pinned)} bytes "
             f"({100 * nbytes(pinned) // max_bytes}% of budget)")
+    if first_pin:
+        log(f"First user message pinned: {nbytes(first_pin)} bytes")
 
     # Two separators around the marker.
     budget = max_bytes - nbytes(_TRUNCATION_MARKER) - 4
@@ -327,31 +359,58 @@ def _join_prompt_parts(parts: list, max_bytes: int, pinned_head: str = None) -> 
     if budget <= 0:
         return full.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
 
+    # Reserve the first user message's share before the newest messages are
+    # allocated: otherwise a giant tail part eats the budget and the plan --
+    # the first thing the head loop would need -- never fits. When the first
+    # message is also the newest (a short session), no reservation is needed:
+    # the tail keeps it naturally.
+    skip_first_in_tail = bool(first_pin) and first_idx != -1 \
+        and first_idx != len(items) - 1
+    first_cost = 0
+    if skip_first_in_tail:
+        first_cost = nbytes(first_pin) + 2
+    tail_budget = budget - first_cost
+    if tail_budget < 0:
+        tail_budget = 0
+
     # 1. Keep the newest messages first: they carry the pending question and
     #    the latest tool results. No single message may claim more than half
     #    the budget: when one giant part (a 46 KB file read) was allowed to
     #    take everything, it evicted every older message including the user's
     #    original request, and only its tail -- stripped of the
     #    "[Tool result for read ...]" label at its head -- reached the model.
+    #    The pinned first message is skipped here: it is allocated in step 2.
     tail = []
+    taken = set()
     used = 0
     part_cap = max(1, budget // 2)
-    for part in reversed(items):
+    for pos in range(len(items) - 1, -1, -1):
+        if skip_first_in_tail and pos == first_idx:
+            continue
+        part = items[pos]
         if nbytes(part) > part_cap:
             part = _squeeze_part(part, part_cap)
         cost = nbytes(part) + (2 if tail else 0)
-        if used + cost > budget:
+        if used + cost > tail_budget:
             break
         tail.append(part)
+        taken.add(pos)
         used += cost
     tail.reverse()
 
     # 2. Spend whatever is left on the leading block (tool defs, system, ...).
     #    This only ever adds a prefix, so history in the middle stays dropped.
+    #    The pinned first message is admitted at its natural position (after
+    #    the system prompt, where it already sits); the reservation above
+    #    guarantees room for its squeezed form.
     remaining = budget - used
     head = []
     head_used = 0
-    for part in items[: len(items) - len(tail)]:
+    for pos, part in enumerate(items):
+        if skip_first_in_tail and pos == first_idx:
+            part = first_pin
+        elif pos in taken:
+            break
         cost = nbytes(part) + (2 if head else 0)
         if head_used + cost > remaining:
             break
@@ -371,14 +430,24 @@ def _compact_tool(t: dict, desc_max: int = 300) -> str:
     outright (the previous behaviour) leaves the model calling a tool whose
     parameters it can no longer see, which produces calls that fail
     validation -- so signatures are always kept and only prose is shortened.
+    Nested object/array shapes are flagged so the model knows a parameter
+    takes a structured value even though its inner schema was cut.
     """
     p = t.get("parameters") or {}
     props = p.get("properties") if isinstance(p, dict) else None
     props = props if isinstance(props, dict) else {}
     required = set(p.get("required", [])) if isinstance(p, dict) else set()
+
+    def _kind(v) -> str:
+        if not isinstance(v, dict):
+            return "any"
+        kind = v.get("type", "any")
+        if kind in ("object", "array") and ("properties" in v or "items" in v):
+            return f"{kind}(nested schema omitted)"
+        return kind
+
     args = ", ".join(
-        f'{k}{"" if k in required else "?"}: '
-        f'{(v or {}).get("type", "any") if isinstance(v, dict) else "any"}'
+        f'{k}{"" if k in required else "?"}: {_kind(v)}'
         for k, v in props.items()
     )
     return f'- {t["name"]}({args}): {(t.get("description") or "")[:desc_max]}'
@@ -411,6 +480,10 @@ def _example_call(tool_defs: list) -> str:
     parameter keys: one entry per ``required`` parameter (fallback: the first
     two declared properties; ``{}`` when the tool takes none), with values
     typed by the schema type.
+
+    String values carry an ``EXAMPLE_`` prefix so a verbatim copy is
+    detectable: :func:`parse_tool_calls` drops calls whose arguments are
+    still the placeholder and tells the model to fill in real values.
     """
     first = (tool_defs or [None])[0] or {}
     name = first.get("name") if isinstance(first, dict) else None
@@ -438,9 +511,21 @@ def _example_call(tool_defs: list) -> str:
         elif kind == "object":
             example_args[key] = {}
         else:
-            example_args[key] = "value"
+            example_args[key] = f"EXAMPLE_{key}"
     return json.dumps({"name": name, "arguments": example_args},
                       ensure_ascii=False)
+
+
+def _is_placeholder_args(args_json: str) -> bool:
+    """True when parsed arguments still carry the ``EXAMPLE_`` placeholder."""
+    try:
+        args = json.loads(args_json, strict=False)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(args, dict):
+        return False
+    return any(isinstance(v, str) and v.startswith("EXAMPLE_")
+               for v in args.values())
 
 
 def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) -> str:
@@ -654,7 +739,15 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         # it needs permission to stop acting and answer.
         parts.append(_TOOL_RESULT_REMINDER if last_role == "tool"
                      else _TOOL_REMINDER)
-    return _join_prompt_parts(parts, max_bytes, pinned_head=tool_block), images
+    first_user_pin = None
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            first_user_pin = _stringify_content(msg.get("content", ""))
+            if first_user_pin and first_user_pin.strip():
+                break
+            first_user_pin = None
+    return _join_prompt_parts(parts, max_bytes, pinned_head=tool_block,
+                              pinned_first=first_user_pin), images
 
 
 # Keys that describe the call itself rather than its parameters. Models emit
@@ -681,12 +774,24 @@ def extract_arguments(data: dict, props=None):
     opencode's ``bash`` really takes a ``description`` -- is a parameter, not
     metadata, and survives. Without the schema every meta key is still
     dropped, so a bare ``name``/``id``/``type`` never leaks into arguments.
+
+    A tool that genuinely declares a parameter named ``args``/``input`` (with
+    a string value) is not a wrapper: the alias is only honoured when the
+    schema does not declare it, or when the payload carries nothing else.
     """
     for key in _ARGUMENT_KEYS:
-        value = data.get(key)
+        if key not in data:
+            continue
+        value = data[key]
         if isinstance(value, dict):
+            if props is not None and key in props:
+                siblings = set(data) - _CALL_META_KEYS - {key}
+                if siblings:
+                    continue
             return value
         if isinstance(value, str) and value.strip():
+            if props is not None and key in props:
+                continue
             return value
     if props is None:
         rest = {k: v for k, v in data.items() if k not in _CALL_META_KEYS}
@@ -762,9 +867,9 @@ def _arguments_json(args) -> tuple:
     return "{}", f"unsupported type {type(args).__name__}"
 
 
-def _arguments_dict(data: dict) -> dict:
+def _arguments_dict(data: dict, props=None) -> dict:
     """``extract_arguments`` for callers that need a JSON object, always."""
-    args = extract_arguments(data)
+    args = extract_arguments(data, props)
     if isinstance(args, dict):
         return args
     text, _ = _arguments_json(args)
@@ -801,6 +906,22 @@ _FABRICATED_CUT_RE = re.compile(
 )
 
 
+def _fence_spans(text: str) -> list:
+    """``(start, end)`` spans of fenced code blocks in ``text``."""
+    spans = []
+    pos = 0
+    while True:
+        open_at = text.find("```", pos)
+        if open_at == -1:
+            return spans
+        close_at = text.find("```", open_at + 3)
+        if close_at == -1:
+            spans.append((open_at, len(text)))
+            return spans
+        spans.append((open_at, close_at + 3))
+        pos = close_at + 3
+
+
 def _strip_fabricated(text: str, has_calls: bool) -> str:
     """Remove fabricated conversation markers from parsed model output.
 
@@ -815,12 +936,21 @@ def _strip_fabricated(text: str, has_calls: bool) -> str:
     * cut at the first line-start ``[Tool result for`` /
       ``[System instruction]:`` / ``[Assistant]:`` -- from there on the model
       is continuing the conversation by itself.
+
+    Markers inside fenced code blocks are literal text the user asked about
+    (e.g. quoting this proxy's own prompt format) and never trigger a cut.
     """
     if text.startswith("[Assistant]:"):
         text = text[len("[Assistant]:"):].lstrip()
-    cut = _FABRICATED_CUT_RE.search(text)
-    if cut:
-        text = text[:cut.start()]
+    spans = _fence_spans(text)
+
+    def _inside(pos: int) -> bool:
+        return any(s <= pos < e for s, e in spans)
+
+    for m in _FABRICATED_CUT_RE.finditer(text):
+        if not _inside(m.start()):
+            text = text[:m.start()]
+            break
     return text
 
 
@@ -1024,6 +1154,13 @@ def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
         if kind == "json" and not _is_declared_call(data, allowed_names, tool_schemas):
             # Ordinary JSON in prose: leave it untouched and do not log it.
             continue
+        if kind in ("tool_call", "function_call", "tool_code"):
+            # A fence quoted mid-sentence ("e.g. ```tool_call ...") or pasted
+            # from a file is an explanation, not a call. Only fences that
+            # start their line (modulo whitespace) execute.
+            line_start = text.rfind("\n", 0, start) + 1
+            if text[line_start:start].strip():
+                continue
         reason = ""
         if data is _NOTHING and kind != "json":
             # A fence that declares a call but holds no JSON: maybe a
@@ -1052,11 +1189,15 @@ def parse_tool_calls(text: str, allowed_names=None, tool_schemas=None) -> tuple:
                     if degraded:
                         log(f"tool_call '{name}': arguments unusable ({degraded}), "
                             "sending an empty object so the client can report it")
-                    parsed = {
-                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                        "type": "function",
-                        "function": {"name": name, "arguments": args},
-                    }
+                    if _is_placeholder_args(args):
+                        reason = (f"tool_call '{name}' copied the EXAMPLE_ "
+                                  "placeholder from the prompt -- fill in real values")
+                    else:
+                        parsed = {
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": args},
+                        }
         elif not reason:
             reason = ("body is not valid JSON" if data is _NOTHING
                       else "unrecognised payload")
@@ -1120,9 +1261,12 @@ _UPSTREAM_ERROR_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Phrases that mean "I am about to look at that" or "I cannot reach that" --
+# Phrases that mean "I am about to act" or "I cannot reach that" --
 # i.e. the model announced an action it never performed because it never
-# emitted the tool call.
+# emitted the tool call. Covers both read verbs (read/check/look/...) and
+# implement verbs (write/create/update/run/...) in English and Vietnamese:
+# without the latter an agent stops after one step ("I'll create the file"
+# with no block reads as a finished answer).
 _MISSED_TOOL_RE = re.compile(
     r"(khong\s+the\s+truy\s+cap|khong\s+co\s+quyen|khong\s+duoc\s+truy\s+cap"
     r"|khong\s+tim\s+thay|khong\s+the\s+doc"
@@ -1130,20 +1274,20 @@ _MISSED_TOOL_RE = re.compile(
     r"|don'?t\s+have\s+access|do\s+not\s+have\s+access"
     r"|no\s+(?:file\s+|tool\s+)?access"
     r"|not\s+(?:permitted|allowed)\s+to\s+read"
-    r"|de\s+minh\s+doc|de\s+minh\s+kiem\s+tra"
-    r"|let'?s\s+(?:read|check|look|see|examine|inspect)"
-    r"|let\s+us\s+(?:read|check|look|see|examine|inspect)"
-    r"|let\s+me\s+(?:read|check|look|see|examine|inspect)"
-    r"|i(?:'ll|\s+will)\s+(?:read|check|look|see|examine|inspect))",
+    r"|de\s+minh\s+(?:doc|kiem\s+tra|viet|tao|sua|chay|cap\s+nhat|thuc\s+hien|xem|mo)"
+    r"|minh\s+se\s+(?:doc|viet|tao|sua|chay|cap\s+nhat|thuc\s+hien|kiem\s+tra)"
+    r"|toi\s+se\s+(?:doc|viet|tao|sua|chay|cap\s+nhat|thuc\s+hien|kiem\s+tra)"
+    r"|let'?s\s+(?:read|check|look|see|examine|inspect|write|create|update|edit|run|implement|fix|build)"
+    r"|let\s+us\s+(?:read|check|look|see|examine|inspect|write|create|update|edit|run|implement|fix|build)"
+    r"|let\s+me\s+(?:read|check|look|see|examine|inspect|write|create|update|edit|run|execute|implement|fix|build|apply|test)"
+    r"|i(?:'ll|\s+will)\s+(?:read|check|look|see|examine|inspect|write|create|update|edit|modify|fix|run|execute|implement|build|apply|test|continue))",
     re.IGNORECASE,
 )
 
 # Longer guard for verbose models that explain before emitting tool_call.
-# Raised from 600 to 1200 to catch models that write a paragraph before the block.
+# A long plan summary (>600 chars) followed by a promise to act is still a
+# stalled turn, not a real answer.
 _MAX_MISSED_TOOL_CHARS = 1200
-
-# Anything at or above this is a real answer rather than a stalled first turn.
-_MAX_MISSED_TOOL_CHARS = 600
 
 
 def _fold_diacritics(text: str) -> str:
@@ -1198,15 +1342,22 @@ def looks_like_missed_tool_call(text: str) -> bool:
 
 
 # File-shaped tokens a sentence can point at: `README.md`, `server.py`,
-# `gemini-web2api.log`. Used on both sides of the check below.
+# `src/server.py`, `gemini-web2api.log`. The optional ``(dir/)*`` prefix
+# keeps project paths intact so callers can detect the project root; without
+# it a "detect root via f.split('/')" block can never fire.
 _FILE_REF_RE = re.compile(
-    r"(?<![\w.-])[\w][\w.-]*\.(?:"
+    r"(?<![\w.-])(?:[\w.-]+/)*[\w][\w.-]*\.(?:"
     r"md|py|pyi|js|jsx|ts|tsx|json|jsonc|txt|ya?ml|toml|cfg|conf|ini|env|"
     r"java|kt|c|cc|cpp|h|hpp|go|rs|rb|php|html|css|scss|less|sql|sh|bash|ps1|"
     r"xml|csv|lock|log|rst|bat|cmd|vue|svelte|proto|gradle|properties"
     r")(?![\w-])",
     re.IGNORECASE,
 )
+
+# Bare `base.ext` tokens with these extensions are far more often member
+# access (`self.cmd`, `process.env`, `math.log(`, `docs.rs`, `args.go`) than
+# real files. They only count when path-like (`a/b.log`) or quoted/backticked.
+_RISKY_BARE_EXTS = frozenset({"cmd", "env", "log", "rs", "go"})
 
 # Names that end in a source extension but are runtimes, frameworks or
 # libraries rather than files. `Node.js` and friends would otherwise look like
@@ -1244,6 +1395,11 @@ def _repeatable_calls(messages) -> set:
     result carrying the same ``tool_call_id``. The retry loop uses this to
     recognise a model that keeps emitting a call it already got the answer
     to, instead of executing the same call again.
+
+    A mutating tool (edit/write/bash/...) changes the world the earlier
+    results described: after one completes, every earlier entry is dropped.
+    Re-running the same ``pytest`` or re-reading a just-edited file is then
+    progress, not a loop.
     """
     calls_by_id = {}
     for msg in messages or []:
@@ -1259,11 +1415,19 @@ def _repeatable_calls(messages) -> set:
                                      _canonical_args(fn.get("arguments")))
     done = set()
     for msg in messages or []:
-        if not isinstance(msg, dict) or msg.get("role") != "tool":
+        if not isinstance(msg, dict):
             continue
-        key = calls_by_id.get(msg.get("tool_call_id", ""))
+        if msg.get("role") == "assistant":
+            continue
+        if msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id", "")
+        key = calls_by_id.get(tcid)
+        name = key[0] if key else (msg.get("name") or "")
         if key is not None:
             done.add(key)
+        if isinstance(name, str) and _MUTATING_TOOL_RE.search(name):
+            done.clear()
     return done
 
 
@@ -1273,7 +1437,9 @@ def _google_repeatable(contents) -> set:
     Model parts carrying ``functionCall`` are paired with later
     ``functionResponse`` parts by name (falling back to oldest-first when the
     name matches nothing): each response completes one outstanding call, and
-    completed calls are what the retry loop must not emit again.
+    completed calls are what the retry loop must not emit again. A completed
+    mutating call clears earlier entries: state changed, so repeats are new
+    work.
     """
     pending = []
     done = set()
@@ -1294,8 +1460,23 @@ def _google_repeatable(contents) -> set:
                 if idx is None and pending:
                     idx = 0
                 if idx is not None:
-                    done.add(pending.pop(idx))
+                    key = pending.pop(idx)
+                    done.add(key)
+                    if isinstance(key[0], str) and _MUTATING_TOOL_RE.search(key[0]):
+                        done.clear()
+                        # Keep the mutating call itself out: re-emitting the
+                        # exact edit is a loop, re-reading after it is not.
     return done
+
+
+# Tool names that change state (files, processes, environment). A repeatable
+# entry from before one of these completed is stale: the world changed.
+_MUTATING_TOOL_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:write|edit|create|update|delete|remove|mkdir|rmdir|"
+    r"bash|shell|exec|run|apply_patch|apply|patch|append|save|move|copy|"
+    r"touch|chmod|truncate)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
 
 
 # "dùng tool", "đọc file", "review source", "use the tool", ... -- matched
@@ -1321,8 +1502,21 @@ _TOOL_DEMAND_RE = re.compile(
 # whitespace-collapsed text, like _TOOL_DEMAND_RE). Kept separate because a
 # listing-only turn (glob/list) must still count as owed here, while every
 # other demand keeps the old "any call ends the check" rule.
+#
+# Verbs are split: strong verbs (review/audit/evaluate/...) combine with any
+# noun, including plan/document/design/spec. Weak verbs (check/find/read/...)
+# only combine with code nouns -- "read the plan then implement" is an
+# implement turn, not a source review, and must not be forced to read modules.
 _SOURCE_REVIEW_VERB_RE = re.compile(
     r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim|xem\s+xet|doc|danh\s+gia|danhgia)\b",
+    re.IGNORECASE,
+)
+_SOURCE_STRONG_VERB_RE = re.compile(
+    r"\b(?:review|audit|inspect|examine|soat|danh\s+gia|danhgia|evaluate|assess)\b",
+    re.IGNORECASE,
+)
+_SOURCE_CODE_NOUN_RE = re.compile(
+    r"\b(?:source|code|codebase|ma\s+nguon|implementation|repository|repo)\b",
     re.IGNORECASE,
 )
 _SOURCE_NOUN_RE = re.compile(
@@ -1333,8 +1527,10 @@ _SOURCE_NOUN_RE = re.compile(
 
 def _is_source_review(folded: str) -> bool:
     """True when folded text asks for a review of source/code."""
+    if _SOURCE_STRONG_VERB_RE.search(folded) and _SOURCE_NOUN_RE.search(folded):
+        return True
     return bool(_SOURCE_REVIEW_VERB_RE.search(folded)
-                and _SOURCE_NOUN_RE.search(folded))
+                and _SOURCE_CODE_NOUN_RE.search(folded))
 
 
 def _is_file_review(folded: str, scannable: str) -> bool:
@@ -1392,18 +1588,79 @@ def _turn_tool_calls(messages, start_idx) -> list:
     return calls
 
 
+def _tool_arguments_dict(fn) -> dict:
+    """Parse a ``tool_calls`` function payload's arguments to a dict or {}."""
+    args = (fn or {}).get("arguments")
+    if isinstance(args, dict):
+        return args
+    if isinstance(args, str):
+        try:
+            parsed = json.loads(args, strict=False)
+        except (json.JSONDecodeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+# Argument keys that carry a file path. Only these are scanned for evidence:
+# scanning the whole serialised args is what counted `glob
+# {"pattern": "**/hand3d.py"}` as "read hand3d.py" and `bash ls x.py` as a
+# read. `pattern`/`command`/`query` deliberately excluded: a listing pattern
+# or a shell one-liner is not content.
+_PATH_ARG_KEYS = frozenset({
+    "path", "filepath", "file_path", "file", "filename", "file_name",
+    "target", "target_file", "dirpath", "directory", "folder",
+})
+
+
+def _is_reader_tool(name) -> bool:
+    return isinstance(name, str) and bool(_READER_TOOL_RE.search(name))
+
+
+def _turn_result_ids(messages, start_idx) -> set:
+    """``tool_call_id`` values with a ``role == "tool"`` result this turn."""
+    ids = set()
+    for msg in (messages or [])[start_idx + 1:]:
+        if isinstance(msg, dict) and msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id")
+            if tcid:
+                ids.add(tcid)
+    return ids
+
+
 def files_read_in_turn(messages) -> set:
-    """Lowercased file names whose content this turn's tool calls opened."""
+    """Lowercased file names whose content this turn's tool calls opened.
+
+    Only reader tools (``read``/``cat``/``view``/``grep``/...) count, only
+    path-like argument keys are scanned, and a call without a paired tool
+    result does not count: a ``glob`` pattern or an unanswered call is not
+    evidence the model saw content.
+    """
     start_idx = _last_user_index(messages)
+    result_ids = _turn_result_ids(messages, start_idx)
     files = set()
     for tc in _turn_tool_calls(messages, start_idx):
         fn = tc.get("function") or {}
-        args = fn.get("arguments")
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
-        found = {f.lower() for f in _files_in(str(args or ""))}
-        if found:
-            files |= found
+        name = fn.get("name") or ""
+        if not _is_reader_tool(name):
+            continue
+        if tc.get("id") and result_ids and tc.get("id") not in result_ids:
+            continue
+        args = _tool_arguments_dict(fn)
+        if args:
+            vals = [v for k, v in args.items()
+                    if k in _PATH_ARG_KEYS and isinstance(v, str)]
+            if vals:
+                files |= {f.lower() for f in _files_in(*vals)}
+                continue
+            # Reader with no path key (grep query only): content was still
+            # read, but no file can be named -- handled by _reads_this_turn.
+            continue
+        raw = fn.get("arguments")
+        if isinstance(raw, str):
+            found = {f.lower() for f in _files_in(raw)}
+            if found:
+                files |= found
     return files
 
 
@@ -1413,10 +1670,13 @@ def _reads_this_turn(messages) -> int:
     if files:
         return len(files)
     start_idx = _last_user_index(messages)
+    result_ids = _turn_result_ids(messages, start_idx)
     for tc in _turn_tool_calls(messages, start_idx):
         fn = tc.get("function") or {}
         name = fn.get("name") or ""
-        if isinstance(name, str) and _READER_TOOL_RE.search(name):
+        if _is_reader_tool(name):
+            if tc.get("id") and result_ids and tc.get("id") not in result_ids:
+                continue
             return 1
     return 0
 
@@ -1424,18 +1684,7 @@ def _reads_this_turn(messages) -> int:
 def _source_reads_this_turn(messages) -> int:
     """Number of distinct SOURCE CODE (.py) reads in this turn."""
     files = files_read_in_turn(messages)
-    if files:
-        return len({f for f in files if f.lower().endswith(".py")})
-    start_idx = _last_user_index(messages)
-    for tc in _turn_tool_calls(messages, _last_user_index(messages)):
-        fn = tc.get("function") or {}
-        args = fn.get("arguments")
-        if not isinstance(args, str):
-            args = json.dumps(args, ensure_ascii=False)
-        found = {f for f in _files_in(str(args or "")) if f.lower().endswith(".py")}
-        if found:
-            return len(found)
-    return 0
+    return len({f for f in files if f.endswith(".py")})
 
 
 def review_demanded(messages) -> bool:
@@ -1498,14 +1747,21 @@ def listed_turn_files(messages) -> list:
     """File names from ``role == "tool"`` contents since the last user turn.
 
     Ordered and unique: the retry nudge names these so the model reads what
-    it just listed instead of guessing.
+    it just listed instead of guessing. Bodies longer than ~2 KB (a just-read
+    file's content) are skipped: scanning a full file body is what promoted
+    incidental mentions (`config.json` quoted in code) into "listed files"
+    and pushed ``required_reads`` to 2 on turns that listed nothing. Short
+    listing outputs (glob/ls results) are unaffected.
     """
     start_idx = _last_user_index(messages)
     seen = []
     for msg in (messages or [])[start_idx + 1:]:
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
-        for f in _files_in(_stringify_content(msg.get("content", ""))):
+        body = _stringify_content(msg.get("content", ""))
+        if len(body) > 2000:
+            continue
+        for f in _files_in(body):
             if f.lower() in _NON_FILE_NAMES:
                 continue
             if f not in seen:
@@ -1531,13 +1787,43 @@ def _strip_code_spans(text: str) -> str:
 
 
 def _files_in(*chunks) -> set:
-    """File-shaped names mentioned anywhere in ``chunks`` (strings or JSON)."""
+    """File-shaped names mentioned anywhere in ``chunks`` (strings or JSON).
+
+    Filters member access (`self.cmd`, `process.env`) and call expressions
+    (`math.log(`): a token followed by ``(`` is code, not a file. Bare
+    tokens with high-collision extensions (cmd/env/log/rs/go) need a path
+    separator or quoting to count.
+    """
     blob = " ".join(c for c in chunks if isinstance(c, str))
-    return {m.group(0) for m in _FILE_REF_RE.finditer(blob)}
+    out = set()
+    for m in _FILE_REF_RE.finditer(blob):
+        token = m.group(0)
+        end = m.end()
+        j = end
+        while j < len(blob) and blob[j] in " \t":
+            j += 1
+        if j < len(blob) and blob[j] == "(":
+            continue
+        if "/" not in token and "\\" not in token:
+            ext = token.rsplit(".", 1)[-1].lower() if "." in token else ""
+            if ext in _RISKY_BARE_EXTS:
+                start = m.start()
+                before = blob[start - 1] if start > 0 else ""
+                after = blob[end] if end < len(blob) else ""
+                if before not in ("`", "'", '"', "/", "\\") \
+                        and after not in ("`", "'", '"'):
+                    continue
+        out.add(token)
+    return out
 
 
 def _conversation_called_files(messages) -> set:
-    """Every file name any tool call in this conversation has touched."""
+    """Every file name a *reader* tool call in this conversation opened.
+
+    Listing/writing tools do not count: a ``glob`` pattern that mentions a
+    file is not evidence the model read it, and without this the `uncovered`
+    check is disabled by the very discovery step it prescribes.
+    """
     called = set()
     for msg in messages or []:
         if not isinstance(msg, dict):
@@ -1546,11 +1832,39 @@ def _conversation_called_files(messages) -> set:
             if not isinstance(tc, dict):
                 continue
             fn = tc.get("function") or {}
-            args = fn.get("arguments")
-            if not isinstance(args, str):
-                args = json.dumps(args, ensure_ascii=False)
-            called |= _files_in(str(fn.get("name") or ""), args)
+            if not _is_reader_tool(fn.get("name") or ""):
+                continue
+            args = _tool_arguments_dict(fn)
+            if args:
+                vals = [v for k, v in args.items()
+                        if k in _PATH_ARG_KEYS and isinstance(v, str)]
+                if vals:
+                    called |= _files_in(*vals)
+                    continue
+            raw = fn.get("arguments")
+            if isinstance(raw, str):
+                called |= _files_in(raw)
+            elif args:
+                called |= _files_in(json.dumps(args, ensure_ascii=False))
     return called
+
+
+# "create/write/generate/make a file ..." (EN + VI): files named in such a
+# turn are to be *created*, not read. The `uncovered` branch must not demand
+# reading a file that does not exist yet -- the retry nudge would otherwise
+# tell the model to "read" it and the read fails.
+_FILE_CREATE_RE = re.compile(
+    r"\b(?:create|write|generate|make|add|tao|tao\s+moi|viet|tao\s+file|"
+    r"tao\s+tep|ghi\s+file|thiet\s+ke\s+moi)\b",
+    re.IGNORECASE,
+)
+
+
+def _created_files(scannable: str, folded: str) -> set:
+    """File tokens exempt from the `uncovered` check (creation intent)."""
+    if not _FILE_CREATE_RE.search(folded):
+        return set()
+    return {f.lower() for f in _files_in(scannable)}
 
 
 def pending_tool_request(messages) -> str:
@@ -1638,9 +1952,11 @@ def pending_tool_request(messages) -> str:
         return None
 
     called_lower = {f.lower() for f in _conversation_called_files(messages)}
+    created = _created_files(scannable, folded)
     uncovered = sorted(
         f for f in _files_in(scannable)
         if f.lower() not in called_lower and f.lower() not in _NON_FILE_NAMES
+        and f.lower() not in created
     )
     if uncovered:
         return "requested file(s) never read: " + ", ".join(uncovered)
@@ -1712,8 +2028,27 @@ def build_tool_prompt(tool_defs: list) -> str:
         '{"name": "<tool_name>", "args": {<arguments>}}\n'
         "```\n\n"
         "When calling tools:\n"
+        "- Each turn do exactly ONE of: (A) you need to read or change "
+        "something -> output ONLY function_call block(s); (B) you already have "
+        "everything -> answer as plain text with NO block. Never both, and "
+        "never any prose after the block.\n"
+        "- Before answering a request to review, audit, inspect or find bugs in "
+        "source code, you MUST read the actual contents of the relevant files with "
+        "a read/search tool first -- reading one file is not reviewing a codebase. "
+        "Listing or globbing file names is not reading.\n"
         "- Output ONLY the function_call block(s), nothing else\n"
         "- You may call multiple tools with multiple blocks\n"
+        "- Every parameter belongs inside the \"args\" object, keyed exactly "
+        "like the parameters properties -- never beside \"name\".\n"
+        "- Never state that you have read a file, run a command or inspected "
+        "the code unless a [Tool result for ...] message proves it.\n"
+        "- Never claim the tools are unavailable or that you lack permission: "
+        "they are connected and will run.\n"
+        "- Never write [Tool result for ...] yourself, and never invent a "
+        "result: emit the block and stop.\n"
+        "- Triple backticks inside a string argument (Markdown or code the user "
+        "asked you to save) are literal text: keep all three of them. A fence "
+        "inside the JSON never closes the block.\n"
         "- After receiving a [Tool result for ...], use that data to answer the user\n\n"
         f"Available tools:\n{tool_spec}"
     )
@@ -1849,7 +2184,8 @@ def _iter_bare_function_calls(text: str):
         pos = end
 
 
-def parse_google_function_calls(text: str) -> tuple:
+def parse_google_function_calls(text: str, allowed_names=None,
+                                tool_schemas=None) -> tuple:
     """Extract function_call blocks from model output.
 
     Handles 3 formats:
@@ -1866,8 +2202,34 @@ def parse_google_function_calls(text: str) -> tuple:
     the answer too. Blocks that still cannot be read are left in the text, so
     nothing the model wrote is silently dropped.
 
+    ``allowed_names``/``tool_schemas`` mirror :func:`parse_tool_calls`:
+    names are normalised (``functions.read``/case variants) and undeclared
+    or placeholder-copied calls are skipped rather than executed.
+
     Returns (clean_text, [{"name": ..., "args": ...}])
     """
+    from .gemini import log
+
+    function_calls = []
+
+    def _accept(data) -> dict:
+        if not (isinstance(data, dict) and data.get("name")):
+            return None
+        name = _normalize_tool_name(data.get("name"), allowed_names)
+        if allowed_names is not None and name is None:
+            log(f"Dropping function_call block: undeclared tool "
+                f"'{data.get('name')}'")
+            return None
+        resolved = name or data.get("name")
+        props = (tool_schemas or {}).get(resolved) if tool_schemas else None
+        args = _arguments_dict(data, props)
+        if isinstance(args, dict) and any(
+                isinstance(v, str) and v.startswith("EXAMPLE_")
+                for v in args.values()):
+            log(f"Dropping function_call block: placeholder args copied "
+                f"for '{resolved}'")
+            return None
+        return {"name": resolved, "args": args}
     function_calls = []
 
     # 1. Fenced blocks. ``json`` fences are skipped: without a declared-name
@@ -1877,7 +2239,14 @@ def parse_google_function_calls(text: str) -> tuple:
     for start, end, data, kind, _body in _iter_tool_blocks(text):
         if kind == "json" or not (isinstance(data, dict) and data.get("name")):
             continue
-        function_calls.append({"name": data["name"], "args": _arguments_dict(data)})
+        if kind in ("function_call", "tool_call", "tool_code"):
+            line_start = text.rfind("\n", 0, start) + 1
+            if text[line_start:start].strip():
+                continue
+        accepted = _accept(data)
+        if accepted is None:
+            continue
+        function_calls.append(accepted)
         parts.append(text[last_end:start])
         last_end = end
     # The tail stays scannable for stage 2 below (a bare marker may follow a
@@ -1889,9 +2258,10 @@ def parse_google_function_calls(text: str) -> tuple:
     before_bare = len(function_calls)
     parts, last_end = [], 0
     for start, end, data in _iter_bare_function_calls(clean):
-        if not (isinstance(data, dict) and data.get("name")):
+        accepted = _accept(data)
+        if accepted is None:
             continue
-        function_calls.append({"name": data["name"], "args": _arguments_dict(data)})
+        function_calls.append(accepted)
         parts.append(clean[last_end:start])
         last_end = end
     if len(function_calls) > before_bare:
@@ -1912,10 +2282,8 @@ def parse_google_function_calls(text: str) -> tuple:
             data = json.loads(clean, strict=False)
         except (json.JSONDecodeError, ValueError):
             data = None
-        if isinstance(data, dict) and data.get("name"):
-            function_calls.append({
-                "name": data["name"],
-                "args": _arguments_dict(data),
-            })
+        accepted = _accept(data) if isinstance(data, dict) else None
+        if accepted is not None:
+            function_calls.append(accepted)
             clean = ""
     return clean, function_calls
