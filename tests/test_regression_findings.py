@@ -36,6 +36,7 @@ from gemini_web2api.tools import (
     _repeatable_calls,
     _strip_fabricated,
     change_demanded,
+    looks_like_described_edit,
     extract_arguments,
     files_read_in_turn,
     listed_turn_files,
@@ -616,6 +617,43 @@ class VaguePromptEvidenceTests(unittest.TestCase):
         self.assertIn("Fixed flow for EVERY turn", prompt)
         self.assertIn("are never an answer", prompt)
 
+    def test_described_edit_detected(self):
+        reply = ("To support /v1/health, update `server.py` as follows:\n"
+                 "```python\ndef _needs_auth(self, path):\n"
+                 "    return path not in ('/', '/health', '/v1/health')\n"
+                 "```\nHere is how you can implement this change.")
+        self.assertTrue(looks_like_described_edit(reply))
+
+    def test_review_quote_is_not_described_edit(self):
+        reply = ("The bug is an unhandled KeyError:\n"
+                 "```python\nreturn settings[\"timeout\"]\n```\n"
+                 "Recommendations: use `.get()` with a default value.")
+        self.assertFalse(looks_like_described_edit(reply))
+
+    def test_plain_prose_is_not_described_edit(self):
+        self.assertFalse(looks_like_described_edit(
+            "You can restart the server to pick up the change."))
+        self.assertFalse(looks_like_described_edit(""))
+        self.assertFalse(looks_like_described_edit(
+            "```tool_call\n{\"name\": \"read\", \"arguments\": {}}\n```"))
+
+    def test_deep_demand_grants_one_more_attempt(self):
+        from gemini_web2api.server import _tool_retry_attempts
+        original = dict(CONFIG)
+        CONFIG["tool_retry_attempts"] = 1
+        CONFIG["tool_retry_on_miss"] = True
+        try:
+            self.assertEqual(_tool_retry_attempts(False, True), 2)
+            self.assertEqual(
+                _tool_retry_attempts(False, True, deep_demand=True), 3)
+            self.assertEqual(
+                _tool_retry_attempts(False, True, deep_demand=False), 2)
+            self.assertEqual(
+                _tool_retry_attempts(False, False, deep_demand=True), 1)
+        finally:
+            CONFIG.clear()
+            CONFIG.update(original)
+
     @mock.patch("gemini_web2api.server.generate")
     def test_vague_review_prose_retried_once(self, generate):
         tools = [{"type": "function", "function": {
@@ -704,6 +742,103 @@ class VaguePromptEvidenceTests(unittest.TestCase):
             self.assertEqual(response.status, 200)
             self.assertEqual(generate.call_count, 2)
             self.assertIn("tool_calls", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_described_edit_prose_retried_into_call(self, generate):
+        tools = [{"type": "function", "function": {
+            "name": "read", "description": "r",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}}}}},
+            {"type": "function", "function": {
+                "name": "edit", "description": "e",
+                "parameters": {"type": "object",
+                               "properties": {"path": {"type": "string"}}}}}]
+        history = [
+            {"role": "user",
+             "content": "The health check should also work under the /v1 "
+                        "prefix. Make it so"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "read",
+                                '{"path": "server.py"}')]},
+            _tool_msg("c1", "routing code...", name="read"),
+        ]
+        generate.side_effect = [
+            ("Update `server.py` as follows:\n```python\n"
+             "return path not in ('/', '/health', '/v1/health')\n```\n"
+             "Here is how you can implement this change."),
+            '```tool_call\n{"name": "edit", '
+            '"arguments": {"path": "server.py"}}\n```',
+        ]
+        server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            original = dict(CONFIG)
+            CONFIG["api_keys"] = []
+            CONFIG["log_requests"] = False
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_address[1], timeout=5)
+            connection.request(
+                "POST", "/v1/chat/completions",
+                body=json.dumps({"model": "gemini-3.6-flash",
+                                 "messages": history, "tools": tools}),
+                headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = response.read().decode()
+            connection.close()
+            CONFIG.clear()
+            CONFIG.update(original)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(generate.call_count, 2)
+            self.assertIn("tool_calls", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_described_edit_after_real_edit_not_retried(self, generate):
+        tools = [{"type": "function", "function": {
+            "name": "edit", "description": "e",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}}}}}]
+        history = [
+            {"role": "user", "content": "Fix the crash in server.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "edit",
+                                '{"path": "server.py"}')]},
+            _tool_msg("c1", "ok", name="edit"),
+            {"role": "user", "content": "what did you change?"},
+        ]
+        generate.return_value = (
+            "I updated `server.py` as follows:\n```python\nfixed()\n```\n"
+            "You can verify by running the tests.")
+        server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            original = dict(CONFIG)
+            CONFIG["api_keys"] = []
+            CONFIG["log_requests"] = False
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_address[1], timeout=5)
+            connection.request(
+                "POST", "/v1/chat/completions",
+                body=json.dumps({"model": "gemini-3.6-flash",
+                                 "messages": history, "tools": tools}),
+                headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            response.read()
+            connection.close()
+            CONFIG.clear()
+            CONFIG.update(original)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(generate.call_count, 1)
         finally:
             server.shutdown()
             server.server_close()

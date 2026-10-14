@@ -1356,6 +1356,41 @@ def looks_like_missed_tool_call(text: str) -> bool:
     return bool(_MISSED_TOOL_RE.search(folded))
 
 
+# Phrases where the model hands the work back to the user instead of acting:
+# a how-to for code it already read. A verbatim bug quote (the prompt's own
+# "quote the exact lines" rule) has proposed code too, so the handoff phrase
+# is required -- a quote that explains a bug never tells the user to apply it.
+_DESCRIBED_EDIT_RE = re.compile(
+    r"\b(?:you\s+can|you\s+need\s+to|you\s+should|here\s+is\s+how\s+you\s+can|"
+    r"follow\s+these\s+steps|update\s+\S+\s+as\s+follows|make\s+the\s+"
+    r"following\s+changes?|to\s+do\s+this,?|run\s+\S+\s+to\s+verify|"
+    r"since\s+tool\s+calls?\s+are\s+no\s+longer\s+available|"
+    r"unable\s+to\s+execute\s+tool|i\s+would\s+be\s+happy\s+to\s+help\s+you\s+"
+    r"(?:identify|implement|fix|update))\b",
+    re.IGNORECASE,
+)
+_DIFF_MARKER_RE = re.compile(
+    r"(?:^|\n)(?:\+\+\+|---|@@\s)", re.MULTILINE,
+)
+
+
+def looks_like_described_edit(text: str) -> bool:
+    """True when the reply describes an edit instead of emitting the call.
+
+    Both halves must hold: proposed code (a diff hunk or a fenced code block)
+    AND a handoff phrase telling the user to apply it. Either half alone is
+    legitimate -- a quoted bug snippet, or prose guidance with no code.
+    """
+    if not text or "```tool_call" in text or "```function_call" in text:
+        return False
+    has_code = bool(_DIFF_MARKER_RE.search(text)
+                    or re.search(r"```(?:python|javascript|js|json|diff|bash|"
+                                 r"typescript|ts)\b", text, re.IGNORECASE))
+    if not has_code:
+        return False
+    return bool(_DESCRIBED_EDIT_RE.search(_fold_diacritics(text)))
+
+
 # File-shaped tokens a sentence can point at: `README.md`, `server.py`,
 # `src/server.py`, `gemini-web2api.log`. The optional ``(dir/)*`` prefix
 # keeps project paths intact so callers can detect the project root; without

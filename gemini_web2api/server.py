@@ -36,7 +36,9 @@ from .tools import (
     fresh_declared_unread,
     review_demanded,
     change_demanded,
+    looks_like_described_edit,
     _conversation_called_files,
+    _turn_act_calls,
     _is_source_review,
     _is_file_review,
     _strip_code_spans,
@@ -173,7 +175,8 @@ def _upload_images(images: list) -> list:
     return file_refs if file_refs else None
 
 
-def _tool_retry_attempts(required_tool: bool, tools_active: bool) -> int:
+def _tool_retry_attempts(required_tool: bool, tools_active: bool,
+                         deep_demand: bool = False) -> int:
     """Total upstream attempts for a turn that is expected to end in a call.
 
     One retry leaves a model that answers in prose instead of emitting the
@@ -190,7 +193,14 @@ def _tool_retry_attempts(required_tool: bool, tools_active: bool) -> int:
         extra = int(CONFIG.get("tool_retry_attempts", 1))
     except (TypeError, ValueError):
         extra = 1
-    return 1 + max(0, extra)
+    total = 1 + max(0, extra)
+    if deep_demand and not required_tool:
+        # A review/change turn is multi-step by nature (survey, then read,
+        # then act): a weak model spends one attempt per step, so one attempt
+        # always dies on a describe-instead-of-do reply. The extra attempt
+        # costs nothing on turns that succeed first try.
+        total += 1
+    return total
 
 
 def _google_declared(req) -> tuple:
@@ -791,16 +801,6 @@ class GeminiHandler(BaseHTTPRequestHandler):
         ``_map_upstream_error``.
         """
         retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
-        attempts = _tool_retry_attempts(required_tool, tools_active)
-        # Computed once: it inspects the whole conversation, not the reply.
-        owed = pending_tool_request(messages) if tools_active else None
-        # Files the model just listed but never opened: the read-directive
-        # nudge names these so the retry reads instead of guessing.
-        files = listed_turn_files(messages) if tools_active else []
-        # Calls this conversation already has results for: emitting one again
-        # is a loop, not progress.
-        repeatable = _repeatable_calls(messages) if tools_active else set()
-
         # Generic source review ("review source" without a named file) --
         # computed from the last user message, same way as pending_tool_request.
         last_user = None
@@ -821,6 +821,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
         # the same fabrication shape as an unread source review: the model
         # surveyed (glob/grep) and then described the edit from the snippets.
         is_change_turn = change_demanded(messages) if tools_active else False
+
+        # Review/change turns are multi-step (survey, read, act): grant one
+        # more attempt so a describe-instead-of-do reply can still be
+        # converted into the call. Ordinary turns keep the old budget.
+        attempts = _tool_retry_attempts(
+            required_tool, tools_active,
+            deep_demand=(is_generic_source_review or is_change_turn))
+        # Computed once: it inspects the whole conversation, not the reply.
+        owed = pending_tool_request(messages) if tools_active else None
+        # Files the model just listed but never opened: the read-directive
+        # nudge names these so the retry reads instead of guessing.
+        files = listed_turn_files(messages) if tools_active else []
+        # Calls this conversation already has results for: emitting one again
+        # is a loop, not progress.
+        repeatable = _repeatable_calls(messages) if tools_active else set()
 
         text, tool_calls, missing = "", None, []
         dropped = []
@@ -967,6 +982,21 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 continue
             if retry_on_miss and owed:
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
+                continue
+            if (retry_on_miss and tools_active and is_change_turn
+                    and not _turn_act_calls(messages, -1)
+                    and looks_like_described_edit(text)):
+                # The model read the code and then wrote a how-to instead of
+                # editing ("here is how you can...", "since tool calls are no
+                # longer available..."). An edit already emitted anywhere in
+                # the conversation means the work is done -- only a
+                # describe-instead-of-do reply is retried, with a do-it nudge.
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): reply "
+                    f"describes the change instead of making it")
+                nudge_extra = (" You have already read the relevant code -- "
+                               "make the change with the edit/write tool now "
+                               "instead of describing it. Emit the tool_call "
+                               "block(s) and stop.")
                 continue
             if (retry_on_miss and tools_active and not saw_call
                     and (is_generic_source_review or is_change_turn)
