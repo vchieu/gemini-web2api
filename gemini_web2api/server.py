@@ -35,6 +35,8 @@ from .tools import (
     listed_turn_files,
     fresh_declared_unread,
     review_demanded,
+    change_demanded,
+    _conversation_called_files,
     _is_source_review,
     _is_file_review,
     _strip_code_spans,
@@ -815,6 +817,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             if _is_source_review(folded) and not _is_file_review(folded, scannable):
                 is_generic_source_review = True
 
+        # An implement/change turn whose reply names files it never read is
+        # the same fabrication shape as an unread source review: the model
+        # surveyed (glob/grep) and then described the edit from the snippets.
+        is_change_turn = change_demanded(messages) if tools_active else False
+
         text, tool_calls, missing = "", None, []
         dropped = []
         nudge_extra = ""
@@ -839,7 +846,9 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 # A source-review turn that only listed files gets a directive
                 # instead: the permissive "otherwise give your final answer"
                 # is what let the model answer from filenames alone.
-                if not required_tool and is_read_retry_reason(owed):
+                if not required_tool and (is_read_retry_reason(owed)
+                                            or is_generic_source_review
+                                            or is_change_turn):
                     nudge = ("IMPORTANT: You have not read enough of the source yet -- "
                              "listing file names, or opening a single file, is not a review. Call the read tool now "
                              "on the other relevant module(s) and answer from what you actually read.")
@@ -947,7 +956,8 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 continue
             fresh = (fresh_declared_unread(text, messages)
                      if tools_active else [])
-            if tools_active and fresh and is_generic_source_review:
+            if tools_active and fresh and (is_generic_source_review
+                                            or is_change_turn):
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): reply "
                     f"named unread file(s): {', '.join(fresh)}")
                 nudge_extra = (" You named these file(s) as part of the review "
@@ -957,6 +967,20 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 continue
             if retry_on_miss and owed:
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
+                continue
+            if (retry_on_miss and tools_active and not saw_call
+                    and (is_generic_source_review or is_change_turn)
+                    and not _conversation_called_files(messages)):
+                # A review/change request answered in prose with no tool call
+                # ever emitted in the conversation: `owed` was computed before
+                # the reply and only covers user-named files, so a vague
+                # prompt ("review how this proxy loads the cookie") and a
+                # survey-stall (glob/grep, then prose describing the edit)
+                # both slip through. One retry with the read-directive nudge
+                # above; a turn that already has evidence never reaches here.
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                    f"review/change requested but no tool call was ever "
+                    f"emitted")
                 continue
             if retry_on_miss and tools_active and looks_like_missed_tool_call(text):
                 log(f"Tool retry (attempt {attempt + 1}/{attempts}): response "

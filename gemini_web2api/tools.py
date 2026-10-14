@@ -555,11 +555,26 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "if you have only listed or opened one file, read the other relevant ones before you "
         "answer. If you name files as part of the review, read every one of them -- "
         "a file you only mentioned is a file you have not reviewed.\n"
+        "- Fixed flow for EVERY turn, in order, no skipping: "
+        "(1) do you already have a [Tool result for ...] message proving "
+        "everything you need? If YES -> answer as plain text. "
+        "If NO -> output ONLY tool_call block(s) and stop. "
+        "A guess, a generic checklist, or instructions telling the user to "
+        "do it themselves are never an answer. "
+        "(2) When the result arrives, go back to (1).\n"
         "- Output ONLY tool_call block(s): no prose, explanation or apology "
         "before or after them.\n"
         '- Every parameter belongs inside the "arguments" object, keyed exactly '
         'like the "parameters" properties below -- never beside "name".\n'
         "- Emit several blocks in one turn when the calls are independent.\n"
+        "- Search results are leads, not evidence: after a glob/grep survey, "
+        "read the matched files before answering or editing -- never quote "
+        "or patch code you only saw in a snippet.\n"
+        "- Before editing a symbol, check its other usages with a search "
+        "tool; after editing, re-read the changed lines before reporting "
+        "success -- an unverified fix is a claim, not evidence.\n"
+        "- When reporting a bug, quote the exact lines verbatim: line "
+        "numbers without quotes cannot be checked.\n"
         "- Never state that you have read a file, run a command or inspected "
         "the code unless a [Tool result for ...] message proves it. Knowing a "
         "file's contents or a command's output requires calling the tool.\n"
@@ -1507,6 +1522,12 @@ _TOOL_DEMAND_RE = re.compile(
 # noun, including plan/document/design/spec. Weak verbs (check/find/read/...)
 # only combine with code nouns -- "read the plan then implement" is an
 # implement turn, not a source review, and must not be forced to read modules.
+#
+# The broad noun set also covers the system under review when the user names
+# it instead of the code ("review how this proxy loads the session cookie"):
+# with a strong verb the request is unambiguously a codebase inspection, so
+# proxy/server/service/... count. Weak verbs keep the narrow code nouns, so
+# "check the server status" stays silent.
 _SOURCE_REVIEW_VERB_RE = re.compile(
     r"\b(?:review|audit|inspect|examine|check|find|kiem\s+tra|soat|tim|xem\s+xet|doc|danh\s+gia|danhgia)\b",
     re.IGNORECASE,
@@ -1520,7 +1541,7 @@ _SOURCE_CODE_NOUN_RE = re.compile(
     re.IGNORECASE,
 )
 _SOURCE_NOUN_RE = re.compile(
-    r"\b(?:source|code|codebase|ma\s+nguon|implementation|repository|repo|ke\s+hoach|kehoach|plan|document|tai\s+lieu|tai-lieu|thiet\s+ke|thietke|design|specification|spec)\b",
+    r"\b(?:source|code|codebase|ma\s+nguon|implementation|repository|repo|ke\s+hoach|kehoach|plan|document|tai\s+lieu|tai-lieu|thiet\s+ke|thietke|design|specification|spec|proxy|server|service|app|module|package|project)\b",
     re.IGNORECASE,
 )
 
@@ -1867,6 +1888,80 @@ def _created_files(scannable: str, folded: str) -> set:
     return {f.lower() for f in _files_in(scannable)}
 
 
+# A request to CHANGE the code (fix/implement/update/...), matched against
+# folded text like the review heuristics. This is the implement-side twin of
+# `_is_source_review`: the failure it guards is the survey-stall, where the
+# model globs/greps to locate the code and then answers from the snippets --
+# describing the edit instead of reading the file and making it.
+#
+# A bare change verb is not enough ("double it" in a maths chat): it must aim
+# at code -- a file token, a code/config noun, or an explicit act phrase
+# ("make it so"). Creation verbs (create/write/generate) are excluded: a file
+# that does not exist yet must not be demanded for reading.
+_CHANGE_VERB_RE = re.compile(
+    r"\b(?:fix|repair|implement|add|introduce|update|upgrade|change|modify|"
+    r"refactor|remove|delete|drop|double|halve|increase|decrease|migrate|"
+    r"sua|them|cap\s+nhat)\b",
+    re.IGNORECASE,
+)
+_CHANGE_NOUN_RE = re.compile(
+    r"\b(?:source|code\w*|implementation|repository|repo\w*|proxy|server|"
+    r"service|app|module\w*|package|project|config\w*|setting\w*|option\w*|"
+    r"endpoint\w*|rout\w*|test\w*|retr\w*|auth\w*|health\w*|bug\w*|"
+    r"securit\w*|vulnerab\w*)\b",
+    re.IGNORECASE,
+)
+_CHANGE_ACT_RE = re.compile(
+    r"\b(?:make\s+it\s+so|make\s+it\s+work|get\s+it\s+done|do\s+it|"
+    r"go\s+ahead|cu\s+lam|lam\s+di)\b",
+    re.IGNORECASE,
+)
+
+# Tool names that act on the world (not just observe it). A change turn that
+# emitted one of these has done the work; a turn with only glob/grep/read
+# has surveyed but not acted.
+_ACT_TOOL_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:edit|write|create|apply|patch|bash|shell|exec|run|"
+    r"pytest|npm|make)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_change_request(folded: str, scannable: str) -> bool:
+    """True when folded text asks for a code change (fix/implement/update)."""
+    if _CHANGE_ACT_RE.search(folded):
+        return True
+    if not _CHANGE_VERB_RE.search(folded):
+        return False
+    if _CHANGE_NOUN_RE.search(folded):
+        return True
+    return any(f for f in _files_in(scannable)
+               if f.lower() not in _NON_FILE_NAMES)
+
+
+def _turn_act_calls(messages, start_idx) -> bool:
+    """True when this turn already emitted an acting (edit/write/run) call."""
+    for tc in _turn_tool_calls(messages, start_idx):
+        fn = tc.get("function") or {}
+        if isinstance(fn, dict) and _ACT_TOOL_RE.search(fn.get("name") or ""):
+            return True
+    return False
+
+
+def change_demanded(messages) -> bool:
+    """True when the newest user turn asks for a code change."""
+    last_user = None
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = _stringify_content(msg.get("content", ""))
+    if not last_user:
+        return False
+    scannable = _strip_code_spans(last_user)
+    folded = _fold_diacritics(scannable)
+    folded = re.sub(r"\s+", " ", folded).strip()
+    return _is_change_request(folded, scannable)
+
+
 def pending_tool_request(messages) -> str:
     """Why the newest user turn still owes the model a tool call, else ``None``.
 
@@ -1948,10 +2043,22 @@ def pending_tool_request(messages) -> str:
             required_reads = 2
     reads = _reads_this_turn(messages)
     source_reads = _source_reads_this_turn(messages)
-    if turn_has_call and (reads >= required_reads or not source_review):
+    called_lower = {f.lower() for f in _conversation_called_files(messages)}
+    # An implement/change request is owed until the turn shows real contact
+    # with the code: an acting call (edit/write/run), a path read, or a read
+    # from an earlier turn. A glob/grep-only survey is not contact -- the
+    # snippets are leads, not evidence -- so the early "a call ends the
+    # search" return must not swallow it.
+    change_owed = (
+        _is_change_request(folded, scannable)
+        and not _turn_act_calls(messages, last_user_idx)
+        and not files_read_in_turn(messages)
+        and not called_lower
+    )
+    if turn_has_call and (reads >= required_reads or not source_review) \
+            and not change_owed:
         return None
 
-    called_lower = {f.lower() for f in _conversation_called_files(messages)}
     created = _created_files(scannable, folded)
     uncovered = sorted(
         f for f in _files_in(scannable)
@@ -1960,6 +2067,9 @@ def pending_tool_request(messages) -> str:
     )
     if uncovered:
         return "requested file(s) never read: " + ", ".join(uncovered)
+
+    if change_owed:
+        return "change requested but no file content was read or edited"
 
     # Only generic source reviews ("review source") enforce reading every
     # file the model names in its prose. Named-file reviews are handled by
@@ -2038,6 +2148,10 @@ def build_tool_prompt(tool_defs: list) -> str:
         "Listing or globbing file names is not reading.\n"
         "- Output ONLY the function_call block(s), nothing else\n"
         "- You may call multiple tools with multiple blocks\n"
+        "- Fixed flow for EVERY turn: do you already have a [Tool result "
+        "for ...] proving everything you need? If YES -> answer as plain "
+        "text. If NO -> output ONLY function_call block(s) and stop; a "
+        "guess or instructions for the user are never an answer.\n"
         "- Every parameter belongs inside the \"args\" object, keyed exactly "
         "like the parameters properties -- never beside \"name\".\n"
         "- Never state that you have read a file, run a command or inspected "
@@ -2046,6 +2160,10 @@ def build_tool_prompt(tool_defs: list) -> str:
         "they are connected and will run.\n"
         "- Never write [Tool result for ...] yourself, and never invent a "
         "result: emit the block and stop.\n"
+        "- Search results are leads, not evidence: read matched files "
+        "before answering or editing.\n"
+        "- After editing, re-read the changed lines before reporting "
+        "success.\n"
         "- Triple backticks inside a string argument (Markdown or code the user "
         "asked you to save) are literal text: keep all three of them. A fence "
         "inside the JSON never closes the block.\n"

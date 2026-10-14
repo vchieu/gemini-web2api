@@ -35,6 +35,7 @@ from gemini_web2api.tools import (
     _join_prompt_parts,
     _repeatable_calls,
     _strip_fabricated,
+    change_demanded,
     extract_arguments,
     files_read_in_turn,
     listed_turn_files,
@@ -482,6 +483,231 @@ class ChatEndpointRegressionTests(unittest.TestCase):
              "tools": tools})
         self.assertEqual(status, 200)
         self.assertIn("tool_calls", body)
+
+
+class VaguePromptEvidenceTests(unittest.TestCase):
+    """Live-test findings: vague implement/review prompts must still seek evidence.
+
+    Observed against a copy of this repo via opencode:
+    - "Review how this proxy loads and caches the session cookie..." got a
+      generic checklist with zero tool calls (no source noun matched).
+    - "The health check should also work under /v1... Make it so" did
+      glob+grep then described the edit instead of reading/editing.
+    - "Find where the retry count is configured and double it" grepped once
+      then pointed at the wrong setting without reading anything.
+    """
+
+    def test_review_of_unnamed_system_is_source_review(self):
+        self.assertTrue(_is_source_review(
+            "review how this proxy loads and caches the google session "
+            "cookie, and flag any security or correctness issues"))
+
+    def test_vague_review_prose_gets_read_retry(self):
+        # `owed` is computed before the reply, so a vague first-turn review
+        # ("review how this proxy...") can only be caught reply-side: prose
+        # with no call ever emitted must cost one retry, not a 200.
+        self.assertIsNone(pending_tool_request(
+            [{"role": "user",
+              "content": "Review how this proxy loads and caches the Google "
+                         "session cookie, and flag any security or "
+                         "correctness issues"}]))
+
+    def test_status_check_stays_silent(self):
+        self.assertFalse(_is_source_review("check the server status"))
+        self.assertFalse(change_demanded(
+            [{"role": "user", "content": "check the server status"}]))
+        self.assertIsNone(pending_tool_request(
+            [{"role": "user", "content": "check the server status"}]))
+
+    def test_math_word_problem_stays_silent(self):
+        self.assertFalse(change_demanded(
+            [{"role": "user", "content": "double it and add five"}]))
+        self.assertIsNone(pending_tool_request(
+            [{"role": "user", "content": "double it and add five"}]))
+
+    def test_make_it_so_is_change_demanded(self):
+        self.assertTrue(change_demanded(
+            [{"role": "user",
+              "content": "The health check should also work under the /v1 "
+                         "prefix. Make it so, and verify with the test "
+                         "suite"}]))
+
+    def test_survey_only_turn_still_owes_change(self):
+        messages = [
+            {"role": "user",
+             "content": "The health check should also work under the /v1 "
+                        "prefix. Make it so"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "glob", '{"pattern": "**/*"}')]},
+            _tool_msg("c1", "server.py\nworker.js", name="glob"),
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c2", "grep", '{"pattern": "health"}')]},
+            _tool_msg("c2", "server.py: health found", name="grep"),
+        ]
+        owed = pending_tool_request(messages)
+        self.assertIsNotNone(owed)
+        self.assertIn("change requested", owed)
+
+    def test_grep_only_config_turn_still_owes_change(self):
+        messages = [
+            {"role": "user",
+             "content": "Find where the tool-call retry count is configured "
+                        "and double it"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "grep", '{"pattern": "retry"}')]},
+            _tool_msg("c1", "100 matches", name="grep"),
+        ]
+        owed = pending_tool_request(messages)
+        self.assertIsNotNone(owed)
+        self.assertIn("change requested", owed)
+
+    def test_read_then_edit_turn_owes_nothing(self):
+        messages = [
+            {"role": "user", "content": "Fix the crash in server.py"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "read", '{"path": "server.py"}')]},
+            _tool_msg("c1", "code...", name="read"),
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c2", "edit", '{"path": "server.py"}')]},
+            _tool_msg("c2", "ok", name="edit"),
+        ]
+        self.assertIsNone(pending_tool_request(messages))
+
+    def test_prior_turn_read_satisfies_change(self):
+        messages = [
+            {"role": "user", "content": "Add the endpoint"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "read", '{"path": "server.py"}')]},
+            _tool_msg("c1", "code...", name="read"),
+            {"role": "user", "content": "now add it"},
+        ]
+        self.assertIsNone(pending_tool_request(messages))
+
+    def test_creation_turn_owes_nothing(self):
+        messages = [
+            {"role": "user",
+             "content": "Create primes.txt with the first five primes"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "write",
+                                '{"path": "primes.txt"}')]},
+            _tool_msg("c1", "ok", name="write"),
+        ]
+        self.assertIsNone(pending_tool_request(messages))
+
+    def test_prompt_block_teaches_survey_leads_rule(self):
+        prompt, _images = messages_to_prompt(
+            [{"role": "user", "content": "hi"}],
+            [{"type": "function",
+              "function": {"name": "read", "description": "r",
+                           "parameters": {"type": "object",
+                                          "properties": {
+                                              "path": {"type": "string"}}}}}])
+        self.assertIn("leads, not evidence", prompt)
+        self.assertIn("re-read the changed lines", prompt)
+
+    def test_prompt_block_has_fixed_flow(self):
+        prompt, _images = messages_to_prompt(
+            [{"role": "user", "content": "hi"}],
+            [{"type": "function",
+              "function": {"name": "read", "description": "r",
+                           "parameters": {"type": "object",
+                                          "properties": {
+                                              "path": {"type": "string"}}}}}])
+        self.assertIn("Fixed flow for EVERY turn", prompt)
+        self.assertIn("are never an answer", prompt)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_vague_review_prose_retried_once(self, generate):
+        tools = [{"type": "function", "function": {
+            "name": "read", "description": "r",
+            "parameters": {"type": "object",
+                           "properties": {"path": {"type": "string"}}}}}]
+        generate.side_effect = [
+            "A generic checklist with no tool call.",
+            '```tool_call\n{"name": "read", '
+            '"arguments": {"path": "gemini.py"}}\n```',
+        ]
+        server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            original = dict(CONFIG)
+            CONFIG["api_keys"] = []
+            CONFIG["log_requests"] = False
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_address[1], timeout=5)
+            connection.request(
+                "POST", "/v1/chat/completions",
+                body=json.dumps(
+                    {"model": "gemini-3.6-flash",
+                     "messages": [{"role": "user",
+                                   "content": "Review how this proxy loads "
+                                              "and caches the session "
+                                              "cookie"}],
+                     "tools": tools}),
+                headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = response.read().decode()
+            connection.close()
+            CONFIG.clear()
+            CONFIG.update(original)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(generate.call_count, 2)
+            self.assertIn("tool_calls", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_survey_stall_prose_retried_once(self, generate):
+        tools = [{"type": "function", "function": {
+            "name": "grep", "description": "g",
+            "parameters": {"type": "object",
+                           "properties": {"pattern": {"type": "string"}}}}},
+            {"type": "function", "function": {
+                "name": "read", "description": "r",
+                "parameters": {"type": "object",
+                               "properties": {"path": {"type": "string"}}}}}]
+        history = [
+            {"role": "user",
+             "content": "Find where the retry count is configured and "
+                        "double it"},
+            {"role": "assistant", "content": "",
+             "tool_calls": [_tc("c1", "grep", '{"pattern": "retry"}')]},
+            _tool_msg("c1", "100 matches", name="grep"),
+        ]
+        generate.side_effect = [
+            "Edit config.example.json and change 3 to 6.",
+            '```tool_call\n{"name": "read", '
+            '"arguments": {"path": "config.py"}}\n```',
+        ]
+        server = ThreadedServer(("127.0.0.1", 0), GeminiHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            original = dict(CONFIG)
+            CONFIG["api_keys"] = []
+            CONFIG["log_requests"] = False
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", server.server_address[1], timeout=5)
+            connection.request(
+                "POST", "/v1/chat/completions",
+                body=json.dumps({"model": "gemini-3.6-flash",
+                                 "messages": history, "tools": tools}),
+                headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            body = response.read().decode()
+            connection.close()
+            CONFIG.clear()
+            CONFIG.update(original)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(generate.call_count, 2)
+            self.assertIn("tool_calls", body)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
 
 
 if __name__ == "__main__":
