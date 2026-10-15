@@ -32,6 +32,7 @@ from .tools import (
     pending_tool_request,
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
+    is_test_retry_reason,
     listed_turn_files,
     unread_listed_core_files,
     fresh_declared_unread,
@@ -863,22 +864,40 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 # instead: the permissive "otherwise give your final answer"
                 # is what let the model answer from filenames alone.
                 if not required_tool and (is_read_retry_reason(owed)
+                                            or is_test_retry_reason(owed)
                                             or is_generic_source_review
                                             or is_change_turn):
-                    unread_core = unread_listed_core_files(messages) \
-                        if is_generic_source_review else []
-                    if unread_core:
-                        # Escalation over the directive nudge: the S3 live
-                        # probe showed a weak model reading one file and then
-                        # answering prose anyway, ignoring "read the others
-                        # first". While listed core files stay unread, prose
-                        # is forbidden entirely so the retry can only come
-                        # back with read blocks; the answer is allowed on a
-                        # later attempt once the evidence exists.
-                        nudge = ("IMPORTANT: Respond with read tool_call "
-                                 "blocks ONLY -- no prose, before or after. "
-                                 "Read ALL of these files: "
-                                 + ", ".join(unread_core[:12]) + ".")
+                    if is_test_retry_reason(owed):
+                        # The code is edited but no test command ran after
+                        # the edit: direct, not a suggestion. A stale
+                        # pre-edit run does not count.
+                        nudge = ("IMPORTANT: The change is implemented but "
+                                 "untested. Run the unit tests NOW with a "
+                                 "bash tool_call block (python -m unittest "
+                                 "discover -s tests) -- no prose. If no test "
+                                 "covers the changed behavior, add one first "
+                                 "with an edit block, then run the tests.")
+                    elif is_generic_source_review:
+                        unread_core = unread_listed_core_files(messages)
+                        if unread_core:
+                            # Escalation over the directive nudge: the S3 live
+                            # probe showed a weak model reading one file and
+                            # then answering prose anyway, ignoring "read the
+                            # others first". While listed core files stay
+                            # unread, prose is forbidden entirely so the retry
+                            # can only come back with read blocks; the answer
+                            # is allowed on a later attempt once the evidence
+                            # exists.
+                            nudge = ("IMPORTANT: Respond with read tool_call "
+                                     "blocks ONLY -- no prose, before or "
+                                     "after. Read ALL of these files: "
+                                     + ", ".join(unread_core[:12]) + ".")
+                        else:
+                            nudge = ("IMPORTANT: You have not read enough of the source yet -- "
+                                     "listing file names, or opening a single file, is not a review. Call the read tool now "
+                                     "on the other relevant module(s) and answer from what you actually read.")
+                            if files:
+                                nudge += " Read these first: " + ", ".join(files[:8]) + "."
                     else:
                         nudge = ("IMPORTANT: You have not read enough of the source yet -- "
                                  "listing file names, or opening a single file, is not a review. Call the read tool now "

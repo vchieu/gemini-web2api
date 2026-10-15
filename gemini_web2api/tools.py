@@ -584,8 +584,9 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "finds no docs, proceed with source as usual; narrow single-file "
         "tasks never need this step.\n"
         "- Before editing a symbol, check its other usages with a search "
-        "tool; after editing, re-read the changed lines before reporting "
-        "success -- an unverified fix is a claim, not evidence.\n"
+        "tool; after editing, re-read the changed lines, then run the unit "
+        "tests unless told not to -- an unverified fix is a claim, not "
+        "evidence. If no test covers the changed behavior, add one first.\n"
         "- When reporting a bug, quote the exact lines verbatim: line "
         "numbers without quotes cannot be checked.\n"
         "- Never state that you have read a file, run a command or inspected "
@@ -2060,6 +2061,129 @@ def _turn_act_calls(messages, start_idx) -> bool:
     return False
 
 
+# Edit tools vs command tools, split out of _ACT_TOOL_RE: after an implement
+# the proxy must see a TEST RUN, not just any act -- a second edit is not
+# verification. A command call only counts as a test run when its arguments
+# look like one (unittest/pytest/npm test); `bash ls` never counts.
+_EDIT_TOOL_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:edit|write|create|apply|patch)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+_RUN_TOOL_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:bash|shell|exec|run|pytest|npm|make)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+_TEST_CMD_RE = re.compile(
+    r"\b(?:unittest|pytest|npm\s+test|make\s+test|go\s+test)\b",
+    re.IGNORECASE,
+)
+_SOURCE_EDIT_EXT_RE = re.compile(
+    r"\.(?:py|js|jsx|ts|tsx|go|rs|java|rb|php|swift|kt|c|h|cpp)$",
+    re.IGNORECASE,
+)
+# Explicit user opt-out ("do not run tests", "khong chay test", "skip tests").
+# "Do not start the server" is NOT an opt-out: tests still run.
+_NO_TEST_RE = re.compile(
+    r"\b(?:do\s+not|don't|dont|skip|khong\s+chay|dung\s+chay)\b.{0,24}\btests?\b"
+    r"|\bkhong\s+can\s+(?:chay\s+)?test\b",
+    re.IGNORECASE,
+)
+
+
+def _edit_indices(messages) -> list:
+    """Indices of assistant messages that edit a source file, in order."""
+    out = []
+    for i, msg in enumerate(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if not isinstance(fn, dict):
+                continue
+            if not _EDIT_TOOL_RE.search(fn.get("name") or ""):
+                continue
+            args = _tool_arguments_dict(fn)
+            for key in ("path", "filepath", "file_path", "file",
+                        "filename", "file_name", "target", "target_file"):
+                val = args.get(key)
+                if isinstance(val, str) and _SOURCE_EDIT_EXT_RE.search(val.strip()):
+                    out.append(i)
+                    break
+    return out
+
+
+def _test_run_indices(messages) -> list:
+    """Indices of answered test-runner calls, in order.
+
+    A call without a paired tool result proves nothing ran, so unanswered
+    calls never count -- same rule as files_read_in_turn.
+    """
+    answered = set()
+    for msg in messages or []:
+        if (isinstance(msg, dict) and msg.get("role") == "tool"
+                and msg.get("tool_call_id")):
+            answered.add(msg["tool_call_id"])
+    out = []
+    for i, msg in enumerate(messages or []):
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            if tc.get("id") not in answered:
+                continue
+            fn = tc.get("function") or {}
+            if not isinstance(fn, dict):
+                continue
+            if not _RUN_TOOL_RE.search(fn.get("name") or ""):
+                continue
+            args = _tool_arguments_dict(fn)
+            blob = json.dumps(args, ensure_ascii=False) if args \
+                else (fn.get("arguments") if isinstance(fn.get("arguments"), str) else "")
+            if isinstance(blob, str) and _TEST_CMD_RE.search(blob):
+                out.append(i)
+                break
+    return out
+
+
+def implement_test_owed(messages):
+    """Reason a change turn still owes a unit-test run, else None.
+
+    Fires only on the full shape: the user asked for a code change, a
+    source file was edited, and no test command ran after the last edit
+    (a stale pre-edit run does not count). Silent when the user opted out
+    ("do not run tests") or when the edit touched no source file.
+    """
+    last_user = None
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = _stringify_content(msg.get("content", ""))
+    if not last_user:
+        return None
+    scannable = _strip_code_spans(last_user)
+    folded = _fold_diacritics(scannable)
+    folded = re.sub(r"\s+", " ", folded).strip()
+    if not _is_change_request(folded, scannable):
+        return None
+    if _NO_TEST_RE.search(folded):
+        return None
+    edits = _edit_indices(messages)
+    if not edits:
+        return None
+    runs = _test_run_indices(messages)
+    if any(r > edits[-1] for r in runs):
+        return None
+    return ("change implemented but unit tests never ran: run the unit tests "
+            "(python -m unittest discover -s tests); if no test covers the "
+            "changed behavior, add one first, then run")
+
+
+def is_test_retry_reason(reason) -> bool:
+    """True when a retry reason means "implemented but never test-run"."""
+    return bool(reason) and reason.startswith(
+        "change implemented but unit tests never ran")
+
+
 def change_demanded(messages) -> bool:
     """True when the newest user turn asks for a code change."""
     last_user = None
@@ -2185,7 +2309,11 @@ def task_pattern_banner(messages) -> str:
             "(1) survey with glob/grep; (2) read the target files; "
             "(3) act with edit/write/run -- never describe the edit "
             "instead of making it; "
-            "(4) re-read the changed lines before reporting success.]"
+            "(4) re-read the changed lines; "
+            "(5) run the unit tests (python -m unittest discover -s tests) "
+            "unless told not to -- an untested change is unfinished; "
+            "(6) if no test covers the changed behavior, add one first, "
+            "then run.]"
         )
     if pattern == _TASK_PATTERN_TOOL_DEMAND:
         return (
@@ -2275,7 +2403,7 @@ def pending_tool_request(messages) -> str:
         and not called_lower
     )
     if turn_has_call and (reads >= required_reads or not source_review) \
-            and not change_owed:
+            and not change_owed and not implement_test_owed(messages):
         return None
 
     created = _created_files(scannable, folded)
@@ -2289,6 +2417,10 @@ def pending_tool_request(messages) -> str:
 
     if change_owed:
         return "change requested but no file content was read or edited"
+
+    test_owed = implement_test_owed(messages)
+    if test_owed:
+        return test_owed
 
     # Only generic source reviews ("review source") enforce reading every
     # file the model names in its prose. Named-file reviews are handled by
@@ -2389,8 +2521,9 @@ def build_tool_prompt(tool_defs: list) -> str:
         "endpoint or which pattern to follow), glob for README.md / AGENTS.md / "
         "agents.md first and read what exists before reading source. If the "
         "glob finds no docs, proceed with source as usual.\n"
-        "- After editing, re-read the changed lines before reporting "
-        "success.\n"
+        "- After editing, re-read the changed lines, then run the unit "
+        "tests (python -m unittest discover -s tests) unless told not to. "
+        "If no test covers the changed behavior, add one first, then run.\n"
         "- Triple backticks inside a string argument (Markdown or code the user "
         "asked you to save) are literal text: keep all three of them. A fence "
         "inside the JSON never closes the block.\n"

@@ -562,7 +562,7 @@ class VaguePromptEvidenceTests(unittest.TestCase):
         self.assertIsNotNone(owed)
         self.assertIn("change requested", owed)
 
-    def test_read_then_edit_turn_owes_nothing(self):
+    def test_read_then_edit_turn_owes_test_run(self):
         messages = [
             {"role": "user", "content": "Fix the crash in server.py"},
             {"role": "assistant", "content": "",
@@ -572,6 +572,15 @@ class VaguePromptEvidenceTests(unittest.TestCase):
              "tool_calls": [_tc("c2", "edit", '{"path": "server.py"}')]},
             _tool_msg("c2", "ok", name="edit"),
         ]
+        owed = pending_tool_request(messages)
+        self.assertIsNotNone(owed)
+        self.assertIn("unit tests never ran", owed)
+        messages.extend([
+            {"role": "assistant", "content": "", "tool_calls": [_tc(
+                "c3", "bash",
+                '{"command": "python -m unittest discover -s tests"}')]},
+            _tool_msg("c3", "OK", name="bash"),
+        ])
         self.assertIsNone(pending_tool_request(messages))
 
     def test_prior_turn_read_satisfies_change(self):

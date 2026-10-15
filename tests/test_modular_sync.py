@@ -28,6 +28,7 @@ from gemini_web2api.tools import (
     declared_unread,
     detect_task_pattern,
     google_contents_to_prompt,
+    implement_test_owed,
     is_read_retry_reason,
     is_required_tool_choice,
     looks_like_missed_tool_call,
@@ -2543,7 +2544,7 @@ class PendingToolRequestTests(unittest.TestCase):
             {"role": "user", "content": "review server.py and find bugs"}]),
             "FILE_REVIEW")
         self.assertEqual(detect_task_pattern([
-            {"role": "user", "content": "fix the auth bug in server.py"}]),
+            {"role": "user", "content": "fix the auth bug"}]),
             "CHANGE")
         self.assertEqual(detect_task_pattern([
             {"role": "user", "content": "use the tools to read a.py"}]),
@@ -2611,6 +2612,80 @@ class PendingToolRequestTests(unittest.TestCase):
         self.assertIsNone(pending_tool_request(self._six_core_messages(six)))
         self.assertEqual(unread_listed_core_files(self._six_core_messages(six)),
                          [])
+
+    def _implement_messages(self, extra_turns):
+        msgs = [
+            {"role": "user", "content": "fix the auth bug"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "e1", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps(
+                        {"path": "proj/auth.py", "old": "a", "new": "b"})}}]},
+            {"role": "tool", "content": "edited", "tool_call_id": "e1"},
+        ]
+        msgs.extend(extra_turns)
+        return msgs
+
+    def _bash_run(self, cid, command):
+        return [
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": cid, "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": json.dumps({"command": command})}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": cid},
+        ]
+
+    def test_implement_without_test_run_is_owed(self):
+        reason = pending_tool_request(self._implement_messages([]))
+        self.assertIsNotNone(reason)
+        self.assertIn("unit tests never ran", reason)
+        self.assertIsNotNone(implement_test_owed(
+            self._implement_messages([])))
+
+    def test_implement_test_run_after_edit_ends_the_check(self):
+        msgs = self._implement_messages(self._bash_run(
+            "t1", "python -m unittest discover -s tests"))
+        self.assertIsNone(pending_tool_request(msgs))
+        self.assertIsNone(implement_test_owed(msgs))
+
+    def test_implement_stale_pre_edit_run_still_owed(self):
+        msgs = self._bash_run("t0", "python -m pytest tests/")[:2]
+        msgs.insert(0, {"role": "user",
+                        "content": "fix the auth bug"})
+        msgs.extend([
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "e1", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({"path": "proj/auth.py"})}}]},
+            {"role": "tool", "content": "edited", "tool_call_id": "e1"},
+        ])
+        self.assertIsNotNone(implement_test_owed(msgs))
+
+    def test_implement_plain_ls_is_not_a_test_run(self):
+        msgs = self._implement_messages(self._bash_run("t1", "ls tests/"))
+        self.assertIsNotNone(implement_test_owed(msgs))
+
+    def test_implement_opt_out_silences_test_check(self):
+        msgs = [
+            {"role": "user", "content": "fix the auth bug, do not run tests"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "e1", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({"path": "proj/auth.py"})}}]},
+            {"role": "tool", "content": "edited", "tool_call_id": "e1"},
+        ]
+        self.assertIsNone(implement_test_owed(msgs))
+
+    def test_implement_doc_edit_needs_no_test_run(self):
+        msgs = [
+            {"role": "user", "content": "fix the typo in README"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "e1", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({"path": "README.md"})}}]},
+            {"role": "tool", "content": "edited", "tool_call_id": "e1"},
+        ]
+        self.assertIsNone(implement_test_owed(msgs))
 
     def test_source_review_read_this_turn_ends_the_check(self):
         self.assertIsNone(pending_tool_request([
@@ -3383,6 +3458,32 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         self.assertIn("blocks ONLY", nudge)
         self.assertIn("proj/b.py", nudge)
         self.assertNotIn("proj/a.py", nudge)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_implement_prose_after_edit_retries_with_test_directive(self, generate):
+        history = [
+            {"role": "user", "content": "fix the auth bug"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "e1", "type": "function", "function": {
+                    "name": "edit",
+                    "arguments": json.dumps({"path": "proj/auth.py"})}}]},
+            {"role": "tool", "content": "edited", "tool_call_id": "e1"},
+        ]
+        generate.side_effect = [
+            "Done, the bug is fixed.",
+            '```tool_call\n{"name": "bash", "arguments": {"command": "python -m unittest discover -s tests"}}\n```',
+        ]
+
+        text, tool_calls = self._retry(
+            generate, history, allowed_names={"read", "bash"},
+            tool_schemas={"read": {"path"}, "bash": {"command"}},
+            tool_required={"read": {"path"}, "bash": {"command"}})
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(tool_calls[0]["function"]["name"], "bash")
+        nudge = generate.call_args_list[1].args[0]
+        self.assertIn("untested", nudge)
+        self.assertIn("unittest", nudge)
 
     @mock.patch("gemini_web2api.server.generate")
     def test_loop_retries_when_reply_names_unread_file(self, generate):
