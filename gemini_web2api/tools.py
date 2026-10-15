@@ -774,6 +774,11 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     if tool_block:
         last = messages[-1] if messages else None
         last_role = last.get("role") if isinstance(last, dict) else None
+        # The pattern banner goes before the reminder: the reminder has to
+        # stay the final thing the model reads.
+        banner = task_pattern_banner(messages)
+        if banner:
+            parts.append(banner)
         # A turn that already ends in a tool result needs no push to act --
         # it needs permission to stop acting and answer.
         parts.append(_TOOL_RESULT_REMINDER if last_role == "tool"
@@ -2069,6 +2074,127 @@ def change_demanded(messages) -> bool:
     return _is_change_request(folded, scannable)
 
 
+# ─── Task-pattern gate ────────────────────────────────────────────────────
+# A vague request ("review source code") must not be answered like a narrow
+# one ("what does X do"). The proxy classifies the newest user turn up front
+# -- no extra upstream call, purely deterministic -- and each pattern carries
+# a mandatory numbered flow the model must follow. Enforcement lives in
+# pending_tool_request; the banner below announces the detected pattern so
+# the model knows which flow binds it before it acts.
+
+_TASK_PATTERN_GENERIC_REVIEW = "GENERIC_REVIEW"
+_TASK_PATTERN_FILE_REVIEW = "FILE_REVIEW"
+_TASK_PATTERN_CHANGE = "CHANGE"
+_TASK_PATTERN_TOOL_DEMAND = "TOOL_DEMAND"
+
+
+def _core_listed_files(messages) -> list:
+    """Listed ``<root>/*.py`` source files of the main project, else ``[]``.
+
+    Same project-root detection the required-reads check uses: count ``.py``
+    files per first path component, take the busiest root. Bare names
+    (``a.py`` with no directory) never form a core set.
+    """
+    from collections import Counter
+    project_counts = Counter()
+    for f in listed_turn_files(messages):
+        if f.endswith(".py") and not f.startswith("__pycache__/"):
+            parts = f.split("/")
+            if len(parts) > 1:
+                project_counts[parts[0]] += 1
+    if not project_counts:
+        return []
+    main_project = project_counts.most_common(1)[0][0]
+    return sorted(f for f in listed_turn_files(messages)
+                  if f.startswith(main_project + "/") and f.endswith(".py"))
+
+
+def unread_listed_core_files(messages) -> list:
+    """Listed core source files with no read anywhere in the conversation."""
+    core = _core_listed_files(messages)
+    if not core:
+        return []
+    read_lower = files_read_in_turn(messages)
+    called_lower = {f.lower() for f in _conversation_called_files(messages)}
+    return sorted(f for f in core
+                  if f.lower() not in read_lower
+                  and f.lower() not in called_lower)
+
+
+def detect_task_pattern(messages):
+    """Newest user turn's task pattern, else None.
+
+    Priority: a review of named files is a FILE_REVIEW even when it also
+    says "source"; a change request outranks a bare tool demand. Explain /
+    where-is questions return None -- grep + a short read is enough there
+    and a numbered flow would burn calls for nothing.
+    """
+    last_user = None
+    for msg in messages or []:
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user = _stringify_content(msg.get("content", ""))
+    if not last_user:
+        return None
+    scannable = _strip_code_spans(last_user)
+    folded = _fold_diacritics(scannable)
+    folded = re.sub(r"\s+", " ", folded).strip()
+    is_generic = _is_source_review(folded)
+    is_file = _is_file_review(folded, scannable)
+    if is_file:
+        return _TASK_PATTERN_FILE_REVIEW
+    if is_generic:
+        return _TASK_PATTERN_GENERIC_REVIEW
+    if _is_change_request(folded, scannable):
+        return _TASK_PATTERN_CHANGE
+    if _TOOL_DEMAND_RE.search(folded):
+        return _TASK_PATTERN_TOOL_DEMAND
+    return None
+
+
+def task_pattern_banner(messages) -> str:
+    """Mandatory-flow banner for the detected task pattern, else ``""``."""
+    pattern = detect_task_pattern(messages)
+    if pattern == _TASK_PATTERN_GENERIC_REVIEW:
+        core = _core_listed_files(messages)
+        if core:
+            names = ", ".join(core)
+            return (
+                "[Task pattern: GENERIC_REVIEW -- vague review request. "
+                "Mandatory flow, no skipping: (1) glob to survey; "
+                f"(2) read ALL {len(core)} listed source files ({names}) -- "
+                "batch several read blocks in one turn; answering from one "
+                "or two files is fabrication; "
+                "(3) only then answer as plain text with verbatim quotes.]"
+            )
+        return (
+            "[Task pattern: GENERIC_REVIEW -- vague review request. "
+            "Mandatory flow, no skipping: (1) glob to survey; "
+            "(2) read every listed source file -- answering from filenames "
+            "alone is fabrication; (3) only then answer as plain text.]"
+        )
+    if pattern == _TASK_PATTERN_FILE_REVIEW:
+        return (
+            "[Task pattern: FILE_REVIEW. Mandatory flow: "
+            "(1) read every named file fully; "
+            "(2) answer only about what you read, with verbatim quotes. "
+            "A file you did not open is a file you must not discuss.]"
+        )
+    if pattern == _TASK_PATTERN_CHANGE:
+        return (
+            "[Task pattern: CHANGE. Mandatory flow: "
+            "(1) survey with glob/grep; (2) read the target files; "
+            "(3) act with edit/write/run -- never describe the edit "
+            "instead of making it; "
+            "(4) re-read the changed lines before reporting success.]"
+        )
+    if pattern == _TASK_PATTERN_TOOL_DEMAND:
+        return (
+            "[Task pattern: TOOL_DEMAND. Emit the tool_call block(s) now; "
+            "no prose, before or after.]"
+        )
+    return ""
+
+
 def pending_tool_request(messages) -> str:
     """Why the newest user turn still owes the model a tool call, else ``None``.
 
@@ -2125,27 +2251,13 @@ def pending_tool_request(messages) -> str:
                         for msg in messages[last_user_idx + 1:])
     required_reads = 1
     if (is_generic_source_review and len(listed_turn_files(messages)) >= 2):
-        # Require reading most of the listed files for a genuine source review.
-        # Not just 2 -- model would read minimum and hallucinate the rest.
-        # File reviews (review a specific file) are handled by the `uncovered` branch.
-        # Generic source reviews (review source/code/plan) require reading source code.
-        listed = listed_turn_files(messages)
-        # Detect project root from listed files (first path component).
-        # Count Python files in each project root, use the one with most files.
-        from collections import Counter
-        project_counts = Counter()
-        for f in listed:
-            if f.endswith(".py") and not f.startswith("__pycache__/"):
-                parts = f.split("/")
-                if len(parts) > 1:
-                    project_counts[parts[0]] += 1
-        if project_counts:
-            main_project = project_counts.most_common(1)[0][0]
-            core_files = [f for f in listed if f.startswith(main_project + "/") and f.endswith(".py")]
-            if len(core_files) >= 5:
-                required_reads = max(5, len(core_files) - 1)
-            else:
-                required_reads = 2
+        # A vague review is owed until EVERY listed core source file is
+        # read -- not most of them. Reading all-but-one still leaves a
+        # module the answer can hallucinate about, and the S3 live probe
+        # showed one read is all a weak model volunteers on its own.
+        core_files = _core_listed_files(messages)
+        if core_files:
+            required_reads = len(core_files)
         else:
             required_reads = 2
     reads = _reads_this_turn(messages)
@@ -2304,6 +2416,57 @@ def _google_tool_choice_instruction(req: dict) -> str:
     return ""
 
 
+def _google_pseudo_messages(req: dict) -> list:
+    """Google contents as OpenAI-style messages for evidence helpers.
+
+    Pairing is positional: the n-th functionCall gets id ``g{n}`` and the
+    n-th functionResponse answers it. Good enough for read-counting and
+    pattern detection -- never used for routing.
+    """
+    messages = []
+    call_idx = resp_idx = 0
+    ids = []
+    pending_responses = []
+    for content in req.get("contents", []):
+        role = content.get("role", "user")
+        texts = []
+        calls = []
+        for p in content.get("parts", []):
+            if p.get("text"):
+                texts.append(p["text"])
+            elif p.get("functionCall"):
+                fc = p["functionCall"]
+                cid = f"g{call_idx}"
+                call_idx += 1
+                ids.append(cid)
+                calls.append({"id": cid, "type": "function", "function": {
+                    "name": fc.get("name", ""),
+                    "arguments": json.dumps(fc.get("args", {}),
+                                            ensure_ascii=False)}})
+            elif p.get("functionResponse"):
+                pending_responses.append(p["functionResponse"])
+        text = "\n".join(t for t in texts if t)
+        if role == "model":
+            msg = {"role": "assistant", "content": text}
+            if calls:
+                msg["tool_calls"] = calls
+            messages.append(msg)
+        else:
+            if text:
+                messages.append({"role": "user", "content": text})
+            if calls:
+                messages.append({"role": "assistant", "content": "",
+                                 "tool_calls": calls})
+    for fr in pending_responses:
+        cid = ids[resp_idx] if resp_idx < len(ids) else f"g{resp_idx}"
+        resp_idx += 1
+        messages.append({"role": "tool", "tool_call_id": cid,
+                         "name": fr.get("name", ""),
+                         "content": json.dumps(fr.get("response", {}),
+                                               ensure_ascii=False)})
+    return messages
+
+
 def google_contents_to_prompt(req: dict) -> tuple:
     """Convert Google API contents/tools/systemInstruction to (prompt_str, images_list).
 
@@ -2371,6 +2534,11 @@ def google_contents_to_prompt(req: dict) -> tuple:
             parts.append(f"[Assistant]: {text}")
         else:
             parts.append(text)
+
+    if tool_defs:
+        banner = task_pattern_banner(_google_pseudo_messages(req))
+        if banner:
+            parts.append(banner)
 
     return "\n\n".join(p for p in parts if p), images
 

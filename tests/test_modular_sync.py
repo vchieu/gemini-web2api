@@ -26,6 +26,7 @@ from gemini_web2api.server import GeminiHandler, ThreadedServer
 from gemini_web2api.tools import (
     PROMPT_MAX_BYTES,
     declared_unread,
+    detect_task_pattern,
     google_contents_to_prompt,
     is_read_retry_reason,
     is_required_tool_choice,
@@ -38,7 +39,9 @@ from gemini_web2api.tools import (
     parse_tool_calls,
     pending_tool_request,
     SOURCE_REVIEW_OWED,
+    task_pattern_banner,
     tool_required_params,
+    unread_listed_core_files,
 )
 
 
@@ -2532,6 +2535,83 @@ class PendingToolRequestTests(unittest.TestCase):
         ])
         self.assertEqual(reason, SOURCE_REVIEW_OWED)
 
+    def test_task_pattern_gate_classifies_each_shape(self):
+        self.assertEqual(detect_task_pattern([
+            {"role": "user", "content": "review source code and find bugs"}]),
+            "GENERIC_REVIEW")
+        self.assertEqual(detect_task_pattern([
+            {"role": "user", "content": "review server.py and find bugs"}]),
+            "FILE_REVIEW")
+        self.assertEqual(detect_task_pattern([
+            {"role": "user", "content": "fix the auth bug in server.py"}]),
+            "CHANGE")
+        self.assertEqual(detect_task_pattern([
+            {"role": "user", "content": "use the tools to read a.py"}]),
+            "TOOL_DEMAND")
+        self.assertIsNone(detect_task_pattern([
+            {"role": "user", "content": "where is the health endpoint?"}]))
+        self.assertIsNone(detect_task_pattern([]))
+
+    def test_task_pattern_banner_names_flow_per_pattern(self):
+        banner = task_pattern_banner([
+            {"role": "user", "content": "review source code and find bugs"}])
+        self.assertIn("GENERIC_REVIEW", banner)
+        self.assertIn("Mandatory flow", banner)
+        self.assertEqual(task_pattern_banner([
+            {"role": "user", "content": "where is the health endpoint?"}]), "")
+        prompt, _ = messages_to_prompt(
+            [{"role": "user", "content": "review source code and find bugs"}],
+            [{"type": "function", "function": {
+                "name": "read", "description": "read a file",
+                "parameters": {"type": "object", "properties": {}}}},
+             ])
+        self.assertIn("GENERIC_REVIEW", prompt)
+
+    def test_google_path_banner_present_for_generic_review(self):
+        req = {
+            "contents": [{"role": "user",
+                          "parts": [{"text": "review source code and find bugs"}]}],
+            "tools": [{"functionDeclarations": [{
+                "name": "read", "description": "read a file",
+                "parameters": {"type": "object", "properties": {}}}]}],
+        }
+        prompt, _ = google_contents_to_prompt(req)
+        self.assertIn("GENERIC_REVIEW", prompt)
+
+    def _six_core_messages(self, read_names):
+        listed = "\n".join(f"proj/{c}.py" for c in "abcdef")
+        msgs = [
+            {"role": "user", "content": "review source code and find bugs"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c0", "type": "function", "function": {
+                    "name": "glob", "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": listed, "tool_call_id": "c0"},
+        ]
+        for i, name in enumerate(read_names):
+            cid = f"cr{i}"
+            msgs.append({"role": "assistant", "content": "", "tool_calls": [{
+                "id": cid, "type": "function", "function": {
+                    "name": "read",
+                    "arguments": json.dumps({"path": name})}}]})
+            msgs.append({"role": "tool", "content": "code",
+                         "tool_call_id": cid})
+        return msgs
+
+    def test_generic_review_demands_all_core_files_not_most(self):
+        five = [f"proj/{c}.py" for c in "abcde"]
+        self.assertEqual(
+            pending_tool_request(self._six_core_messages(five)),
+            SOURCE_REVIEW_OWED)
+        self.assertEqual(
+            unread_listed_core_files(self._six_core_messages(five)),
+            ["proj/f.py"])
+
+    def test_generic_review_all_core_read_ends_the_check(self):
+        six = [f"proj/{c}.py" for c in "abcdef"]
+        self.assertIsNone(pending_tool_request(self._six_core_messages(six)))
+        self.assertEqual(unread_listed_core_files(self._six_core_messages(six)),
+                         [])
+
     def test_source_review_read_this_turn_ends_the_check(self):
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
@@ -3272,6 +3352,37 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         nudge = generate.call_args_list[1].args[0]
         self.assertTrue("not read enough" in nudge or "not a review" in nudge)
         self.assertIn("a.py", nudge)
+
+    @mock.patch("gemini_web2api.server.generate")
+    def test_generic_review_retry_forbids_prose_until_core_read(self, generate):
+        history = [
+            {"role": "user",
+             "content": "review source và cho biết critical bugs nếu có"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c0", "type": "function",
+                "function": {"name": "glob",
+                             "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "proj/a.py\nproj/b.py",
+             "tool_call_id": "c0"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function",
+                "function": {"name": "read",
+                             "arguments": '{"path": "proj/a.py"}'}}]},
+            {"role": "tool", "content": "print('a')", "tool_call_id": "c1"},
+        ]
+        generate.side_effect = [
+            "The code looks fine overall.",
+            '```tool_call\n{"name": "read", "arguments": {"path": "proj/b.py"}}\n```',
+        ]
+
+        text, tool_calls = self._retry(generate, history)
+
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(tool_calls[0]["function"]["name"], "read")
+        nudge = generate.call_args_list[1].args[0]
+        self.assertIn("blocks ONLY", nudge)
+        self.assertIn("proj/b.py", nudge)
+        self.assertNotIn("proj/a.py", nudge)
 
     @mock.patch("gemini_web2api.server.generate")
     def test_loop_retries_when_reply_names_unread_file(self, generate):

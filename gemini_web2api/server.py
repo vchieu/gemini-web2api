@@ -33,6 +33,7 @@ from .tools import (
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
     listed_turn_files,
+    unread_listed_core_files,
     fresh_declared_unread,
     review_demanded,
     change_demanded,
@@ -864,11 +865,26 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 if not required_tool and (is_read_retry_reason(owed)
                                             or is_generic_source_review
                                             or is_change_turn):
-                    nudge = ("IMPORTANT: You have not read enough of the source yet -- "
-                             "listing file names, or opening a single file, is not a review. Call the read tool now "
-                             "on the other relevant module(s) and answer from what you actually read.")
-                    if files:
-                        nudge += " Read these first: " + ", ".join(files[:8]) + "."
+                    unread_core = unread_listed_core_files(messages) \
+                        if is_generic_source_review else []
+                    if unread_core:
+                        # Escalation over the directive nudge: the S3 live
+                        # probe showed a weak model reading one file and then
+                        # answering prose anyway, ignoring "read the others
+                        # first". While listed core files stay unread, prose
+                        # is forbidden entirely so the retry can only come
+                        # back with read blocks; the answer is allowed on a
+                        # later attempt once the evidence exists.
+                        nudge = ("IMPORTANT: Respond with read tool_call "
+                                 "blocks ONLY -- no prose, before or after. "
+                                 "Read ALL of these files: "
+                                 + ", ".join(unread_core[:12]) + ".")
+                    else:
+                        nudge = ("IMPORTANT: You have not read enough of the source yet -- "
+                                 "listing file names, or opening a single file, is not a review. Call the read tool now "
+                                 "on the other relevant module(s) and answer from what you actually read.")
+                        if files:
+                            nudge += " Read these first: " + ", ".join(files[:8]) + "."
                 else:
                     nudge = (
                         "IMPORTANT: Respond with a tool_call block ONLY."
