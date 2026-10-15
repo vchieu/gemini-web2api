@@ -570,6 +570,12 @@ def _tool_use_block(tools_json: str, constraint: str, tool_defs: list = None) ->
         "- Search results are leads, not evidence: after a glob/grep survey, "
         "read the matched files before answering or editing -- never quote "
         "or patch code you only saw in a snippet.\n"
+        "- When the task needs project-wide context (structure, conventions, "
+        "architecture, where a feature lives), glob for README.md / AGENTS.md / "
+        "agents.md first and read what exists before reading source -- they say "
+        "where things live so the reads land in the right files. If the glob "
+        "finds no docs, proceed with source as usual; narrow single-file "
+        "tasks never need this step.\n"
         "- Before editing a symbol, check its other usages with a search "
         "tool; after editing, re-read the changed lines before reporting "
         "success -- an unverified fix is a claim, not evidence.\n"
@@ -732,7 +738,12 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                         next_content = " ".join(p for p in text_parts if p)
                     name = next_msg.get("name") or id_to_name.get(tcid) or "tool"
                     body = _stringify_content(next_content)
-                    combined += f"\n[Tool result for {name} (id={tcid})]: {body}"
+                    if _is_file_reader_tool(name):
+                        path = _called_file_path(msg.get("tool_calls"), tcid)
+                        combined += (f"\n[Tool result for {name} (id={tcid})]:\n"
+                                     + _format_file_body(path, body))
+                    else:
+                        combined += f"\n[Tool result for {name} (id={tcid})]: {body}"
                 parts.append(combined)
             else:
                 parts.append(f"[Assistant]: {content}")
@@ -743,7 +754,13 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                 continue
             name = msg.get("name") or id_to_name.get(tcid) or "tool"
             body = _stringify_content(content)
-            parts.append(f"[Tool result for {name} (id={tcid})]: {body}")
+            if _is_file_reader_tool(name):
+                # Standalone result (its assistant turn was evicted): no call
+                # args left to recover the path from, so the label is generic.
+                parts.append(f"[Tool result for {name} (id={tcid})]:\n"
+                             + _format_file_body(None, body))
+            else:
+                parts.append(f"[Tool result for {name} (id={tcid})]: {body}")
         else:
             parts.append(_stringify_content(content))
 
@@ -1673,6 +1690,54 @@ def _is_reader_tool(name) -> bool:
     return isinstance(name, str) and bool(_READER_TOOL_RE.search(name))
 
 
+# Tools that return whole-file content (not search snippets). Only these get
+# line numbers + boundaries: numbering a grep hit would fabricate line
+# numbers the file does not have.
+_FILE_READER_TOOL_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:read|cat|view|open|show|head|tail|less)(?:[^a-z0-9]|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_file_reader_tool(name) -> bool:
+    return isinstance(name, str) and bool(_FILE_READER_TOOL_RE.search(name))
+
+
+def _format_file_body(path, body: str) -> str:
+    """Number every line and wrap in boundaries so edits can anchor.
+
+    A bare text blob gives the model no reference point: it cannot tell
+    where one file ends and the next begins, nor which line a symbol sits
+    on -- so patches land in the wrong method. Line numbers + explicit
+    Start/End markers fix both.
+    """
+    label = path.strip() if isinstance(path, str) and path.strip() else "file"
+    lines = body.split("\n")
+    width = max(4, len(str(len(lines))))
+    numbered = "\n".join(f"{i:>{width}} | {line}"
+                         for i, line in enumerate(lines, 1))
+    return f"--- Start {label} ---\n{numbered}\n--- End {label} ---"
+
+
+def _called_file_path(tool_calls, tcid):
+    """File path from the tool call with this id, else None.
+
+    Reads ``path``-like argument keys only (never the whole serialised
+    args): a ``glob {"pattern": "**/x.py"}`` is not a file that was read.
+    """
+    for tc in tool_calls or []:
+        if not isinstance(tc, dict) or tc.get("id") != tcid:
+            continue
+        args = _tool_arguments_dict(tc.get("function") or {})
+        for key in ("path", "filepath", "file_path", "file", "filename",
+                    "file_name", "target", "target_file"):
+            val = args.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        return None
+    return None
+
+
 def _turn_result_ids(messages, start_idx) -> set:
     """``tool_call_id`` values with a ``role == "tool"`` result this turn."""
     ids = set()
@@ -2197,6 +2262,10 @@ def build_tool_prompt(tool_defs: list) -> str:
         "result: emit the block and stop.\n"
         "- Search results are leads, not evidence: read matched files "
         "before answering or editing.\n"
+        "- When the task needs project-wide context (structure, conventions, "
+        "architecture, where a feature lives), glob for README.md / AGENTS.md / "
+        "agents.md first and read what exists before reading source. If the "
+        "glob finds no docs, proceed with source as usual.\n"
         "- After editing, re-read the changed lines before reporting "
         "success.\n"
         "- Triple backticks inside a string argument (Markdown or code the user "
