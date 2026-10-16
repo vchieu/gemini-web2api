@@ -2184,6 +2184,12 @@ def is_test_retry_reason(reason) -> bool:
         "change implemented but unit tests never ran")
 
 
+def is_review_test_reason(reason) -> bool:
+    """True when a retry reason means "review started without test results"."""
+    return bool(reason) and reason.startswith(
+        "review requested but unit tests never ran")
+
+
 def change_demanded(messages) -> bool:
     """True when the newest user turn asks for a code change."""
     last_user = None
@@ -2284,17 +2290,20 @@ def task_pattern_banner(messages) -> str:
             names = ", ".join(core)
             return (
                 "[Task pattern: GENERIC_REVIEW -- vague review request. "
-                "Mandatory flow, no skipping: (1) glob to survey; "
-                f"(2) read ALL {len(core)} listed source files ({names}) -- "
+                "Mandatory flow, no skipping: (1) run the unit tests "
+                "(python -m unittest discover -s tests) so failures point "
+                "at what to read closely; (2) glob to survey; "
+                f"(3) read ALL {len(core)} listed source files ({names}) -- "
                 "batch several read blocks in one turn; answering from one "
                 "or two files is fabrication; "
-                "(3) only then answer as plain text with verbatim quotes.]"
+                "(4) only then answer as plain text with verbatim quotes.]"
             )
         return (
             "[Task pattern: GENERIC_REVIEW -- vague review request. "
-            "Mandatory flow, no skipping: (1) glob to survey; "
-            "(2) read every listed source file -- answering from filenames "
-            "alone is fabrication; (3) only then answer as plain text.]"
+            "Mandatory flow, no skipping: (1) run the unit tests first so "
+            "failures point at what to read closely; (2) glob to survey; "
+            "(3) read every listed source file -- answering from filenames "
+            "alone is fabrication; (4) only then answer as plain text.]"
         )
     if pattern == _TASK_PATTERN_FILE_REVIEW:
         return (
@@ -2402,8 +2411,19 @@ def pending_tool_request(messages) -> str:
         and not files_read_in_turn(messages)
         and not called_lower
     )
+    # A vague review grounds itself in test results first: failing tests
+    # point at the files worth reading closely, and a green suite bounds
+    # the review so covered paths are not hallucinated about. Scoped to
+    # generic reviews only -- demanding a full-suite run for "review this
+    # one file" would burn 25s for nothing.
+    review_test_owed = (
+        is_generic_source_review
+        and turn_has_call
+        and not _test_run_indices(messages)
+    )
     if turn_has_call and (reads >= required_reads or not source_review) \
-            and not change_owed and not implement_test_owed(messages):
+            and not change_owed and not implement_test_owed(messages) \
+            and not review_test_owed:
         return None
 
     created = _created_files(scannable, folded)
@@ -2417,6 +2437,11 @@ def pending_tool_request(messages) -> str:
 
     if change_owed:
         return "change requested but no file content was read or edited"
+
+    if review_test_owed:
+        return ("review requested but unit tests never ran: run the unit "
+                "tests first (python -m unittest discover -s tests) so "
+                "failures point at what to read closely")
 
     test_owed = implement_test_owed(messages)
     if test_owed:

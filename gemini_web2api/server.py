@@ -32,6 +32,7 @@ from .tools import (
     pending_tool_request,
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
+    is_review_test_reason,
     is_test_retry_reason,
     listed_turn_files,
     unread_listed_core_files,
@@ -865,6 +866,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 # is what let the model answer from filenames alone.
                 if not required_tool and (is_read_retry_reason(owed)
                                             or is_test_retry_reason(owed)
+                                            or is_review_test_reason(owed)
                                             or is_generic_source_review
                                             or is_change_turn):
                     if is_test_retry_reason(owed):
@@ -877,6 +879,15 @@ class GeminiHandler(BaseHTTPRequestHandler):
                                  "discover -s tests) -- no prose. If no test "
                                  "covers the changed behavior, add one first "
                                  "with an edit block, then run the tests.")
+                    elif is_review_test_reason(owed):
+                        # A vague review grounds itself in test results
+                        # first: failures point at what to read closely.
+                        nudge = ("IMPORTANT: Run the unit tests NOW with a "
+                                 "bash tool_call block (python -m unittest "
+                                 "discover -s tests) -- no prose. Read the "
+                                 "source files only after you have the test "
+                                 "results, starting with files any failure "
+                                 "implicates.")
                     elif is_generic_source_review:
                         unread_core = unread_listed_core_files(messages)
                         if unread_core:

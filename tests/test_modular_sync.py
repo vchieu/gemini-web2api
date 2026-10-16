@@ -2462,6 +2462,11 @@ class PendingToolRequestTests(unittest.TestCase):
             {"role": "user",
              "content": "Review source code thu muc. Bat buoc dung tool."},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "glob",
                     "arguments": '{"path": "src", "pattern": "**/*"}'}}]},
@@ -2529,6 +2534,11 @@ class PendingToolRequestTests(unittest.TestCase):
         reason = pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "glob",
                     "arguments": '{"pattern": "**/*"}'}}]},
@@ -2584,6 +2594,12 @@ class PendingToolRequestTests(unittest.TestCase):
         msgs = [
             {"role": "user", "content": "review source code and find bugs"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": json.dumps(
+                        {"command": "python -m unittest discover -s tests"})}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c0", "type": "function", "function": {
                     "name": "glob", "arguments": '{"pattern": "**/*"}'}}]},
             {"role": "tool", "content": listed, "tool_call_id": "c0"},
@@ -2612,6 +2628,30 @@ class PendingToolRequestTests(unittest.TestCase):
         self.assertIsNone(pending_tool_request(self._six_core_messages(six)))
         self.assertEqual(unread_listed_core_files(self._six_core_messages(six)),
                          [])
+
+    def test_generic_review_without_test_run_owes_tests_first(self):
+        msgs = [
+            {"role": "user", "content": "review source code and find bugs"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c0", "type": "function", "function": {
+                    "name": "glob", "arguments": '{"pattern": "**/*"}'}}]},
+            {"role": "tool", "content": "proj/a.py\nproj/b.py",
+             "tool_call_id": "c0"},
+        ]
+        reason = pending_tool_request(msgs)
+        self.assertIsNotNone(reason)
+        self.assertIn("unit tests never ran", reason)
+        self.assertIn("review requested", reason)
+
+    def test_file_review_needs_no_test_run(self):
+        self.assertIsNone(pending_tool_request([
+            {"role": "user", "content": "review proj/a.py for bugs"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "c1", "type": "function", "function": {
+                    "name": "read",
+                    "arguments": json.dumps({"path": "proj/a.py"})}}]},
+            {"role": "tool", "content": "code", "tool_call_id": "c1"},
+        ]))
 
     def _implement_messages(self, extra_turns):
         msgs = [
@@ -2691,6 +2731,11 @@ class PendingToolRequestTests(unittest.TestCase):
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
                     "arguments": '{"path": "a.py"}'}}]},
@@ -2700,6 +2745,11 @@ class PendingToolRequestTests(unittest.TestCase):
     def test_source_review_one_read_with_two_candidates_still_owed(self):
         reason = pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
@@ -2711,6 +2761,11 @@ class PendingToolRequestTests(unittest.TestCase):
     def test_source_review_two_distinct_reads_end_the_check(self):
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
@@ -2733,6 +2788,11 @@ class PendingToolRequestTests(unittest.TestCase):
         reason = pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
                     "arguments": '{"path": "a.py"}'}}]},
@@ -2745,6 +2805,11 @@ class PendingToolRequestTests(unittest.TestCase):
     def test_declared_files_all_read_end_the_check(self):
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
@@ -2777,6 +2842,11 @@ class PendingToolRequestTests(unittest.TestCase):
         messages = [
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
                     "arguments": '{"path": "a.py"}'}}]},
@@ -2791,6 +2861,11 @@ class PendingToolRequestTests(unittest.TestCase):
         """``Node.js`` in prose is a runtime, never an owed file."""
         messages = [
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
@@ -2810,6 +2885,11 @@ class PendingToolRequestTests(unittest.TestCase):
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
                     "arguments": '{"path": "a.py"}'}}]},
@@ -2819,6 +2899,11 @@ class PendingToolRequestTests(unittest.TestCase):
     def test_source_review_dot_path_does_not_count_as_a_file(self):
         reason = pending_tool_request([
             {"role": "user", "content": "review source va cho biet critical bugs neu co"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "read",
@@ -2840,6 +2925,11 @@ class PendingToolRequestTests(unittest.TestCase):
         """
         self.assertIsNone(pending_tool_request([
             {"role": "user", "content": "review source va tim bug gium"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function", "function": {
                     "name": "grep",
@@ -3410,6 +3500,11 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
             {"role": "user",
              "content": "review source và cho biết critical bugs nếu có"},
             {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
+            {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function",
                 "function": {"name": "glob",
                              "arguments": '{"pattern": "**/*"}'}}]},
@@ -3433,6 +3528,11 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         history = [
             {"role": "user",
              "content": "review source và cho biết critical bugs nếu có"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c0", "type": "function",
                 "function": {"name": "glob",
@@ -3490,6 +3590,11 @@ class ToolRetryLoopGuardTests(unittest.TestCase):
         history = [
             {"role": "user",
              "content": "review source và cho biết critical bugs nếu có"},
+            {"role": "assistant", "content": "", "tool_calls": [{
+                "id": "ct", "type": "function", "function": {
+                    "name": "bash",
+                    "arguments": '{"command": "python -m unittest discover -s tests"}'}}]},
+            {"role": "tool", "content": "OK", "tool_call_id": "ct"},
             {"role": "assistant", "content": "", "tool_calls": [{
                 "id": "c1", "type": "function",
                 "function": {"name": "read",
