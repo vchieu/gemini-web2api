@@ -80,13 +80,18 @@ OLD_STREAMED_FN = '''def _streamed_generate(call_prompt, model_id, think_mode, f
 NEW_STREAMED_FN = '''def _complete_call_end(text: str):
     """Char index just past the LAST closed, parseable tool-call block, else None.
 
-    Reuses the real parser machinery (_iter_tool_blocks + JSONDecoder.raw_decode
-    over the prefix), so early-exit fires exactly when the buffered text holds
-    calls that would actually be accepted -- not on any stray triple-backtick.
-    A payload still streaming fails raw_decode (or its closing fence has not
-    arrived) and only counts the blocks closed before it.
+    Uses the same primitives as the real parser (_FENCE_OPEN/_FENCE_CLOSE +
+    JSONDecoder.raw_decode with strict=False), so early-exit fires exactly
+    when the buffered prefix already holds a call ``parse_tool_calls`` would
+    accept -- never on a stray triple-backtick. Conservative by design:
+    * a payload still streaming fails raw_decode -> wait for more deltas;
+    * a non-JSON body (Python-style ``read(path="x")``) is NOT counted --
+      AST recovery happens later in parse_tool_calls, so such turns simply
+      read to completion instead of risking a cut-off call;
+    * prose ```json examples are skipped and scanning continues -- the real
+      call may follow them.
     """
-    from .tools import _NOTHING, _ARGUMENT_KEYS, _FENCE_OPEN, _FENCE_CLOSE
+    from .tools import _ARGUMENT_KEYS, _FENCE_OPEN, _FENCE_CLOSE
     dec = json.JSONDecoder(strict=False)
     last_end = None
     pos = 0
@@ -101,29 +106,23 @@ NEW_STREAMED_FN = '''def _complete_call_end(text: str):
         try:
             data, end = dec.raw_decode(text, j)
         except ValueError:
-            # Payload not complete (or not JSON): a Python-style call could
-            # still close later -- stop scanning, keep earlier blocks.
+            # Body not (yet) valid JSON: keep any earlier closed block and
+            # wait for more deltas rather than cutting mid-payload.
             return last_end
         counted = False
         if isinstance(data, dict) and data.get("name"):
             if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
                 counted = True
-        elif data is _NOTHING and kind != "json":
-            # Declared tool-call fence whose body is not (yet) valid JSON:
-            # wait for its closing fence; parse_tool_calls may still recover it.
-            close = text.find("```", m.end())
-            if close == -1:
-                return last_end
-            counted = True
-            end = close
-        if counted:
+        if not counted:
+            # Prose example or non-call payload: skip it, keep scanning.
             c = _FENCE_CLOSE.match(text, end)
-            if not c:
-                return last_end      # closing fence still streaming
-            last_end = c.end()
-            pos = last_end
-        else:
-            pos = max(end, m.end())
+            pos = c.end() if c else max(end, m.end())
+            continue
+        c = _FENCE_CLOSE.match(text, end)
+        if not c:
+            return last_end          # closing fence still streaming
+        last_end = c.end()
+        pos = last_end
 
 
 def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
