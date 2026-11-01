@@ -1,0 +1,2033 @@
+"""HTTP server: OpenAI-compatible API endpoints."""
+import json
+import time
+import uuid
+import re
+import hmac
+import threading
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+
+from .config import CONFIG
+from .models import MODELS, resolve_model, ticket_for
+from .gemini import generate, generate_stream, log, GeminiError, trace
+from .tools import (
+    messages_to_prompt,
+    parse_tool_calls,
+    google_contents_to_prompt,
+    parse_google_function_calls,
+    _canonical_args,
+    _google_repeatable,
+    _google_pseudo_messages,
+    unverified_quotes,
+    _repeatable_calls,
+    build_response_format_instruction,
+    strip_code_fence,
+    tool_names,
+    tool_parameters,
+    tool_required_params,
+    missing_required_params,
+    is_required_tool_choice,
+    looks_like_missed_tool_call,
+    looks_like_upstream_error,
+    looks_like_extension_refusal,
+    pending_tool_request,
+    SOURCE_REVIEW_OWED,
+    is_read_retry_reason,
+    is_review_test_reason,
+    is_test_retry_reason,
+    listed_turn_files,
+    unread_listed_core_files,
+    fresh_declared_unread,
+    review_demanded,
+    change_demanded,
+    looks_like_described_edit,
+    _conversation_called_files,
+    _turn_act_calls,
+    _is_source_review,
+    _is_file_review,
+    _strip_code_spans,
+    _fold_diacritics,
+    _stringify_content,
+)
+from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
+from . import __version__
+
+
+ERR_INVALID_REQUEST = "invalid_request_error"
+ERR_RATE_LIMIT = "rate_limit_error"
+ERR_API = "api_error"
+
+# Gap between SSE keep-alive comments while a buffered turn still works
+# upstream. Must stay well under every client's idle/chunk timeout (OpenCode
+# defaults to 300 s).
+SSE_PING_INTERVAL_SEC = 15
+
+_MISSING = object()
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(text or "") // 4
+
+
+def _usage(prompt: str, text: str) -> dict:
+    p = _estimate_tokens(prompt)
+    c = _estimate_tokens(text)
+    return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _normalize_stop(stop) -> list:
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        return [stop] if stop else []
+    if isinstance(stop, list):
+        return [s for s in stop if isinstance(s, str) and s]
+    return []
+
+
+def _apply_stop(text: str, stops: list) -> str:
+    if not text or not stops:
+        return text
+    cut = None
+    for s in stops:
+        idx = text.find(s)
+        if idx != -1 and (cut is None or idx < cut):
+            cut = idx
+    return text[:cut] if cut is not None else text
+
+
+def _apply_max_tokens(text: str, max_tokens) -> tuple:
+    """Return (text, truncated) after applying an estimated token budget."""
+    if not isinstance(max_tokens, int) or max_tokens <= 0:
+        return text, False
+    limit = max_tokens * 4
+    if len(text) > limit:
+        return text[:limit], True
+    return text, False
+
+
+def _responses_text_format(text_field) -> dict:
+    """Map a Responses API ``text.format`` object to a Chat ``response_format``.
+
+    The field name differs (``text.format`` vs ``response_format``) and the
+    JSON schema sits one level further up:
+    ``{"type":"json_schema","schema":{...}}`` instead of
+    ``{"type":"json_schema","json_schema":{"schema":{...}}}``.
+    """
+    if not isinstance(text_field, dict):
+        return None
+    fmt = text_field.get("format")
+    if not isinstance(fmt, dict):
+        return None
+    if fmt.get("type") == "json_object":
+        return {"type": "json_object"}
+    if fmt.get("type") == "json_schema":
+        if isinstance(fmt.get("json_schema"), dict):
+            return {"type": "json_schema", "json_schema": fmt["json_schema"]}
+        return {"type": "json_schema", "json_schema": {"schema": fmt.get("schema", {})}}
+    return None
+
+
+def _map_upstream_error(e) -> tuple:
+    """Map an upstream exception to (status, message, type, code).
+
+    503 rather than 502: the spec declares 400/401/403/404/429/500/503 for
+    ``/chat/completions`` and 400/404/429/503 for ``/responses``. A 502 is
+    documented only for the audio endpoints, and a strict client that treats
+    undeclared statuses as a protocol error would reject it. Upstream Gemini
+    failing is exactly the "service unavailable" case 503 describes.
+    """
+    status = getattr(e, "status", None)
+    if status is None:
+        status = getattr(e, "code", None)
+    if status is None:
+        status = getattr(getattr(e, "response", None), "status_code", None)
+    if status == 429:
+        return 429, f"upstream rate limited: {e}", ERR_RATE_LIMIT, "rate_limit_exceeded"
+    if status:
+        return 503, f"upstream error ({status}): {e}", ERR_API, None
+    return 503, f"upstream error: {e}", ERR_API, None
+
+
+def _map_google_error(e) -> tuple:
+    """Map an upstream exception to (status, message, google_status)."""
+    status, message, _type, _code = _map_upstream_error(e)
+    gstatus = "RESOURCE_EXHAUSTED" if status == 429 else "UNAVAILABLE"
+    return status, message, gstatus
+
+
+def _upload_images(images: list) -> list:
+    """Upload images and return list of file references. Returns None if no images."""
+    if not images:
+        return None
+    file_refs = []
+    for item in images:
+        if not (isinstance(item, tuple) and len(item) == 2):
+            continue
+        data, mime = item
+        if isinstance(data, str):
+            data = fetch_image_bytes(data)
+            mime = mime or "image/png"
+        if not data:
+            raise RuntimeError("image fetch failed")
+        mime = detect_image_mime(data, mime or "image/png")
+        try:
+            ref = upload_image(data, "image.png", mime or "image/png")
+            file_refs.append(ref)
+        except Exception as e:
+            raise RuntimeError(f"image upload failed: {e}") from e
+    return file_refs if file_refs else None
+
+
+def _tool_retry_attempts(required_tool: bool, tools_active: bool,
+                         deep_demand: bool = False) -> int:
+    """Total upstream attempts for a turn that is expected to end in a call.
+
+    One retry leaves a model that answers in prose instead of emitting the
+    block failing on a meaningful share of turns (and every ``tool_choice:
+    "required"`` failure is a 503 for the client), so the number of extra
+    attempts is configurable -- ``tool_retry_attempts`` in the config. The
+    default of 1 keeps the cost at "one extra call, and only when the first
+    one already failed"; an operator running a forgetful model raises it
+    instead of everyone paying for three calls on turns that succeeded.
+    """
+    if not (required_tool or (tools_active and CONFIG.get("tool_retry_on_miss"))):
+        return 1
+    try:
+        extra = int(CONFIG.get("tool_retry_attempts", 1))
+    except (TypeError, ValueError):
+        extra = 1
+    total = 1 + max(0, extra)
+    if deep_demand and not required_tool:
+        # A review/change turn is multi-step by nature (survey, then read,
+        # then act): a weak model spends one attempt per step, so one attempt
+        # always dies on a describe-instead-of-do reply. The extra attempt
+        # costs nothing on turns that succeed first try.
+        total += 1
+    return total
+
+
+def _google_declared(req) -> tuple:
+    """``(allowed_names, schemas, required)`` from a Google native request.
+
+    Mirrors :func:`tool_names` / :func:`tool_parameters` /
+    :func:`tool_required_params` for ``functionDeclarations`` so the retry
+    loop can normalise names, infer nothing silently, and demand required
+    parameters -- the parity the OpenAI path already has.
+    """
+    allowed, schemas, required = set(), {}, {}
+    for tool_group in req.get("tools") or []:
+        if not isinstance(tool_group, dict):
+            continue
+        for fn in tool_group.get("functionDeclarations", []) or []:
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            name = fn["name"]
+            allowed.add(name)
+            params = fn.get("parameters") or fn.get("parametersJsonSchema") or {}
+            props = params.get("properties") if isinstance(params, dict) else None
+            schemas[name] = set(props) if isinstance(props, dict) else set()
+            req_list = params.get("required") if isinstance(params, dict) else None
+            if isinstance(req_list, list):
+                required[name] = {n for n in req_list if isinstance(n, str)}
+    return allowed or None, schemas or None, required or None
+
+
+def _log_tool_trace(raw_text: str, tool_calls) -> None:
+    """Log what the model emitted and what was parsed out of it.
+
+    A tool call that reaches the client with missing or unusable arguments is
+    indistinguishable, from the client's side, from a model that simply wrote
+    ``{"arguments": {}}``. The raw block is the only place that shows whether
+    the model or the parser is at fault, so log it whenever tools are involved.
+
+    Argument values are truncated (per-call and per-value caps): a ``write``
+    call carries a whole file body, and logging it verbatim to stderr or
+    ``log_file`` under plain ``log_requests=true`` leaks file content into
+    logs the README only warns about for the debug flags.
+    """
+    blocks = raw_text.count("```tool_call")
+    log(f"upstream: {len(raw_text)} chars, {blocks} tool_call marker(s)")
+    for m in re.finditer(r"```tool_call[ \t]*\n?(.*?)\n?```", raw_text, re.DOTALL):
+        log(f"tool_call block: {m.group(1).strip()[:500]}")
+    if blocks and not tool_calls:
+        log("tool_call marker(s) present but no tool call was parsed")
+    if tool_calls:
+        redacted = []
+        for tc in tool_calls:
+            try:
+                fn = (tc or {}).get("function") or {}
+                args_text = fn.get("arguments") or "{}"
+                args = json.loads(args_text) if isinstance(args_text, str) else args_text
+                if isinstance(args, dict):
+                    short = {}
+                    for k, v in args.items():
+                        s = v if isinstance(v, str) else json.dumps(v, ensure_ascii=False)
+                        short[k] = (s[:200] + "…[truncated]"
+                                    if len(s) > 200 else s)
+                    redacted.append({"name": fn.get("name"), "arguments": short})
+                else:
+                    redacted.append({"name": fn.get("name"),
+                                     "arguments": str(args)[:200]})
+            except (json.JSONDecodeError, ValueError, TypeError):
+                redacted.append({"name": (tc.get("function") or {}).get("name"),
+                                 "arguments": "[unparsable]"})
+            if len(json.dumps(redacted, ensure_ascii=False)) > 2000:
+                redacted.append("[... further calls truncated ...]")
+                break
+        log(f"parsed tool_calls: {json.dumps(redacted, ensure_ascii=False)}")
+    if not tool_calls:
+        # With tools offered and nothing parsed, the raw text is the only place
+        # that distinguishes "model answered in prose" from "model used a fence
+        # we do not recognise" (```json / ```function_call / bare JSON) -- both
+        # look identical in the marker count above.
+        fences = sorted({(m.group(1) or "bare").lower()
+                         for m in re.finditer(r"```([A-Za-z0-9_+-]*)", raw_text)})
+        log(f"no tool_call parsed; fences seen: {', '.join(fences) or 'none'}")
+        log(f"no tool_call parsed; text head: {raw_text[:400]!r}")
+
+
+class GeminiHandler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        client_ip = self.client_address[0] if self.client_address else "-"
+        log(f"{client_ip} {fmt % args}")
+
+    # ─── CORS / security helpers ──────────────────────────────────────────────
+
+    def _cors_origin(self) -> str:
+        """Return the Access-Control-Allow-Origin value, or '' to omit.
+
+        When api_keys is empty the server is unauthenticated; sending
+        ``*`` would let any malicious page read the response.  We only
+        emit the header when the operator explicitly configured
+        ``cors_origins``.
+        """
+        origins = CONFIG.get("cors_origins") or []
+        if not origins:
+            return ""
+        if "*" in origins:
+            return "*"
+        # Echo back the requesting origin if it is in the whitelist.
+        origin = self.headers.get("Origin", "")
+        if origin in origins:
+            return origin
+        return ""
+
+    def _send_cors_headers(self):
+        """Send CORS headers if applicable."""
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, x-api-key, x-goog-api-key",
+            )
+
+    def _check_host(self) -> bool:
+        """Reject requests whose Host header is not a loopback / configured host.
+
+        This blocks DNS-rebinding attacks where an attacker's domain resolves
+        to 127.0.0.1 but the browser sends ``Host: attacker.com``.
+
+        Three cases where the check is deliberately not restrictive:
+
+        * ``api_keys`` configured -- the request already had to present a valid
+          key, so a rebound hostname buys nothing (``do_GET`` never runs this
+          check either, so only POST was ever gated);
+        * a wildcard bind (``0.0.0.0`` / ``::``) with ``api_keys`` -- the
+          operator chose to serve every interface AND configured auth, so LAN
+          IPs and container hostnames must pass;
+        * no ``Host`` header at all (non-HTTP/1.1 edge case).
+
+        The hostname is parsed with ``urlsplit`` so ``[::1]:8081`` yields
+        ``::1`` instead of the unbracketed ``[::1]`` that ``rsplit(":")``
+        produced, and a port is never mistaken for part of the name.
+
+        NOTE: A wildcard bind WITHOUT ``api_keys`` does NOT bypass the check.
+        This prevents accidental exposure when binding 0.0.0.0 on a public
+        interface without authentication.
+        """
+        if CONFIG.get("api_keys"):
+            return True
+        host = self.headers.get("Host", "")
+        if not host:
+            return True
+        hostname = (urllib.parse.urlsplit("//" + host).hostname or "").lower()
+        if not hostname:
+            return True
+        allowed = {"localhost", "127.0.0.1", "::1"}
+        bind_host = (CONFIG.get("host") or "").lower().strip("[]")
+        if bind_host:
+            if bind_host in ("0.0.0.0", "::", "*"):
+                # Wildcard bind ONLY bypasses check when api_keys is set.
+                # Without auth, we still restrict to loopback to prevent
+                # accidental public exposure.
+                pass
+            else:
+                allowed.add(bind_host)
+        return hostname in allowed
+
+    def _check_origin(self) -> bool:
+        """Reject cross-origin requests when no API key is configured.
+
+        A malicious page can issue a ``text/plain`` POST (simple request, no
+        preflight) to our endpoint.  Without an API key we cannot distinguish
+        a legitimate local client from an attacker's page, so we reject any
+        request that carries an ``Origin`` header not in the whitelist.
+        """
+        keys = CONFIG.get("api_keys") or []
+        if keys:
+            return True  # Authenticated: origin check is not needed
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True  # No Origin: likely a non-browser client
+        origins = CONFIG.get("cors_origins") or []
+        if "*" in origins:
+            return True
+        return origin in origins
+
+    # ─── response helpers ─────────────────────────────────────────────────────
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode()
+        trace(f"PROXY -> CLIENT (HTTP {status})", body)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self._send_cors_headers()
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_api_error(self, status, message, type_=ERR_API, code=None):
+        """Send an OpenAI-shaped error body."""
+        self.send_json(
+            {"error": {"message": message, "type": type_, "param": None, "code": code}},
+            status,
+        )
+
+    def send_google_error(self, status, message, gstatus="UNKNOWN"):
+        """Send a Google Gemini-shaped error body."""
+        self.send_json({"error": {"code": status, "message": message, "status": gstatus}}, status)
+
+    def _start_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self._send_cors_headers()
+        self.end_headers()
+
+    def _sse_write(self, data: bytes):
+        """Write raw bytes to the SSE stream.
+
+        A keep-alive thread may be writing ``: ping`` comments concurrently
+        (see ``_start_sse_with_keepalive``), so every SSE write goes through
+        one lock -- an interleaved frame would corrupt the stream.
+        """
+        lock = getattr(self, "_sse_lock", None)
+        if lock is None:
+            self.wfile.write(data)
+            self.wfile.flush()
+            return
+        with lock:
+            self.wfile.write(data)
+            self.wfile.flush()
+
+    def _start_sse_with_keepalive(self):
+        """Send the SSE response head *now* and keep the wire warm.
+
+        A buffered turn (tools active, or response_format set) can spend
+        minutes upstream -- a thinking model plus one heuristic retry -- and
+        HTTP carries its status line with the first body byte. A client that
+        waits for response headers would see nothing at all until the very
+        end and abort on its own header timeout (observed with OpenCode:
+        "Timed out waiting for response headers", every 5 minutes, forever,
+        while upstream answers kept arriving at a dead socket).
+
+        Sending the head immediately plus an SSE comment every
+        ``SSE_PING_INTERVAL_SEC`` keeps every idle timeout quiet; comments
+        dispatch no event, so conformant clients never see them.
+        """
+        self._sse_lock = threading.Lock()
+        client_gone = threading.Event()
+        self._start_sse()
+
+        stop_ping = threading.Event()
+
+        def _ping():
+            while not stop_ping.wait(SSE_PING_INTERVAL_SEC):
+                try:
+                    self._sse_write(b": ping\n\n")
+                except (BrokenPipeError, ConnectionResetError):
+                    # Nobody is listening any more; the caller uses this to
+                    # stop burning upstream calls for an answer no one gets.
+                    client_gone.set()
+                    return
+                except Exception:
+                    return
+
+        threading.Thread(target=_ping, daemon=True).start()
+        return stop_ping.set, client_gone
+
+    def _sse_chunk(self, cid, model, delta, finish_reason, include_usage=False):
+        # ``logprobs`` is required (nullable) on the choice of a chat chunk and
+        # ``delta`` must open with an empty ``content`` so clients that read
+        # ``delta.content`` on the first chunk (NextChat among them) see a
+        # string rather than an absent key.
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "delta": delta, "logprobs": None,
+                         "finish_reason": finish_reason}],
+        }
+        if include_usage:
+            # stream_options.include_usage: every chunk carries a usage field,
+            # null until the final usage chunk.
+            chunk["usage"] = None
+        frame = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        trace("PROXY -> CLIENT (SSE frame)", frame)
+        self._sse_write(frame.encode())
+
+    def _sse_usage(self, cid, model, prompt, text):
+        chunk = {
+            "id": cid,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [],
+            "usage": _usage(prompt, text),
+        }
+        frame = f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        trace("PROXY -> CLIENT (SSE usage)", frame)
+        self._sse_write(frame.encode())
+
+    def _sse_event_error(self, status, message, type_=ERR_API, code=None):
+        payload = {"error": {"message": message, "type": type_, "param": None, "code": code}}
+        frame = f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        trace("PROXY -> CLIENT (SSE error)", frame)
+        self._sse_write(frame.encode())
+
+    def _sse_done(self):
+        trace("PROXY -> CLIENT (SSE done)", "data: [DONE]\n\n")
+        self._sse_write(b"data: [DONE]\n\n")
+
+# ─── request parsing / auth / routing ─────────────────────────────────────
+
+    def _parse_body(self, body: bytes):
+        try:
+            return json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+    def _read_request_body(self) -> bytes:
+        transfer_encoding = self.headers.get("Transfer-Encoding", "")
+        if "chunked" in transfer_encoding.lower():
+            chunks = []
+            total = 0
+            limit = CONFIG.get("max_body_bytes", 32 * 1024 * 1024)
+            while True:
+                size_line = self.rfile.readline()
+                if not size_line:
+                    break
+                size_text = size_line.split(b";", 1)[0].strip()
+                try:
+                    size = int(size_text, 16)
+                except ValueError:
+                    raise ValueError("invalid chunked request body")
+                if size == 0:
+                    while True:
+                        trailer = self.rfile.readline()
+                        if trailer in (b"\r\n", b"\n", b""):
+                            break
+                    break
+                total += size
+                if total > limit:
+                    raise ValueError("request body too large")
+                chunks.append(self.rfile.read(size))
+                # Consume the trailing CRLF after each chunk. Some non-conformant
+                # clients send only LF; read until we hit a newline to be robust.
+                crlf = self.rfile.read(1)
+                if crlf == b"\r":
+                    self.rfile.read(1)  # consume LF
+                elif crlf != b"\n":
+                    # Unexpected byte; push back by treating as part of next read
+                    # (unlikely in practice, but avoids desync)
+                    pass
+            return b"".join(chunks)
+
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            return b""
+        try:
+            length = int(raw_len)
+        except (ValueError, TypeError):
+            raise ValueError("invalid Content-Length header")
+        if length < 0:
+            raise ValueError("invalid Content-Length header")
+        if length > CONFIG.get("max_body_bytes", 32 * 1024 * 1024):
+            raise ValueError("request body too large")
+        return self.rfile.read(length) if length else b""
+
+    def _route_path(self) -> str:
+        """Return the request path without query string / trailing slash."""
+        return urllib.parse.urlparse(self.path).path.rstrip("/") or "/"
+
+    def _authorized(self):
+        keys = CONFIG.get("api_keys") or []
+        if not keys:
+            return True
+        provided = []
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            provided.append(auth[7:])
+        for header in ("x-api-key", "x-goog-api-key"):
+            value = self.headers.get(header)
+            if value:
+                provided.append(value)
+        query = urllib.parse.urlparse(self.path).query
+        for pair in query.split("&"):
+            if pair.startswith("key="):
+                provided.append(urllib.parse.unquote(pair[4:]))
+        for value in provided:
+            for key in keys:
+                if isinstance(key, str) and hmac.compare_digest(value.encode(), key.encode()):
+                    return True
+        return False
+
+    def _needs_auth(self, path: str) -> bool:
+        return path not in ("/", "/health")
+
+    def do_OPTIONS(self):
+        requested = self.headers.get("Access-Control-Request-Headers")
+        self.send_response(204)
+        self._send_cors_headers()
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            requested or "Authorization, Content-Type, x-api-key, x-goog-api-key",
+        )
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
+    def do_GET(self):
+        try:
+            path = self._route_path()
+            if self._needs_auth(path) and not self._authorized():
+                self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST, "invalid_api_key")
+                return
+            if path in ("/v1/models", "/models"):
+                self.send_json({"object": "list", "data": [
+                    {"id": n, "object": "model", "created": 1700000000,
+                     "owned_by": "google", "description": c["desc"]}
+                    for n, c in MODELS.items()
+                ]})
+            elif path.startswith("/v1/models/") or path.startswith("/models/"):
+                model_id = path.rsplit("/", 1)[-1]
+                cfg = MODELS.get(model_id)
+                if cfg:
+                    self.send_json({"id": model_id, "object": "model", "created": 1700000000,
+                                    "owned_by": "google", "description": cfg["desc"]})
+                else:
+                    self.send_api_error(404, f"model '{model_id}' not found",
+                                        ERR_INVALID_REQUEST, "model_not_found")
+            elif path.startswith("/v1beta/models"):
+                self.send_json({"models": [
+                    {"name": f"models/{n}", "displayName": n, "description": c["desc"],
+                     "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
+                    for n, c in MODELS.items()
+                ]})
+            elif re.match(r"^/(v1/)?responses/[^/]+$", path):
+                # The spec declares GET /v1/responses/{id} (200/404) but this
+                # server keeps no store, so every id is unknown. Deeper paths
+                # (e.g. /input_items) fall through to the generic 404.
+                self.send_api_error(404, f"response '{path.rsplit('/', 1)[-1]}' not found",
+                                    ERR_INVALID_REQUEST, "response_not_found")
+            elif path in ("/", "/health"):
+                self.send_json({"status": "ok", "version": __version__,
+                                "models": list(MODELS.keys())})
+            else:
+                self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            # Without this an exception escapes and the socket is dropped with
+            # no response at all, leaving the client waiting on a dead socket.
+            log(f"GET error: {e}")
+            try:
+                self.send_api_error(500, str(e), ERR_API)
+            except Exception:
+                pass
+
+    def _check_security(self) -> str:
+        """Run Host / Origin / Content-Type checks. Returns '' or an error message."""
+        if not self._check_host():
+            return "forbidden host"
+        if not self._check_origin():
+            return "cross-origin request not allowed"
+        return ""
+
+    def _resolve_request_model(self, req):
+        """Resolve the requested model. Returns a tuple or None (error sent)."""
+        raw = req.get("model")
+        base = raw.split("@think=")[0] if isinstance(raw, str) else raw
+        if CONFIG.get("strict_models") and isinstance(base, str) and base and base not in MODELS:
+            self.send_api_error(404, f"model '{raw}' not found",
+                                ERR_INVALID_REQUEST, "model_not_found")
+            return None
+        model_name, model_id, think_mode, err, extra = resolve_model(
+            raw or CONFIG["default_model"], default=CONFIG["default_model"])
+        if err:
+            self.send_api_error(400, err, ERR_INVALID_REQUEST)
+            return None
+        echo = raw if isinstance(raw, str) and raw else model_name
+        # The ticket is what upstream routes on; [79]/[80] alone are ignored.
+        return echo, model_name, model_id, think_mode, extra, ticket_for(model_name)
+
+    def do_POST(self):
+        try:
+            path = self._route_path()
+            if self._needs_auth(path) and not self._authorized():
+                self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST, "invalid_api_key")
+                return
+            # Security checks: Host, Origin, Content-Type
+            security_err = self._check_security()
+            if security_err:
+                self.send_api_error(403, security_err, ERR_INVALID_REQUEST)
+                return
+            # Require application/json for POST requests (except OPTIONS)
+            if not self.headers.get("Content-Type", "").startswith("application/json"):
+                self.send_api_error(415, "Content-Type must be application/json", ERR_INVALID_REQUEST)
+                return
+            body = self._read_request_body()
+            trace(f"CLIENT -> PROXY ({path})", body)
+            if path in ("/v1/chat/completions", "/chat/completions"):
+                self._handle_chat(body)
+            elif path in ("/v1/responses", "/responses"):
+                self._handle_responses(body)
+            elif ":streamGenerateContent" in path:
+                self._handle_google_generate(body, stream=True)
+            elif ":generateContent" in path:
+                self._handle_google_generate(body, stream=False)
+            else:
+                self.send_api_error(404, f"not found: {path}", ERR_INVALID_REQUEST)
+        except ValueError as e:
+            # Body parsing errors: invalid Content-Length, too large, etc.
+            if "too large" in str(e):
+                self.send_api_error(413, str(e), ERR_INVALID_REQUEST)
+            else:
+                self.send_api_error(400, str(e), ERR_INVALID_REQUEST)
+            return
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"POST error: {e}")
+            try:
+                self.send_api_error(500, str(e), ERR_API)
+            except Exception:
+                pass
+
+    def _unsupported_method(self):
+        """Answer PUT/PATCH/DELETE with a JSON error instead of 501 HTML.
+
+        ``BaseHTTPRequestHandler`` replies to any method it has no ``do_*``
+        for with a bare-text ``501``, which no OpenAI SDK can parse.
+        """
+        try:
+            path = self._route_path()
+            if self._needs_auth(path) and not self._authorized():
+                self.send_api_error(401, "invalid api key", ERR_INVALID_REQUEST,
+                                    "invalid_api_key")
+                return
+            # Drain the body before answering. Left unread it becomes the next
+            # "request line", and the resulting connection reset can discard
+            # the very response written here.
+            try:
+                self._read_request_body()
+            except ValueError as e:
+                if "too large" in str(e):
+                    self.send_api_error(413, str(e), ERR_INVALID_REQUEST)
+                    return
+            # DELETE /v1/responses/{id} is a real spec endpoint (200 or 404),
+            # and this server stores nothing, so every id is simply unknown.
+            if self.command == "DELETE" and re.match(r"^/(v1/)?responses/[^/]+$", path):
+                self.send_api_error(404, f"response '{path.rsplit('/', 1)[-1]}' not found",
+                                    ERR_INVALID_REQUEST, "response_not_found")
+                return
+            self.send_api_error(405, f"{self.command} is not allowed for {path}",
+                                ERR_INVALID_REQUEST, "method_not_allowed")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            log(f"{self.command} error: {e}")
+            try:
+                self.send_api_error(500, str(e), ERR_API)
+            except Exception:
+                pass
+
+    def do_PUT(self):
+        self._unsupported_method()
+
+    def do_PATCH(self):
+        self._unsupported_method()
+
+    def do_DELETE(self):
+        self._unsupported_method()
+
+    def _generate_with_tool_retry(self, prompt, model_id, think_mode, file_refs,
+                                  extra, tools_active, allowed_names,
+                                  tool_schemas, required_tool, messages=None,
+                                  ticket=None, tool_required=None,
+                                  client_gone=None):
+        """Run ``generate()``, retrying while the reply did not use a tool.
+
+        Five shapes all arrive as a normal HTTP 200 yet leave the client
+        believing the turn is over:
+
+        * an empty body -- a connection that died mid-generation leaves
+          nothing to answer with, and 200-with-no-content reads as "done";
+        * the upstream's canned failure sentence ("I encountered an error doing
+          what you asked...") -- nothing was generated, a retry usually works,
+          and passing it on reads as a finished answer;
+        * the model announcing an action ("let me read...") without ever
+          emitting the block;
+        * the model *fabricating* an answer about a file no tool call has
+          opened -- the reply is fluent and complete, so nothing in the text
+          itself looks wrong (see ``pending_tool_request``);
+        * ``tool_choice: "required"`` with no block at all -- or a block that
+          parses but omits a required parameter, which fails on the client's
+          side and costs a round-trip before anyone learns what was missing.
+
+        The retry appends a hard instruction. The number of attempts comes from
+        :func:`_tool_retry_attempts`. Raises once attempts are exhausted (or if
+        ``generate`` itself fails on the final attempt) so the caller decides
+        how the failure is reported -- both endpoints map it through
+        ``_map_upstream_error``.
+        """
+        retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
+        # Generic source review ("review source" without a named file) --
+        # computed from the last user message, same way as pending_tool_request.
+        last_user = None
+        if messages:
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "user":
+                    last_user = _stringify_content(msg.get("content", ""))
+                    break
+        is_generic_source_review = False
+        if last_user:
+            scannable = _strip_code_spans(last_user)
+            folded = _fold_diacritics(scannable)
+            folded = re.sub(r"\s+", " ", folded).strip()
+            if _is_source_review(folded) and not _is_file_review(folded, scannable):
+                is_generic_source_review = True
+
+        # An implement/change turn whose reply names files it never read is
+        # the same fabrication shape as an unread source review: the model
+        # surveyed (glob/grep) and then described the edit from the snippets.
+        is_change_turn = change_demanded(messages) if tools_active else False
+
+        # Review/change turns are multi-step (survey, read, act): grant one
+        # more attempt so a describe-instead-of-do reply can still be
+        # converted into the call. Ordinary turns keep the old budget.
+        attempts = _tool_retry_attempts(
+            required_tool, tools_active,
+            deep_demand=(is_generic_source_review or is_change_turn))
+        # Computed once: it inspects the whole conversation, not the reply.
+        owed = pending_tool_request(messages) if tools_active else None
+        # Files the model just listed but never opened: the read-directive
+        # nudge names these so the retry reads instead of guessing.
+        files = listed_turn_files(messages) if tools_active else []
+        # Calls this conversation already has results for: emitting one again
+        # is a loop, not progress.
+        repeatable = _repeatable_calls(messages) if tools_active else set()
+
+        text, tool_calls, missing = "", None, []
+        dropped = []
+        nudge_extra = ""
+        repeat_nudge = ""
+        repeats = 0
+        saw_call = False
+        best_text, best_idx = "", -1
+        # Canned-error placeholders seen this turn: a deterministic refusal
+        # (expired ticket / extension-routed prompt) is retried at most twice;
+        # more attempts only burn quota on the same answer.
+        placeholder_hits = 0
+        for attempt in range(attempts):
+            if attempt > 0 and client_gone is not None and client_gone.is_set():
+                # The client hung up while an earlier attempt ran (a keep-alive
+                # write failed): another upstream call would bill the account
+                # for an answer that reaches nobody.
+                log("Tool retry skipped: client disconnected")
+                break
+            call_prompt = prompt
+            if attempt > 0:
+                # "tool_call block ONLY" is right when the client demands a
+                # call, but on a heuristic retry it would rewrite a finished
+                # summary into a call nobody asked for -- and an agent happily
+                # runs that, then asks again. Conditional wording still pushes
+                # an acting model to act while letting a genuine answer stand.
+                # A source-review turn that only listed files gets a directive
+                # instead: the permissive "otherwise give your final answer"
+                # is what let the model answer from filenames alone.
+                if not required_tool and (is_read_retry_reason(owed)
+                                            or is_test_retry_reason(owed)
+                                            or is_review_test_reason(owed)
+                                            or is_generic_source_review
+                                            or is_change_turn):
+                    if is_test_retry_reason(owed):
+                        # The code is edited but no test command ran after
+                        # the edit: direct, not a suggestion. A stale
+                        # pre-edit run does not count.
+                        nudge = ("IMPORTANT: The change is implemented but "
+                                 "untested. Run the unit tests NOW with a "
+                                 "bash tool_call block (python -m unittest "
+                                 "discover -s tests) -- no prose. If no test "
+                                 "covers the changed behavior, add one first "
+                                 "with an edit block, then run the tests.")
+                    elif is_review_test_reason(owed):
+                        # A vague review grounds itself in test results
+                        # first: failures point at what to read closely.
+                        nudge = ("IMPORTANT: Run the unit tests NOW with a "
+                                 "bash tool_call block (python -m unittest "
+                                 "discover -s tests) -- no prose. Read the "
+                                 "source files only after you have the test "
+                                 "results, starting with files any failure "
+                                 "implicates.")
+                    elif is_generic_source_review:
+                        unread_core = unread_listed_core_files(messages)
+                        if unread_core:
+                            # Escalation over the directive nudge: the S3 live
+                            # probe showed a weak model reading one file and
+                            # then answering prose anyway, ignoring "read the
+                            # others first". While listed core files stay
+                            # unread, prose is forbidden entirely so the retry
+                            # can only come back with read blocks; the answer
+                            # is allowed on a later attempt once the evidence
+                            # exists.
+                            nudge = ("IMPORTANT: Respond with read tool_call "
+                                     "blocks ONLY -- no prose, before or "
+                                     "after. Read ALL of these files: "
+                                     + ", ".join(unread_core[:12]) + ".")
+                        else:
+                            nudge = ("IMPORTANT: You have not read enough of the source yet -- "
+                                     "listing file names, or opening a single file, is not a review. Call the read tool now "
+                                     "on the other relevant module(s) and answer from what you actually read.")
+                            if files:
+                                nudge += " Read these first: " + ", ".join(files[:8]) + "."
+                    else:
+                        nudge = ("IMPORTANT: You have not read enough of the source yet -- "
+                                 "listing file names, or opening a single file, is not a review. Call the read tool now "
+                                 "on the other relevant module(s) and answer from what you actually read.")
+                        if files:
+                            nudge += " Read these first: " + ", ".join(files[:8]) + "."
+                else:
+                    nudge = (
+                        "IMPORTANT: Respond with a tool_call block ONLY."
+                        if required_tool else
+                        "IMPORTANT: Do not describe a tool call -- make it. If "
+                        "answering requires reading or changing something, call "
+                        "the tool now; otherwise give your final answer."
+                    )
+                if missing:
+                    # A model that omitted a parameter believes its call is
+                    # complete, so it has to be told which fields were absent.
+                    nudge += (f" The previous tool call was missing required "
+                              f"parameter(s): {', '.join(missing)} -- include "
+                              "every required parameter.")
+                    missing = []
+                if nudge_extra:
+                    nudge += nudge_extra
+                    nudge_extra = ""
+                if repeat_nudge:
+                    nudge += repeat_nudge
+                    repeat_nudge = ""
+                call_prompt = prompt + "\n\n" + nudge
+            try:
+                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+            except Exception as e:
+                if attempt + 1 < attempts:
+                    log(f"Tool retry after upstream error: {e}")
+                    continue
+                if best_text and not required_tool:
+                    log(f"Tool retry: final attempt failed ({e}); returning "
+                        f"best text from attempt {best_idx + 1}")
+                    return best_text, None
+                raise
+            text, tool_calls, dropped = raw, None, []
+            if tools_active and text:
+                text, tool_calls, dropped = parse_tool_calls(text, allowed_names, tool_schemas)
+                _log_tool_trace(raw, tool_calls)
+            if tool_calls:
+                saw_call = True
+                if all(((tc.get("function") or {}).get("name"),
+                        _canonical_args((tc.get("function") or {}).get("arguments")))
+                       in repeatable for tc in tool_calls):
+                    # Every call repeats one whose result is already in the
+                    # conversation: running it again cannot learn anything.
+                    if repeats < 3 and attempt + 1 < attempts:
+                        repeats += 1
+                        repeat_nudge = (" The result of this exact tool call "
+                                        "is already in the conversation -- "
+                                        "answer in plain text, do not call "
+                                        "it again.")
+                        log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                            "duplicate tool call already answered, nudging "
+                            "the model to answer instead")
+                        continue
+                    log("Duplicate tool call repeated 3 times (or no attempts "
+                        "left): a loop is worse than one prose turn, "
+                        "returning the plain-text answer instead")
+                    tool_calls = None
+                    break
+                missing = missing_required_params(tool_calls, tool_required)
+                if missing:
+                    # Always logged: even when no attempt is left this is the
+                    # only place that shows the model wrote a call the client
+                    # cannot run.
+                    log(f"tool_call missing required parameter(s): "
+                        f"{', '.join(missing)}")
+                    if attempt + 1 < attempts:
+                        log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                            "asking the model to fill them in")
+                        continue
+                break
+            if (text or "").strip() and not looks_like_upstream_error(text):
+                # A usable answer worth keeping if a later attempt fails: a
+                # good first turn must not become a 503 because the retry
+                # produced the placeholder or raised.
+                best_text, best_idx = text, attempt
+            if required_tool:
+                continue
+            if attempt + 1 >= attempts:
+                break
+            if not (text or "").strip():
+                # An upstream that produced nothing (observed once as an empty
+                # body after a dropped connection) is never a usable answer:
+                # handing it to the client as 200 says "finished, nothing to
+                # do" and Opencode stops the turn there.
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
+                    "returned an empty response")
+                continue
+            if looks_like_upstream_error(text):
+                placeholder_hits += 1
+                if placeholder_hits >= 2:
+                    log("Tool retry: upstream returned the same canned "
+                        "placeholder twice -- stopping early; if this "
+                        "persists, refresh CONFIG['model_tickets'] from a "
+                        "fresh browser capture and check the routing-mismatch "
+                        "log lines above")
+                    break
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
+                    "returned its canned error placeholder instead of a response")
+                continue
+            if (not required_tool and tools_active
+                    and looks_like_extension_refusal(text)):
+                # A verbose model can pad the settings-are-off refusal with
+                # prose, escaping the anchored placeholder regex; without this
+                # branch it would reach the client as a finished answer.
+                placeholder_hits += 1
+                if placeholder_hits >= 2:
+                    log("Tool retry: upstream returned the same extension "
+                        "refusal twice -- stopping early; refresh "
+                        "CONFIG['model_tickets'] if this persists")
+                    break
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): upstream "
+                    "returned a Workspace-extension refusal inside a longer "
+                    "reply")
+                continue
+            if tools_active and dropped:
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): previous "
+                    f"tool_call block(s) unusable: {'; '.join(dropped)}")
+                nudge_extra = (" Your previous tool_call block(s) could not be "
+                               "used: " + "; ".join(dropped) +
+                               ". Valid tool names: "
+                               + ", ".join(sorted(allowed_names or [])) + ".")
+                continue
+            fresh = (fresh_declared_unread(text, messages)
+                     if tools_active else [])
+            if tools_active and fresh and (is_generic_source_review
+                                            or is_change_turn):
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): reply "
+                    f"named unread file(s): {', '.join(fresh)}")
+                nudge_extra = (" You named these file(s) as part of the review "
+                               "but have not read them: " + ", ".join(fresh) +
+                               ". Call the read tool on each of them now, then "
+                               "answer from what you actually read.")
+                continue
+            if (retry_on_miss and tools_active and (text or "").strip()
+                    and review_demanded(messages)):
+                bad_quotes = unverified_quotes(text, messages)
+                if bad_quotes:
+                    log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                        f"{len(bad_quotes)} quoted snippet(s) not found in "
+                        "any tool result")
+                    nudge_extra = (" Some code you quoted does not appear in "
+                                   "any tool result: "
+                                   + " | ".join(q[:80] for q in bad_quotes[:3])
+                                   + ". Do not quote from memory: call the "
+                                   "read tool (or grep) on the relevant file "
+                                   "and quote only lines that really exist, "
+                                   "or drop the claim.")
+                    continue
+            if retry_on_miss and owed:
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): {owed}")
+                continue
+            if (retry_on_miss and tools_active and is_change_turn
+                    and not _turn_act_calls(messages, -1)
+                    and looks_like_described_edit(text)):
+                # The model read the code and then wrote a how-to instead of
+                # editing ("here is how you can...", "since tool calls are no
+                # longer available..."). An edit already emitted anywhere in
+                # the conversation means the work is done -- only a
+                # describe-instead-of-do reply is retried, with a do-it nudge.
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): reply "
+                    f"describes the change instead of making it")
+                nudge_extra = (" You have already read the relevant code -- "
+                               "make the change with the edit/write tool now "
+                               "instead of describing it. Emit the tool_call "
+                               "block(s) and stop.")
+                continue
+            if (retry_on_miss and tools_active and not saw_call
+                    and (is_generic_source_review or is_change_turn)
+                    and not _conversation_called_files(messages)):
+                # A review/change request answered in prose with no tool call
+                # ever emitted in the conversation: `owed` was computed before
+                # the reply and only covers user-named files, so a vague
+                # prompt ("review how this proxy loads the cookie") and a
+                # survey-stall (glob/grep, then prose describing the edit)
+                # both slip through. One retry with the read-directive nudge
+                # above; a turn that already has evidence never reaches here.
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): "
+                    f"review/change requested but no tool call was ever "
+                    f"emitted")
+                continue
+            if retry_on_miss and tools_active and looks_like_missed_tool_call(text):
+                log(f"Tool retry (attempt {attempt + 1}/{attempts}): response "
+                    f"looks like a missed tool call ({len(text)} chars)")
+                continue
+            break
+
+        # The canned sentence is an upstream failure, not something the model
+        # said. Handing it to the client as 200 says "answered" when it was not.
+        if not tool_calls and looks_like_upstream_error(text):
+            if best_text and not required_tool:
+                log(f"Tool retry: final answer is the upstream placeholder; "
+                    f"returning best text from attempt {best_idx + 1}")
+                return best_text, None
+            raise GeminiError("upstream returned an error placeholder instead "
+                              "of a response; please retry")
+        if not tool_calls and not (text or "").strip():
+            if best_text and not required_tool:
+                log(f"Tool retry: final answer is empty; returning best text "
+                    f"from attempt {best_idx + 1}")
+                return best_text, None
+        if required_tool and not tool_calls and not saw_call:
+            # `tool_choice: required` is a contract: prose with no call ever
+            # emitted is not a result. Raise so the endpoint reports 503
+            # instead of a 200 that silently ends an agent turn. (A duplicate
+            # loop that fell back to prose keeps its fallback: a loop is
+            # worse than one prose turn.)
+            raise GeminiError("model did not emit the required tool call; "
+                              "please retry")
+        return text, tool_calls
+
+    # ─── /v1/chat/completions ─────────────────────────────────────────────────
+
+    def _handle_chat(self, body: bytes):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_api_error(400, "invalid JSON body", ERR_INVALID_REQUEST)
+            return
+        resolved = self._resolve_request_model(req)
+        if resolved is None:
+            return
+        echo_model, model_name, model_id, think_mode, extra, ticket = resolved
+
+        n = req.get("n", 1)
+        if isinstance(n, int) and n > 1:
+            self.send_api_error(400, "n>1 is not supported", ERR_INVALID_REQUEST, "unsupported_value")
+            return
+
+        tools = req.get("tools")
+        tool_choice = req.get("tool_choice", "auto")
+        messages = req.get("messages", [])
+        if not isinstance(messages, list):
+            self.send_api_error(400, "messages must be a list", ERR_INVALID_REQUEST)
+            return
+
+        # Review behaviour ("read the file before reviewing it") lives in the
+        # shared `_tool_use_block` appended by `messages_to_prompt` whenever
+        # tools are active -- not as a per-request injected system message.
+        # (A hard-coded injection here previously shipped another project's
+        # filenames, replaced clients' system prompts, and crashed on
+        # list-shaped `content`.)
+        prompt, images = messages_to_prompt(messages, tools, tool_choice)
+
+        rf_instruction = build_response_format_instruction(req.get("response_format"))
+        if rf_instruction:
+            prompt = prompt + rf_instruction
+        if not prompt.strip():
+            self.send_api_error(400, "empty prompt", ERR_INVALID_REQUEST)
+            return
+
+        stream = bool(req.get("stream", False))
+        stop_strings = _normalize_stop(req.get("stop"))
+        max_tokens = req.get("max_tokens")
+        if max_tokens is None:
+            max_tokens = req.get("max_completion_tokens")
+        include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
+        cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+
+        try:
+            file_refs = _upload_images(images)
+        except RuntimeError as e:
+            self.send_api_error(503, f"upstream error: {e}", ERR_API)
+            return
+
+        allowed_names = tool_names(tools) or None
+        tool_schemas = tool_parameters(tools) or None
+        tool_required = tool_required_params(tools) or None
+
+        # Pure streaming (no tools, no post-processing): stream tokens straight through.
+        # When response_format is set the text still has to be defenced and
+        # normalised, so it has to go through the buffered path below.
+        if stream and not rf_instruction and (not tools or tool_choice == "none"):
+            self._stream_chat(cid, echo_model, prompt, model_id, think_mode, file_refs,
+                              extra, stop_strings, max_tokens, include_usage, ticket)
+            return
+
+        # Tool calls need the full text; retry once when the reply did not use
+        # one (see _generate_with_tool_retry).
+        required_tool = is_required_tool_choice(tool_choice)
+        tools_active = bool(tools) and tool_choice != "none"
+
+        # A streaming client gets its response head and the opening role chunk
+        # immediately, then keep-alive comments while upstream works: a
+        # buffered turn can take minutes (thinking model plus one tool retry),
+        # and a client that has received no headers at all gives up on its own
+        # header timeout mid-generation (see _start_sse_with_keepalive).
+        stop_ping, client_gone = None, None
+        if stream:
+            stop_ping, client_gone = self._start_sse_with_keepalive()
+            self._sse_chunk(cid, echo_model, {"role": "assistant", "content": ""},
+                            None, include_usage)
+        try:
+            text, tool_calls = self._generate_with_tool_retry(
+                prompt, model_id, think_mode, file_refs, extra,
+                tools_active, allowed_names, tool_schemas, required_tool,
+                messages=messages, ticket=ticket, tool_required=tool_required,
+                client_gone=client_gone)
+        except Exception as e:
+            if stream:
+                try:
+                    self._sse_event_error(*_map_upstream_error(e))
+                    self._sse_done()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            self.send_api_error(*_map_upstream_error(e))
+            return
+        finally:
+            if stop_ping is not None:
+                stop_ping()
+
+        if rf_instruction and text:
+            text = strip_code_fence(text)
+        text = _apply_stop(text, stop_strings)
+        text, truncated = _apply_max_tokens(text, max_tokens)
+
+        if not text and not tool_calls:
+            if stream:
+                self._sse_event_error(503, "empty response from upstream", ERR_API)
+                self._sse_done()
+                return
+            self.send_api_error(503, "empty response from upstream", ERR_API)
+            return
+
+        # `refusal` and `logprobs` are required-nullable on the spec's
+        # response message/choice; strict SDKs (Go, Rust, Java) reject an
+        # absent key where Python's only checks for null.
+        msg = {"role": "assistant", "content": text or None, "refusal": None}
+        if tool_calls:
+            msg["tool_calls"] = tool_calls
+        finish = "tool_calls" if tool_calls else ("length" if truncated else "stop")
+
+        if stream:
+            # The head and the role chunk were sent before upstream started.
+            try:
+                if text:
+                    self._sse_chunk(cid, echo_model, {"content": text}, None, include_usage)
+                for index, tc in enumerate(tool_calls or []):
+                    self._sse_chunk(cid, echo_model,
+                                    {"tool_calls": [{"index": index, **tc}]},
+                                    None, include_usage)
+                self._sse_chunk(cid, echo_model, {}, finish, include_usage)
+                if include_usage:
+                    self._sse_usage(cid, echo_model, prompt, text)
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+
+        self.send_json({
+            "id": cid, "object": "chat.completion", "created": int(time.time()),
+            "model": echo_model,
+            "choices": [{"index": 0, "message": msg, "logprobs": None,
+                         "finish_reason": finish}],
+            "usage": _usage(prompt, text),
+        })
+
+    @staticmethod
+    def _iter_with_first(first, gen):
+        yield first
+        for delta in gen:
+            yield delta
+
+    def _stream_chat(self, cid, model, prompt, model_id, think_mode, file_refs,
+                     extra, stop_strings, max_tokens, include_usage, ticket=None):
+        # Head first, upstream second: the first upstream byte can take
+        # minutes on a thinking model, and a client waiting for response
+        # headers would abort before a single frame (see
+        # _start_sse_with_keepalive).
+        stop_ping, _client_gone = self._start_sse_with_keepalive()
+        self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
+                        None, include_usage)
+        try:
+            gen = generate_stream(prompt, model_id, think_mode, file_refs, extra, ticket)
+            first = next(gen, _MISSING)
+        except Exception as e:
+            stop_ping()
+            try:
+                self._sse_event_error(*_map_upstream_error(e))
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        if first is _MISSING:
+            try:
+                self._sse_event_error(503, "empty response from upstream", ERR_API)
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        full_text = ""
+        finish = "stop"
+        hold = max((len(s) for s in stop_strings), default=0)
+        buf = ""
+        try:
+            # The keep-alive stays on for the whole stream: a thinking model
+            # can go silent between chunks for longer than a client's chunk
+            # timeout, and a comment is ignored by every SSE parser.
+            for raw in self._iter_with_first(first, gen):
+                if not raw:
+                    continue
+                buf += raw
+                hit = None
+                for s in stop_strings:
+                    idx = buf.find(s)
+                    if idx != -1 and (hit is None or idx < hit):
+                        hit = idx
+                if hit is not None:
+                    piece = buf[:hit]
+                    if piece:
+                        full_text += piece
+                        self._sse_chunk(cid, model, {"content": piece}, None, include_usage)
+                    buf = ""
+                    break
+                # `>` rather than `>=`: a reply that lands exactly on the budget
+                # is complete, and only a truncated reply may claim `length`.
+                if max_tokens and (len(full_text) + len(buf)) > max_tokens * 4:
+                    allowed = max(0, max_tokens * 4 - len(full_text))
+                    piece = buf[:allowed]
+                    if piece:
+                        full_text += piece
+                        self._sse_chunk(cid, model, {"content": piece}, None, include_usage)
+                    buf = ""
+                    finish = "length"
+                    break
+                if len(buf) > hold:
+                    piece = buf[:len(buf) - hold] if hold else buf
+                    buf = buf[-hold:] if hold else ""
+                    if piece:
+                        full_text += piece
+                        self._sse_chunk(cid, model, {"content": piece}, None, include_usage)
+            else:
+                if buf:
+                    full_text += buf
+                    self._sse_chunk(cid, model, {"content": buf}, None, include_usage)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+        except Exception as e:
+            log(f"Stream error: {e}")
+            try:
+                self._sse_event_error(*_map_upstream_error(e))
+                self._sse_done()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
+        finally:
+            stop_ping()
+            close = getattr(gen, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        self._sse_chunk(cid, model, {}, finish, include_usage)
+        if include_usage:
+            self._sse_usage(cid, model, prompt, full_text)
+        self._sse_done()
+
+# ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
+
+    def _normalize_responses_tools(self, tools):
+        if not tools:
+            return None
+        normalized = []
+        for tool in tools:
+            if not isinstance(tool, dict):
+                continue
+            if tool.get("type") == "function":
+                fn = tool.get("function", tool)
+                if not isinstance(fn, dict):
+                    continue
+                name = fn.get("name")
+                if not name:
+                    log("Responses: ignoring function tool without a name")
+                    continue
+                normalized.append({"type": "function", "function": {
+                    "name": name,
+                    "description": fn.get("description", ""),
+                    "parameters": fn.get("parameters", {}),
+                }})
+            else:
+                log(f"Responses: ignoring unsupported tool type '{tool.get('type')}'")
+        return normalized or None
+
+    def _responses_messages(self, input_items, instructions):
+        messages = []
+        if instructions:
+            messages.append({"role": "system", "content": instructions})
+        if isinstance(input_items, str):
+            messages.append({"role": "user", "content": input_items})
+            return messages
+        if not isinstance(input_items, list):
+            return messages
+        for item in input_items:
+            if isinstance(item, str):
+                messages.append({"role": "user", "content": item})
+                continue
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "function_call_output":
+                output = item.get("output", "")
+                if isinstance(output, list):
+                    output = "\n".join(
+                        c.get("text", "") for c in output
+                        if isinstance(c, dict) and c.get("type") in ("output_text", "text")
+                    )
+                messages.append({"role": "tool", "tool_call_id": item.get("call_id", ""),
+                                 "content": output})
+            elif itype == "function_call":
+                call_id = item.get("call_id") or item.get("id") or f"call_{uuid.uuid4().hex[:8]}"
+                # Codex omits `arguments` on a call it wants replayed from context;
+                # an empty string would serialise into the broken `"arguments": }`.
+                call = {"id": call_id, "type": "function",
+                        "function": {"name": item.get("name", ""),
+                                     "arguments": item.get("arguments") or "{}"}}
+                if messages and messages[-1].get("role") == "assistant" \
+                        and messages[-1].get("tool_calls"):
+                    messages[-1]["tool_calls"].append(call)
+                else:
+                    messages.append({"role": "assistant", "content": None, "tool_calls": [call]})
+            elif itype in ("input_text", "input_image", "image"):
+                messages.append({"role": "user", "content": [item]})
+            elif item.get("role") == "assistant":
+                content_parts = item.get("content", [])
+                text_acc, tc_list = "", []
+                if isinstance(content_parts, list):
+                    for c in content_parts:
+                        if isinstance(c, dict):
+                            if c.get("type") == "output_text":
+                                text_acc += c.get("text", "")
+                            elif c.get("type") == "function_call":
+                                tc_list.append(c)
+                elif isinstance(content_parts, str):
+                    text_acc = content_parts
+                message = {"role": "assistant", "content": text_acc or None}
+                if tc_list:
+                    message["tool_calls"] = [
+                        {"id": tc.get("call_id", f"call_{i}"), "type": "function",
+                         "function": {"name": tc.get("name", ""),
+                                      "arguments": tc.get("arguments") or "{}"}}
+                        for i, tc in enumerate(tc_list)
+                    ]
+                messages.append(message)
+            else:
+                role = item.get("role", "user")
+                if role == "developer":
+                    role = "system"
+                messages.append({"role": role, "content": item.get("content", "")})
+        return messages
+
+    def _handle_responses(self, body: bytes):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_api_error(400, "invalid JSON body", ERR_INVALID_REQUEST)
+            return
+        resolved = self._resolve_request_model(req)
+        if resolved is None:
+            return
+        echo_model, model_name, model_id, think_mode, extra, ticket = resolved
+
+        tools = self._normalize_responses_tools(req.get("tools"))
+        messages = self._responses_messages(req.get("input", []), req.get("instructions"))
+        # `null` is a legal JSON value here; the spec has no null variant, so
+        # fall back to "auto" rather than echoing a null tool_choice back.
+        tool_choice = req.get("tool_choice") or "auto"
+        prompt, images = messages_to_prompt(messages, tools, tool_choice)
+
+        rf = req.get("response_format")
+        if rf is None:
+            rf = _responses_text_format(req.get("text"))
+        rf_instruction = build_response_format_instruction(rf)
+        if rf_instruction:
+            prompt = prompt + rf_instruction
+        if not prompt.strip():
+            self.send_api_error(400, "empty input", ERR_INVALID_REQUEST)
+            return
+
+        stop_strings = _normalize_stop(req.get("stop"))
+        max_tokens = req.get("max_output_tokens")
+
+        allowed_names = tool_names(tools) or None
+        tool_schemas = tool_parameters(tools) or None
+        tool_required = tool_required_params(tools) or None
+        required_tool = is_required_tool_choice(tool_choice)
+        tools_active = bool(tools) and tool_choice != "none"
+        want_stream = bool(req.get("stream"))
+
+        # Fields the spec marks required on every response object. Request
+        # fields are echoed back unchanged where we honour them, otherwise the
+        # spec's own default is used.
+        rid = f"resp_{uuid.uuid4().hex[:16]}"
+        created_at = int(time.time())
+        instructions = req.get("instructions")
+        tools_echo = req.get("tools")
+        metadata = req.get("metadata")
+        parallel = req.get("parallel_tool_calls")
+        temperature = req.get("temperature")
+        top_p = req.get("top_p")
+        # Set before generate (the opening events carry it as null) and
+        # reassigned once truncation is known; the closure reads it at call
+        # time, so both see the right value.
+        incomplete_details = None
+
+        def _number(value, default):
+            # `bool` is an ``int`` subclass: `temperature: true` must not be
+            # echoed back as a number the schema rejects.
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return default
+            return value
+
+        def response_fields(status, items, token_usage):
+            return {
+                "id": rid,
+                "object": "response",
+                "created_at": created_at,
+                "status": status,
+                "model": echo_model,
+                "output": items,
+                "error": None,
+                "incomplete_details": incomplete_details,
+                "instructions": instructions if isinstance(instructions, str) else None,
+                "tools": tools_echo if isinstance(tools_echo, list) else [],
+                "parallel_tool_calls": parallel if isinstance(parallel, bool) else True,
+                "metadata": metadata if isinstance(metadata, dict) else None,
+                "tool_choice": tool_choice,
+                "temperature": _number(temperature, 1),
+                "top_p": _number(top_p, 1),
+                "access_programs": None,
+                "usage": token_usage,
+            }
+
+        # A buffered turn can spend minutes upstream, and HTTP carries its
+        # status line with the first body byte: without the head now, a
+        # streaming client aborts on its own header timeout mid-generation.
+        stop_ping, client_gone = None, None
+        if want_stream:
+            stop_ping, client_gone = self._start_sse_with_keepalive()
+            sequence_number = 0
+
+            def emit(event_type, **fields):
+                nonlocal sequence_number
+                sequence_number += 1
+                event = {"type": event_type, "sequence_number": sequence_number,
+                         **fields}
+                frame = (f"event: {event_type}\n"
+                         f"data: {json.dumps(event)}\n\n").encode()
+                trace(f"PROXY -> CLIENT (SSE {event_type})", frame)
+                self._sse_write(frame)
+
+            emit("response.created", response=response_fields("in_progress", [], None))
+            emit("response.in_progress", response=response_fields("in_progress", [], None))
+        try:
+            file_refs = _upload_images(images)
+            text, tool_calls = self._generate_with_tool_retry(
+                prompt, model_id, think_mode, file_refs, extra,
+                tools_active, allowed_names, tool_schemas, required_tool,
+                messages=messages, ticket=ticket, tool_required=tool_required,
+                client_gone=client_gone)
+        except Exception as e:
+            if want_stream:
+                try:
+                    _status, message, _type, _code = _map_upstream_error(e)
+                    failed = response_fields("failed", [], None)
+                    failed["error"] = {"message": message}
+                    emit("response.failed", response=failed)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    stop_ping()
+                return
+            self.send_api_error(*_map_upstream_error(e))
+            return
+        if rf_instruction and text:
+            text = strip_code_fence(text)
+        text = _apply_stop(text, stop_strings)
+        text, truncated = _apply_max_tokens(text, max_tokens)
+        if not text and not tool_calls:
+            if want_stream:
+                # Headers are already on the wire: the failure arrives as an
+                # event, not a status.
+                try:
+                    failed = response_fields("failed", [], None)
+                    failed["error"] = {"message": "empty response from upstream"}
+                    emit("response.failed", response=failed)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                finally:
+                    stop_ping()
+                return
+            self.send_api_error(503, "empty response from upstream", ERR_API)
+            return
+
+        # Responses reports a cut-off answer as incomplete rather than completed.
+        final_status = "incomplete" if truncated else "completed"
+        # `incomplete_details` is required on the object and null when the
+        # answer is complete; it must not disappear from the payload.
+        incomplete_details = {"reason": "max_output_tokens"} if truncated else None
+        # A message that max_output_tokens cut off is itself incomplete --
+        # leaving it "completed" while the response says "incomplete" is the
+        # contradiction strict clients flag.
+        message_status = "incomplete" if truncated else "completed"
+
+        mid = f"msg_{uuid.uuid4().hex[:12]}"
+        output = []
+        if tool_calls:
+            for tc in tool_calls:
+                output.append({"type": "function_call", "id": tc["id"], "call_id": tc["id"],
+                               "name": tc["function"]["name"],
+                               "arguments": tc["function"]["arguments"], "status": "completed"})
+        if text or not tool_calls:
+            output.append({"type": "message", "id": mid, "role": "assistant",
+                           "status": message_status,
+                           "content": [{"type": "output_text", "text": text or "",
+                                        "annotations": [], "logprobs": []}]})
+
+        usage = {
+            "input_tokens": len(prompt) // 4,
+            "output_tokens": len(text or "") // 4,
+            "total_tokens": (len(prompt) + len(text or "")) // 4,
+            # Required breakdowns: their absence fails strict SDKs even though
+            # the totals are all we can actually measure.
+            "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+
+        # Fields the spec marks required on every response object were bound
+        # before generate (above); `created_at`, the echoed request fields and
+        # `response_fields` are all reused here.
+        if want_stream:
+            # The head plus response.created/in_progress went out before
+            # upstream started; only the output items and the final event
+            # remain, on the same sequence.
+            try:
+                for output_index, item in enumerate(output):
+                    if item["type"] == "function_call":
+                        pending_item = {
+                            "type": "function_call", "id": item["id"], "call_id": item["call_id"],
+                            "name": item["name"], "arguments": "", "status": "in_progress",
+                        }
+                        emit("response.output_item.added", output_index=output_index, item=pending_item)
+                        emit("response.function_call_arguments.delta", item_id=item["id"],
+                             output_index=output_index, delta=item["arguments"])
+                        emit("response.function_call_arguments.done", item_id=item["id"],
+                             output_index=output_index, arguments=item["arguments"])
+                        emit("response.output_item.done", output_index=output_index, item=item)
+                    elif item["type"] == "message":
+                        pending_item = {
+                            "type": "message", "id": item["id"], "role": "assistant",
+                            "status": "in_progress", "content": [],
+                        }
+                        emit("response.output_item.added", output_index=output_index, item=pending_item)
+                        for content_index, content_part in enumerate(item["content"]):
+                            event_fields = {"item_id": item["id"], "output_index": output_index,
+                                            "content_index": content_index}
+                            emit("response.content_part.added", **event_fields, part={
+                                "type": "output_text", "text": "", "annotations": [],
+                                "logprobs": []})
+                            # `logprobs` is required on both text events (an empty
+                            # list: we never see upstream probabilities).
+                            emit("response.output_text.delta", **event_fields,
+                                 delta=content_part["text"], logprobs=[])
+                            emit("response.output_text.done", **event_fields,
+                                 text=content_part["text"], logprobs=[])
+                            emit("response.content_part.done", **event_fields, part=content_part)
+                        emit("response.output_item.done", output_index=output_index, item=item)
+                final_event = "response.incomplete" if truncated else "response.completed"
+                emit(final_event, response=response_fields(final_status, output, usage))
+                self.wfile.flush()
+            finally:
+                stop_ping()
+        else:
+            self.send_json(response_fields(final_status, output, usage))
+
+    # ─── /v1beta/models (Google Gemini CLI) ──────────────────────────────────
+
+    def _handle_google_generate(self, body: bytes, stream: bool):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_google_error(400, "invalid JSON", "INVALID_ARGUMENT")
+            return
+        m = re.match(r'/v1beta/models/([^:?]+)', self.path)
+        model_name = m.group(1) if m else CONFIG["default_model"]
+        model_name, model_id, think_mode, err, extra = resolve_model(
+            model_name, default=CONFIG["default_model"])
+        if err:
+            self.send_google_error(400, err, "INVALID_ARGUMENT")
+            return
+        ticket = ticket_for(model_name)
+
+        tool_config = req.get("toolConfig", {})
+        fc_mode = tool_config.get("functionCallingConfig", {}).get("mode", "AUTO")
+        has_tools = bool(req.get("tools")) and fc_mode != "NONE"
+
+        # The review nudge lives in the shared tool block (see _handle_chat);
+        # never rewrite the client's own system instruction here.
+        prompt, images = google_contents_to_prompt(req)
+        if not prompt.strip():
+            self.send_google_error(400, "empty content", "INVALID_ARGUMENT")
+            return
+
+        try:
+            file_refs = _upload_images(images)
+        except RuntimeError as e:
+            self.send_google_error(502, f"upstream error: {e}", "UNAVAILABLE")
+            return
+        log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
+
+        if stream and not has_tools:
+            try:
+                gen = generate_stream(prompt, model_id, think_mode, file_refs, extra, ticket)
+                first = next(gen, _MISSING)
+            except Exception as e:
+                self.send_google_error(*_map_google_error(e))
+                return
+            if first is _MISSING:
+                self.send_google_error(502, "empty response from upstream", "UNAVAILABLE")
+                return
+            try:
+                self._start_sse()
+                full_text = ""
+                for delta in self._iter_with_first(first, gen):
+                    if not delta:
+                        continue
+                    full_text += delta
+                    chunk_obj = {
+                        "candidates": [{"content": {"parts": [{"text": delta}],
+                                                    "role": "model"}, "index": 0}],
+                        "modelVersion": model_name,
+                    }
+                    self.wfile.write(
+                        f"data: {json.dumps(chunk_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                final_chunk = {
+                    "candidates": [{"finishReason": "STOP", "index": 0}],
+                    "usageMetadata": {
+                        "promptTokenCount": len(prompt) // 4,
+                        "candidatesTokenCount": len(full_text) // 4,
+                        "totalTokenCount": (len(prompt) + len(full_text)) // 4,
+                    },
+                    "modelVersion": model_name,
+                }
+                self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            except Exception as e:
+                log(f"Google stream error: {e}")
+                # The 200 is already sent, so the only way to tell the client
+                # is a Google-shaped error event on the same stream.
+                status, message, gstatus = _map_google_error(e)
+                try:
+                    err_obj = {"error": {"code": status, "message": message, "status": gstatus}}
+                    self.wfile.write(f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode())
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+            finally:
+                close = getattr(gen, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        pass
+            return
+
+        # The Google path used to call generate() once and hand back whatever
+        # came out, so none of the "the model said it would act but did not"
+        # protections the OpenAI endpoints have applied here: a client using
+        # the native API was the one most likely to be left with prose.
+        required_tool = fc_mode == "ANY"
+        retry_on_miss = bool(CONFIG.get("tool_retry_on_miss"))
+        attempts = _tool_retry_attempts(required_tool, has_tools)
+        grepeat = _google_repeatable(req.get("contents")) if has_tools else set()
+        g_owed = None
+        if has_tools:
+            try:
+                g_owed = pending_tool_request(_google_pseudo_messages(req))
+            except Exception as exc:
+                log(f"Google evidence check failed: {exc}")
+        # Declared names + schemas for parity with the OpenAI path, plus the
+        # mode=ANY allowlist: a call outside `allowedFunctionNames` is not a
+        # usable call and must be retried, not returned.
+        g_allowed, g_schemas, g_required = None, None, None
+        g_allowlist = None
+        if has_tools:
+            g_allowed, g_schemas, g_required = _google_declared(req)
+            fc_config = (req.get("toolConfig", {}) or {}).get(
+                "functionCallingConfig", {}) or {}
+            allowed_list = fc_config.get("allowedFunctionNames")
+            if fc_mode == "ANY" and isinstance(allowed_list, list) and allowed_list:
+                g_allowlist = {n for n in allowed_list if isinstance(n, str)}
+                g_allowed = ({n for n in (g_allowed or set()) if n in g_allowlist}
+                             or g_allowlist)
+
+        # Stream + tools buffers the whole turn (retries included) before the
+        # first byte, so the head goes out before upstream starts -- same
+        # header-timeout rationale as the OpenAI streaming paths -- and
+        # retries are gated on the client still listening.
+        stop_ping, client_gone, sse_started = None, None, False
+        if stream and has_tools:
+            stop_ping, client_gone = self._start_sse_with_keepalive()
+            sse_started = True
+
+        def _google_stream_fail(exc):
+            """Report a buffered-turn failure on the already-open stream."""
+            status, message, gstatus = _map_google_error(exc)
+            try:
+                err_obj = {"error": {"code": status, "message": message,
+                                     "status": gstatus}}
+                self._sse_write(
+                    f"data: {json.dumps(err_obj, ensure_ascii=False)}\n\n".encode())
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                if stop_ping is not None:
+                    stop_ping()
+
+        def _google_fail(status, message, gstatus):
+            if sse_started:
+                _google_stream_fail(GeminiError(message, status=status))
+            else:
+                self.send_google_error(status, message, gstatus)
+
+        text, clean_text, function_calls = "", "", []
+        grepeat_nudge = ""
+        grepeats = 0
+        best_text, best_idx = "", -1
+        for attempt in range(attempts):
+            if attempt > 0 and client_gone is not None and client_gone.is_set():
+                # Same rationale as the chat loop: no billing the account for
+                # an answer that reaches nobody.
+                log("Google tool retry skipped: client disconnected")
+                break
+            call_prompt = prompt
+            if attempt > 0:
+                nudge = (
+                    "IMPORTANT: Respond with a function_call block ONLY."
+                    if required_tool else
+                    "IMPORTANT: Do not describe a function call -- make it. If "
+                    "answering requires reading or changing something, call "
+                    "the tool now; otherwise give your final answer."
+                )
+                if grepeat_nudge:
+                    nudge += grepeat_nudge
+                    grepeat_nudge = ""
+                call_prompt = prompt + "\n\n" + nudge
+            try:
+                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+            except Exception as e:
+                if attempt + 1 < attempts:
+                    log(f"Google tool retry after upstream error: {e}")
+                    continue
+                if best_text and not required_tool:
+                    log(f"Google tool retry: final attempt failed ({e}); "
+                        f"returning best text from attempt {best_idx + 1}")
+                    text, clean_text, function_calls = best_text, best_text, []
+                    break
+                if sse_started:
+                    _google_stream_fail(e)
+                    return
+                raise
+            text = raw
+            clean_text, function_calls = "", []
+            if has_tools and raw:
+                clean_text, function_calls = parse_google_function_calls(
+                    raw, allowed_names=g_allowed, tool_schemas=g_schemas)
+                function_calls = [
+                    fc for fc in function_calls
+                    if g_allowlist is None or fc.get("name") in g_allowlist
+                ]
+            if function_calls:
+                if g_required:
+                    g_missing = missing_required_params(
+                        [{"function": {
+                            "name": fc.get("name"),
+                            "arguments": json.dumps(fc.get("args") or {},
+                                                   ensure_ascii=False)}}
+                         for fc in function_calls], g_required)
+                    if g_missing:
+                        log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                            f"missing required parameter(s): {', '.join(g_missing)}")
+                        if attempt + 1 < attempts:
+                            grepeat_nudge = (
+                                " The previous function call was missing required "
+                                f"parameter(s): {', '.join(g_missing)} -- include "
+                                "every required parameter.")
+                            continue
+                if all((fc.get("name"), _canonical_args(fc.get("args")))
+                       in grepeat for fc in function_calls):
+                    # Already answered upstream: re-emitting the call loops.
+                    if grepeats < 3 and attempt + 1 < attempts:
+                        grepeats += 1
+                        grepeat_nudge = (" The result of this exact function "
+                                         "call is already in the conversation "
+                                         "-- answer in plain text, do not call "
+                                         "it again.")
+                        log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                            "duplicate function call already answered, nudging")
+                        continue
+                    log("Google duplicate function call repeated 3 times (or no "
+                        "attempts left): returning the plain-text answer instead")
+                    function_calls = []
+                    text = clean_text or raw
+                    break
+                break
+            if (raw or "").strip() and not looks_like_upstream_error(raw):
+                best_text, best_idx = raw, attempt
+            if attempt + 1 >= attempts:
+                break
+            if not (raw or "").strip():
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    "upstream returned an empty response")
+                continue
+            if looks_like_upstream_error(raw):
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    "upstream returned its canned error placeholder instead of "
+                    "a response")
+                continue
+            if required_tool:
+                continue
+            if retry_on_miss and has_tools and g_owed:
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    f"{g_owed}")
+                grepeat_nudge = (" You have not gathered enough evidence yet ("
+                                 + g_owed + "). Call the read/search tools "
+                                 "now instead of answering from memory.")
+                continue
+            if retry_on_miss and looks_like_missed_tool_call(raw):
+                log(f"Google tool retry (attempt {attempt + 1}/{attempts}): "
+                    f"response looks like a missed tool call ({len(raw)} chars)")
+                continue
+            break
+
+        if not text:
+            if best_text and not required_tool:
+                log(f"Google tool retry: final answer is empty; returning best "
+                    f"text from attempt {best_idx + 1}")
+                text = best_text
+            else:
+                _google_fail(502, "empty response from upstream", "UNAVAILABLE")
+                return
+
+        # The canned sentence is an upstream failure, not something the model
+        # said. Returning it as a candidate tells the client "answered".
+        if looks_like_upstream_error(text):
+            if best_text and not required_tool:
+                log(f"Google tool retry: final answer is the upstream "
+                    f"placeholder; returning best text from attempt {best_idx + 1}")
+                text = best_text
+            else:
+                status, message, gstatus = _map_google_error(GeminiError(
+                    "upstream returned an error placeholder instead of a response; "
+                    "please retry"))
+                _google_fail(status, message, gstatus)
+                return
+
+        if required_tool and not function_calls:
+            # mode=ANY is a contract, like tool_choice=required: prose ends
+            # an agent turn that asked for action. Report, don't answer.
+            status, message, gstatus = _map_google_error(GeminiError(
+                "model did not emit the required function call; please retry"))
+            _google_fail(status, message, gstatus)
+            return
+
+        response_parts = []
+        if has_tools and function_calls:
+            if clean_text:
+                response_parts.append({"text": clean_text})
+            for fc in function_calls:
+                response_parts.append({"functionCall": {"name": fc["name"], "args": fc["args"]}})
+        else:
+            response_parts.append({"text": text})
+
+        candidate = {
+            "content": {"parts": response_parts, "role": "model"},
+            "finishReason": "STOP",
+            "index": 0,
+        }
+        usage = {
+            "promptTokenCount": len(prompt) // 4,
+            "candidatesTokenCount": len(text) // 4,
+            "totalTokenCount": (len(prompt) + len(text)) // 4,
+        }
+        response_obj = {
+            "candidates": [candidate],
+            "usageMetadata": usage,
+            "modelVersion": model_name,
+        }
+
+        if stream:
+            try:
+                if not sse_started:
+                    self._start_sse()
+                self._sse_write(
+                    f"data: {json.dumps(response_obj, ensure_ascii=False)}\n\n".encode())
+            finally:
+                if stop_ping is not None:
+                    stop_ping()
+        else:
+            self.send_json(response_obj)
+
+
+class ThreadedServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
