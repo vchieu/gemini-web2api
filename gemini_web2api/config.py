@@ -9,6 +9,7 @@ DEFAULT_CONFIG = {
     # could otherwise use your Google session. Set to "0.0.0.0" behind a
     # container / reverse proxy that provides its own access control.
     "host": "127.0.0.1",
+    "tool_stream": False,
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,

@@ -13,6 +13,7 @@ from .config import CONFIG
 from .models import MODELS, resolve_model, ticket_for
 from .gemini import generate, generate_stream, log, GeminiError, trace
 from .tools import (
+    looks_like_tool_call,
     messages_to_prompt,
     parse_tool_calls,
     google_contents_to_prompt,
@@ -62,9 +63,40 @@ ERR_API = "api_error"
 # Gap between SSE keep-alive comments while a buffered turn still works
 # upstream. Must stay well under every client's idle/chunk timeout (OpenCode
 # defaults to 300 s).
-SSE_PING_INTERVAL_SEC = 15
+SSE_PING_INTERVAL_SEC = 5
 
 _MISSING = object()
+
+
+def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
+                       extra, ticket, tools_active, attempt_no):
+    """generate_stream() collapsed to one string, with [timing] + early exit.
+
+    Used by the tool-retry loops when CONFIG["tool_stream"] is on: the client
+    sees first-delta timing in the log and we stop reading upstream as soon as
+    a complete tool_call fence has arrived -- waiting for the tail of a turn
+    that already produced its call only delays the next client action.
+    """
+    chunks = []
+    ttfb_done = False
+    t0 = time.monotonic()
+    for delta in generate_stream(call_prompt, model_id, think_mode,
+                                 file_refs, extra, ticket):
+        if not ttfb_done and delta:
+            ttfb_done = True
+            log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
+                f"{time.monotonic() - t0:.1f}s")
+        chunks.append(delta)
+        if tools_active:
+            raw_so_far = "".join(chunks)
+            if looks_like_tool_call(raw_so_far):
+                i = raw_so_far.find("```")
+                if i >= 0 and "\n```" in raw_so_far[i + 3:]:
+                    log(f"[timing] tool attempt {attempt_no + 1}: complete "
+                        f"tool_call fence after {time.monotonic() - t0:.1f}s, "
+                        "early-exit read")
+                    break
+    return "".join(chunks)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -945,7 +977,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     repeat_nudge = ""
                 call_prompt = prompt + "\n\n" + nudge
             try:
-                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+                if CONFIG.get("tool_stream"):
+                    raw = _streamed_generate(call_prompt, model_id, think_mode,
+                                             file_refs, extra, ticket,
+                                             tools_active, attempt)
+                else:
+                    raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
             except Exception as e:
                 if attempt + 1 < attempts:
                     log(f"Tool retry after upstream error: {e}")
@@ -1002,6 +1039,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 continue
             if attempt + 1 >= attempts:
                 break
+            time.sleep(CONFIG["retry_delay_sec"])
             if not (text or "").strip():
                 # An upstream that produced nothing (observed once as an empty
                 # body after a dropped connection) is never a usable answer:
@@ -1873,7 +1911,12 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     grepeat_nudge = ""
                 call_prompt = prompt + "\n\n" + nudge
             try:
-                raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
+                if CONFIG.get("tool_stream"):
+                    raw = _streamed_generate(call_prompt, model_id, think_mode,
+                                             file_refs, extra, ticket,
+                                             tools_active, attempt)
+                else:
+                    raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
             except Exception as e:
                 if attempt + 1 < attempts:
                     log(f"Google tool retry after upstream error: {e}")

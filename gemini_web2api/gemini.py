@@ -616,6 +616,7 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     last_err = None
     bl_refreshed = False
     for attempt in range(CONFIG["retry_attempts"]):
+        _t0 = time.monotonic()
         url = _get_url()
         headers = _build_headers(ticket)
         try:
@@ -634,7 +635,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                 _dump_raw(raw)
             trace("MODEL -> PROXY", raw)
             check_routing(raw, model_id, extra_fields, ticket)
-            return extract_response_text(raw)
+            text = extract_response_text(raw)
+            log(f"[timing] generate attempt {attempt + 1}: "
+                f"{time.monotonic() - _t0:.1f}s, {len(text)} chars")
+            return text
         except urllib.error.HTTPError as e:
             last_err = _status_error(e.code)
             # A stale BL build label manifests as 405/404: refresh and retry once.
@@ -673,6 +677,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
     last_err = None
     bl_refreshed = False
     for attempt in range(CONFIG["retry_attempts"]):
+        _t0 = time.monotonic()
+        _ttfb_logged = False
         url = _get_url()
         headers = _build_headers(ticket)
         emitted_raw_text = ""
@@ -777,6 +783,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                             delta = clean_text(clean_buf, strip=False)
                             clean_buf = ""
                             if delta:
+                                if not _ttfb_logged:
+                                    _ttfb_logged = True
+                                    log(f"[timing] stream attempt "
+                                        f"{attempt + 1}: first token in "
+                                        f"{time.monotonic() - _t0:.1f}s")
                                 emitted_any = True
                                 yield delta
             if clean_buf:
@@ -801,6 +812,8 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
                 _dump_raw(raw_full)
             trace("MODEL -> PROXY (stream)", raw_full)
             check_routing(raw_full, model_id, extra_fields, ticket)
+            log(f"[timing] stream attempt {attempt + 1}: "
+                f"{time.monotonic() - _t0:.1f}s total, {len(raw_full)} raw bytes")
             return
         except httpx.HTTPStatusError as e:
             status = e.response.status_code if e.response is not None else None
