@@ -133,67 +133,46 @@ def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
       * log first-delta timing so operator and client can tell "upstream slow"
         from "proxy hung";
       * stop reading upstream as soon as a *complete, parseable* tool_call
-        fence has arrived (real parser, not a backtick heuristic);
+        fence has arrived (real parser primitives, not a backtick heuristic);
       * hand every delta to ``on_delta`` so the caller can keep the client's
         connection warm (heartbeat/ping) during a long buffered turn.
 
-    The generator is consumed through a queue with a timeout: silence itself
-    becomes an observable event ("silent for Ns") instead of an unexplained
-    hang. On early-exit the pump is *not* joined -- it drains in the background
-    (daemon thread) so a stalled upstream can never hold the request open, and
-    GeneratorExit never reaches generate_stream mid-yield because the pump
-    always exhausts it into the queue.
+    The wrapped generator is iterated directly in this thread and abandoned
+    at the early-exit point via close(), preserving the pre-patch contract
+    that TAIL deltas are never pulled -- a background pump would defeat it.
     """
-    import queue as _queue
-    q: "_queue.Queue" = _queue.Queue()
-
-    def _pump():
-        try:
-            for d in generate_stream(call_prompt, model_id, think_mode,
-                                     file_refs, extra, ticket):
-                q.put(d)
-        except BaseException as exc:      # re-raised in this thread below
-            q.put(exc)
-        q.put(None)
-
-    threading.Thread(target=_pump, daemon=True).start()
     chunks = []
     ttfb_done = False
-    silent_logged = False
-    last_activity = t0 = time.monotonic()
-    while True:
-        try:
-            item = q.get(timeout=20.0)
-        except _queue.Empty:
-            if not silent_logged:
-                silent_logged = True
-                log(f"[timing] tool attempt {attempt_no + 1}: upstream silent "
-                    f"for {time.monotonic() - last_activity:.0f}s mid-turn")
-            continue
-        if isinstance(item, BaseException):
-            raise item
-        if item is None:
-            break
-        silent_logged = False
-        last_activity = time.monotonic()
-        if not ttfb_done and item:
-            ttfb_done = True
-            log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
-                f"{last_activity - t0:.1f}s")
-        chunks.append(item)
-        if on_delta is not None:
+    t0 = time.monotonic()
+    gen = generate_stream(call_prompt, model_id, think_mode,
+                          file_refs, extra, ticket)
+    try:
+        for delta in gen:
+            if not ttfb_done and delta:
+                ttfb_done = True
+                log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
+                    f"{time.monotonic() - t0:.1f}s")
+            chunks.append(delta)
+            if on_delta is not None:
+                try:
+                    on_delta(delta)
+                except Exception as e:
+                    log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
+            if tools_active:
+                raw_so_far = "".join(chunks)
+                cut = _complete_call_end(raw_so_far)
+                if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
+                    log(f"[timing] tool attempt {attempt_no + 1}: complete "
+                        f"tool_call fence after {time.monotonic() - t0:.1f}s, "
+                        "early-exit read")
+                    break
+    finally:
+        close = getattr(gen, "close", None)
+        if close is not None:
             try:
-                on_delta(item)
-            except Exception as e:
-                log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
-        if tools_active:
-            raw_so_far = "".join(chunks)
-            cut = _complete_call_end(raw_so_far)
-            if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
-                log(f"[timing] tool attempt {attempt_no + 1}: complete "
-                    f"tool_call fence after {time.monotonic() - t0:.1f}s, "
-                    "early-exit read")
-                break
+                close()
+            except Exception:
+                pass
     return "".join(chunks)'''
 
 # NOTE: OLD anchors below must match what latency_stream_patch.py leaves in
@@ -601,8 +580,10 @@ def apply(revert: bool) -> int:
             print(f"BACKUP {path.name} -> {bak.name}")
 
     skips = 0
+    buffers = {}
+    touched = set()
     for path, name, old, new in EDITS:
-        src = path.read_text(encoding="utf-8")
+        src = buffers.get(path, path.read_text(encoding="utf-8"))
         if old not in src:
             if new in src:
                 print(f"ALREADY  {path.name}: {name}")
@@ -616,8 +597,11 @@ def apply(revert: bool) -> int:
                   f"{src.count(old)} times, expected 1)")
             skips += 1
             continue
-        path.write_text(src.replace(old, new, 1), encoding="utf-8")
+        buffers[path] = src.replace(old, new, 1)
+        touched.add(path.name)
         print(f"PATCHED  {path.name}: {name}")
+    for path, src in buffers.items():
+        path.write_text(src, encoding="utf-8")
 
     for path in files:
         rc = subprocess.run([sys.executable, "-m", "py_compile", str(path)])

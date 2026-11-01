@@ -1421,6 +1421,36 @@ def looks_like_canned_failure(text: str) -> bool:
                                                   for r in _CANNED_FAILURE_RES)
 
 
+_CANNED_FAILURE_RES = (
+    re.compile(r"sorry,?\s+something\s+went\s+wrong", re.IGNORECASE),
+    re.compile(r"please\s+try\s+your\s+request\s+again", re.IGNORECASE),
+    re.compile(r"i\s+can'?t\s+use\s+[a-z][a-z .'\-]{0,60}?\s+because\s+"
+               r"required\s+.{0,80}?(settings|permissions)\s+are\s+off",
+               re.IGNORECASE),
+    re.compile(r"turn\s+on\s+these\s+settings\s+to\s+continue",
+               re.IGNORECASE),
+)
+
+
+def looks_like_canned_failure(text: str) -> bool:
+    """True for ANY upstream canned sentence, at any length.
+
+    ``looks_like_upstream_error`` is anchored (whole-string) and
+    ``looks_like_extension_refusal`` caps at 800 chars, so a verbose model that
+    pads "Sorry, something went wrong..." or the Workspace-settings refusal
+    with prose escapes both and is handed to the client as a finished answer --
+    observed live as turns that stall ~60 s and then "stop by themselves".
+    These sentences are machine-generated upstream failures, never part of a
+    genuine reply, so substring matching is safe here (the patterns are too
+    specific to occur inside real content).
+    """
+    if not text or len(text) > 4000:
+        return False
+    folded = _fold_diacritics(text)
+    return looks_like_upstream_error(text) or any(r.search(folded)
+                                                  for r in _CANNED_FAILURE_RES)
+
+
 def looks_like_missed_tool_call(text: str) -> bool:
     """True when a response *intended* to use a tool but never emitted a block.
 

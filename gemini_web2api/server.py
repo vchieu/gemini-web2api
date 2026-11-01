@@ -34,6 +34,7 @@ from .tools import (
     looks_like_upstream_error,
     looks_like_extension_refusal,
     looks_like_canned_failure,
+    looks_like_canned_failure,
     pending_tool_request,
     SOURCE_REVIEW_OWED,
     is_read_retry_reason,
@@ -125,65 +126,195 @@ def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
       * log first-delta timing so operator and client can tell "upstream slow"
         from "proxy hung";
       * stop reading upstream as soon as a *complete, parseable* tool_call
-        fence has arrived (real parser, not a backtick heuristic);
+        fence has arrived (real parser primitives, not a backtick heuristic);
       * hand every delta to ``on_delta`` so the caller can keep the client's
         connection warm (heartbeat/ping) during a long buffered turn.
 
-    The generator is consumed through a queue with a timeout: silence itself
-    becomes an observable event ("silent for Ns") instead of an unexplained
-    hang. GeneratorExit never reaches the wrapped generator because it is
-    always drained into the queue by the pump thread first.
+    The wrapped generator is iterated directly in this thread and abandoned
+    at the early-exit point via close(), preserving the pre-patch contract
+    that TAIL deltas are never pulled -- a background pump would defeat it.
     """
-    import queue as _queue
-    q: "_queue.Queue" = _queue.Queue()
-
-    def _pump():
-        try:
-            for d in generate_stream(call_prompt, model_id, think_mode,
-                                     file_refs, extra, ticket):
-                q.put(d)
-        except BaseException as exc:      # re-raised in this thread below
-            q.put(exc)
-        q.put(None)
-
-    threading.Thread(target=_pump, daemon=True).start()
     chunks = []
     ttfb_done = False
-    silent_logged = False
-    last_activity = t0 = time.monotonic()
-    while True:
-        try:
-            item = q.get(timeout=20.0)
-        except _queue.Empty:
-            if not silent_logged:
-                silent_logged = True
-                log(f"[timing] tool attempt {attempt_no + 1}: upstream silent "
-                    f"for {time.monotonic() - last_activity:.0f}s mid-turn")
-            continue
-        if isinstance(item, BaseException):
-            raise item
-        if item is None:
-            break
-        silent_logged = False
-        last_activity = time.monotonic()
-        if not ttfb_done and item:
-            ttfb_done = True
-            log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
-                f"{last_activity - t0:.1f}s")
-        chunks.append(item)
-        if on_delta is not None:
+    t0 = time.monotonic()
+    gen = generate_stream(call_prompt, model_id, think_mode,
+                          file_refs, extra, ticket)
+    try:
+        for delta in gen:
+            if not ttfb_done and delta:
+                ttfb_done = True
+                log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
+                    f"{time.monotonic() - t0:.1f}s")
+            chunks.append(delta)
+            if on_delta is not None:
+                try:
+                    on_delta(delta)
+                except Exception as e:
+                    log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
+            if tools_active:
+                raw_so_far = "".join(chunks)
+                cut = _complete_call_end(raw_so_far)
+                if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
+                    log(f"[timing] tool attempt {attempt_no + 1}: complete "
+                        f"tool_call fence after {time.monotonic() - t0:.1f}s, "
+                        "early-exit read")
+                    break
+    finally:
+        close = getattr(gen, "close", None)
+        if close is not None:
             try:
-                on_delta(item)
-            except Exception as e:
-                log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
-        if tools_active:
-            raw_so_far = "".join(chunks)
-            cut = _complete_call_end(raw_so_far)
-            if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
-                log(f"[timing] tool attempt {attempt_no + 1}: complete "
-                    f"tool_call fence after {time.monotonic() - t0:.1f}s, "
-                    "early-exit read")
-                break
+                close()
+            except Exception:
+                pass
+    return "".join(chunks)
+
+
+class _Heartbeat:
+    """Delta sink for a buffered tool turn: upstream activity == keep-alive.
+
+    ``feed(delta)`` is called by ``_streamed_generate`` for every streamed
+    chunk of a tool-retry attempt. It writes one SSE comment immediately --
+    clients see per-part activity instead of 20-60 s of silence -- and resets
+    the interval timer so idle pings only fire when nothing arrives. The gone
+    flag is shared with the caller: a failed write means nobody listens and
+    further upstream attempts must be skipped. Thread-safe via ``_lock``
+    because both the request thread (feed) and this thread (run) write.
+    """
+
+    def __init__(self, handler, stop_event, gone_event):
+        self._handler = handler
+        self._stop = stop_event
+        self._gone = gone_event
+        self._wake = threading.Event()
+        self._lock = threading.Lock()
+
+    def _write_ping(self):
+        with self._lock:
+            if self._stop.is_set():
+                return False
+            try:
+                self._handler._sse_write(b": ping\n\n")
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                self._gone.set()
+                return False
+            except Exception:
+                return False
+
+    def feed(self, delta=None):
+        if self._stop.is_set() or self._gone.is_set():
+            return
+        self._write_ping()
+        self._wake.set()          # restart the idle countdown
+
+    def run(self):
+        interval = SSE_PING_INTERVAL_SEC
+        while not self._stop.is_set():
+            if self._wake.wait(interval):
+                self._wake.clear()
+                continue          # real activity just happened: re-arm quietly
+            if self._stop.is_set():
+                return
+            if not self._write_ping():
+                return
+
+
+def _complete_call_end(text: str):
+    """Char index just past the LAST closed, parseable tool-call block, else None.
+
+    Uses the same primitives as the real parser (_FENCE_OPEN/_FENCE_CLOSE +
+    JSONDecoder.raw_decode with strict=False), so early-exit fires exactly
+    when the buffered prefix already holds a call ``parse_tool_calls`` would
+    accept -- never on a stray triple-backtick. Conservative by design:
+    * a payload still streaming fails raw_decode -> wait for more deltas;
+    * a non-JSON body (Python-style ``read(path="x")``) is NOT counted --
+      AST recovery happens later in parse_tool_calls, so such turns simply
+      read to completion instead of risking a cut-off call;
+    * prose ```json examples are skipped and scanning continues -- the real
+      call may follow them.
+    """
+    from .tools import _ARGUMENT_KEYS, _FENCE_OPEN, _FENCE_CLOSE
+    dec = json.JSONDecoder(strict=False)
+    last_end = None
+    pos = 0
+    while True:
+        m = _FENCE_OPEN.search(text, pos)
+        if not m:
+            return last_end
+        j = m.end()
+        while j < len(text) and text[j] in " \t\r\n":
+            j += 1
+        kind = m.group(1)
+        try:
+            data, end = dec.raw_decode(text, j)
+        except ValueError:
+            # Body not (yet) valid JSON: keep any earlier closed block and
+            # wait for more deltas rather than cutting mid-payload.
+            return last_end
+        counted = False
+        if isinstance(data, dict) and data.get("name"):
+            if kind != "json" or any(k in data for k in _ARGUMENT_KEYS):
+                counted = True
+        if not counted:
+            # Prose example or non-call payload: skip it, keep scanning.
+            c = _FENCE_CLOSE.match(text, end)
+            pos = c.end() if c else max(end, m.end())
+            continue
+        c = _FENCE_CLOSE.match(text, end)
+        if not c:
+            return last_end          # closing fence still streaming
+        last_end = c.end()
+        pos = last_end
+
+
+def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
+                       extra, ticket, tools_active, attempt_no, on_delta=None):
+    """generate_stream() collapsed to one string, with [timing] + early exit.
+
+    Used by the tool-retry loops when CONFIG["tool_stream"] is on. Three jobs:
+      * log first-delta timing so operator and client can tell "upstream slow"
+        from "proxy hung";
+      * stop reading upstream as soon as a *complete, parseable* tool_call
+        fence has arrived (real parser primitives, not a backtick heuristic);
+      * hand every delta to ``on_delta`` so the caller can keep the client's
+        connection warm (heartbeat/ping) during a long buffered turn.
+
+    The wrapped generator is iterated directly in this thread and abandoned
+    at the early-exit point via close(), preserving the pre-patch contract
+    that TAIL deltas are never pulled -- a background pump would defeat it.
+    """
+    chunks = []
+    ttfb_done = False
+    t0 = time.monotonic()
+    gen = generate_stream(call_prompt, model_id, think_mode,
+                          file_refs, extra, ticket)
+    try:
+        for delta in gen:
+            if not ttfb_done and delta:
+                ttfb_done = True
+                log(f"[timing] tool attempt {attempt_no + 1}: first delta in "
+                    f"{time.monotonic() - t0:.1f}s")
+            chunks.append(delta)
+            if on_delta is not None:
+                try:
+                    on_delta(delta)
+                except Exception as e:
+                    log(f"tool attempt {attempt_no + 1}: delta sink failed: {e}")
+            if tools_active:
+                raw_so_far = "".join(chunks)
+                cut = _complete_call_end(raw_so_far)
+                if cut is not None and looks_like_tool_call(raw_so_far[:cut]):
+                    log(f"[timing] tool attempt {attempt_no + 1}: complete "
+                        f"tool_call fence after {time.monotonic() - t0:.1f}s, "
+                        "early-exit read")
+                    break
+    finally:
+        close = getattr(gen, "close", None)
+        if close is not None:
+            try:
+                close()
+            except Exception:
+                pass
     return "".join(chunks)
 
 
