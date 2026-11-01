@@ -15,12 +15,6 @@ DEFAULT_CONFIG = {
     # per-part progress instead of 20-60 s of silence. Set false to keep the
     # old fully-buffered behaviour.
     "tool_delta_forward": True,
-    "tool_stream": False,
-    # When tool_stream is on, also forward each streamed delta of a buffered
-    # tool turn to the client (SSE ping / heartbeat) so agent clients see
-    # per-part progress instead of 20-60 s of silence. Set false to keep the
-    # old fully-buffered behaviour.
-    "tool_delta_forward": True,
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "request_timeout_sec": 180,
