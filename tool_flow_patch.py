@@ -139,8 +139,10 @@ def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
 
     The generator is consumed through a queue with a timeout: silence itself
     becomes an observable event ("silent for Ns") instead of an unexplained
-    hang. GeneratorExit never reaches the wrapped generator because it is
-    always drained into the queue by the pump thread first.
+    hang. On early-exit the pump is *not* joined -- it drains in the background
+    (daemon thread) so a stalled upstream can never hold the request open, and
+    GeneratorExit never reaches generate_stream mid-yield because the pump
+    always exhausts it into the queue.
     """
     import queue as _queue
     q: "_queue.Queue" = _queue.Queue()
@@ -194,7 +196,11 @@ def _streamed_generate(call_prompt, model_id, think_mode, file_refs,
                 break
     return "".join(chunks)'''
 
-OLD_OAI_CALLSITE = '''            try:
+# NOTE: OLD anchors below must match what latency_stream_patch.py leaves in
+# server.py -- including the leading "call_prompt = ..." line, which keeps the
+# anchor unique per loop ("Tool retry..." vs "Google tool retry...").
+OLD_OAI_CALLSITE = '''                call_prompt = prompt + "\\n\\n" + nudge
+            try:
                 if CONFIG.get("tool_stream"):
                     raw = _streamed_generate(call_prompt, model_id, think_mode,
                                              file_refs, extra, ticket,
@@ -206,7 +212,8 @@ OLD_OAI_CALLSITE = '''            try:
                     log(f"Tool retry after upstream error: {e}")
                     continue'''
 
-NEW_OAI_CALLSITE = '''            try:
+NEW_OAI_CALLSITE = '''                call_prompt = prompt + "\\n\\n" + nudge
+            try:
                 if CONFIG.get("tool_stream"):
                     # Buffered turn, live heartbeat: every upstream delta
                     # emits an SSE comment on the already-open stream, so the
@@ -229,7 +236,8 @@ NEW_OAI_CALLSITE = '''            try:
                     time.sleep(CONFIG["retry_delay_sec"])
                     continue'''
 
-OLD_GOO_CALLSITE = '''            try:
+OLD_GOO_CALLSITE = '''                call_prompt = prompt + "\\n\\n" + nudge
+            try:
                 if CONFIG.get("tool_stream"):
                     raw = _streamed_generate(call_prompt, model_id, think_mode,
                                              file_refs, extra, ticket,
@@ -241,7 +249,8 @@ OLD_GOO_CALLSITE = '''            try:
                     log(f"Google tool retry after upstream error: {e}")
                     continue'''
 
-NEW_GOO_CALLSITE = '''            try:
+NEW_GOO_CALLSITE = '''                call_prompt = prompt + "\\n\\n" + nudge
+            try:
                 if CONFIG.get("tool_stream"):
                     # Same live-heartbeat contract as the OpenAI loop: deltas
                     # reset/emit SSE pings through the sink the endpoint set up
@@ -252,7 +261,7 @@ NEW_GOO_CALLSITE = '''            try:
                              else None)
                     raw = _streamed_generate(call_prompt, model_id, think_mode,
                                              file_refs, extra, ticket,
-                                             has_tools, attempt,
+                                             tools_active, attempt,
                                              on_delta=gsink)
                 else:
                     raw = generate(call_prompt, model_id, think_mode, file_refs, extra, ticket)
@@ -465,11 +474,27 @@ NEW_OAI_ANCHOR2 = '''            if looks_like_canned_failure(text):
 
 OLD_OAI_ANCHOR3 = '''            if (not required_tool and tools_active
                     and looks_like_extension_refusal(text)):'''
+
+# Keep the dedicated refusal branch but let it catch refusals padded with
+# prose at ANY length: looks_like_canned_failure is a superset of
+# looks_like_extension_refusal, so this only widens detection. The import of
+# looks_like_extension_refusal stays untouched (harmless, still exported).
 NEW_OAI_ANCHOR3 = '''            if (not required_tool and tools_active
-                    and looks_like_canned_failure(text)):'''
+                    and looks_like_canned_failure(text)
+                    and not looks_like_upstream_error(text)):'''
 
 OLD_OAI_ANCHOR4 = '''        if not tool_calls and looks_like_upstream_error(text):'''
 NEW_OAI_ANCHOR4 = '''        if not tool_calls and looks_like_canned_failure(text):'''
+
+# E1: server.py must import the new detector (NameError otherwise -- this was
+# the exact crash in the reported test run). looks_like_extension_refusal is
+# still imported and still referenced by tests that patch it via the server
+# module namespace, so we keep it in the import list.
+OLD_IMPORTS = '''    looks_like_upstream_error,
+    looks_like_extension_refusal,'''
+NEW_IMPORTS = '''    looks_like_upstream_error,
+    looks_like_extension_refusal,
+    looks_like_canned_failure,'''
 
 OLD_GOO_ANCHOR1 = '''            if (raw or "").strip() and not looks_like_upstream_error(raw):'''
 NEW_GOO_ANCHOR1 = '''            if (raw or "").strip() and not looks_like_canned_failure(raw):'''
@@ -497,14 +522,18 @@ NEW_CONFIG_DEFAULT = '''    "tool_stream": False,
 # ------------------------------------------------------------------- edits --
 
 EDITS = [
+    # tools.py FIRST: server.py imports look_like_canned_failure at module
+    # import time; if the order were reversed, py_compile of server.py would
+    # still pass but any later test run in the same process could hit a stale
+    # ordering. Content-wise order does not matter, but keep it explicit.
+    (TOOLS, "A: looks_like_canned_failure (length-independent detection)",
+     OLD_TOOLS_FUNC_TAIL, NEW_TOOLS_FUNC_TAIL),
     (SERVER, "B1: _streamed_generate -> queue+timeout, parser-based early exit, "
              "on_delta sink", OLD_STREAMED_FN, NEW_STREAMED_FN),
     (SERVER, "C1: OpenAI tool loop -> live heartbeat + retry backoff",
      OLD_OAI_CALLSITE, NEW_OAI_CALLSITE),
     (SERVER, "C2: Google tool loop -> live heartbeat + retry backoff",
      OLD_GOO_CALLSITE, NEW_GOO_CALLSITE),
-    (TOOLS, "A: looks_like_canned_failure (length-independent detection)",
-     OLD_TOOLS_FUNC_TAIL, NEW_TOOLS_FUNC_TAIL),
     (SERVER, "C3a: OpenAI best-text guard uses canned detector",
      OLD_OAI_ANCHOR1, NEW_OAI_ANCHOR1),
     (SERVER, "C3b: OpenAI placeholder branch uses canned detector",
@@ -519,6 +548,27 @@ EDITS = [
      OLD_GOO_ANCHOR2, NEW_GOO_ANCHOR2),
     (SERVER, "C3g: Google final placeholder check uses canned detector",
      OLD_GOO_ANCHOR3, NEW_GOO_ANCHOR3),
+    (SERVER, "E1: import looks_like_canned_failure",
+     OLD_IMPORTS, NEW_IMPORTS),
+    # Heartbeat class must exist before _start_sse_with_keepalive returns it.
+    (SERVER, "E2: insert _Heartbeat class",
+     OLD_HB_ANCHOR, NEW_HB_ANCHOR),
+    (SERVER, "E3: _start_sse_with_keepalive -> heartbeat, 3-tuple",
+     OLD_PING_FN, NEW_PING_FN),
+    (SERVER, "E4: chat endpoint unpacks 3-tuple",
+     OLD_CHAT_UNPACK, NEW_CHAT_UNPACK),
+    (SERVER, "E5: chat endpoint clears _chat_hb",
+     OLD_CHAT_FINALLY, NEW_CHAT_FINALLY),
+    (SERVER, "E6: responses endpoint absorbs 3rd tuple item",
+     OLD_RESP_UNPACK, NEW_RESP_UNPACK),
+    (SERVER, "E7: late stream unpack absorbs 3rd item",
+     OLD_LATE_UNPACK, NEW_LATE_UNPACK),
+    (SERVER, "E8: google endpoint stores _google_hb",
+     OLD_GOO_SETUP, NEW_GOO_SETUP),
+    (SERVER, "E9: google stream-fail clears _google_hb",
+     OLD_GOO_STOP1, NEW_GOO_STOP1),
+    (SERVER, "E10: google final finally clears _google_hb",
+     OLD_GOO_STOP2, NEW_GOO_STOP2),
     (CONFIGF, "D: add tool_delta_forward default",
      OLD_CONFIG_DEFAULT, NEW_CONFIG_DEFAULT),
 ]
