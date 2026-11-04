@@ -8,8 +8,9 @@ from socketserver import ThreadingMixIn
 
 from .config import CONFIG
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
-from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
+from .gemini import generate, generate_stream, log, GeminiError
+from .tools import (messages_to_prompt, parse_tool_calls, google_contents_to_prompt,
+                    parse_google_function_calls, missing_required_params, tool_required_params)
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
 
@@ -18,6 +19,46 @@ def _usage(prompt: str, text: str) -> dict:
     p = len(prompt) // 4
     c = len(text or "") // 4
     return {"prompt_tokens": p, "completion_tokens": c, "total_tokens": p + c}
+
+
+def _generate_with_tool_retry(prompt, model_id, think_mode, file_refs, extra_fields,
+                              tool_required, attempts=None):
+    """Generate text and parse tool calls, retrying while emitted calls are invalid.
+
+    Fail-closed: if a tool call omits a required parameter (or its arguments do
+    not decode), the call is retried with a corrective nudge appended to the
+    prompt. When retries are exhausted, raise GeminiError instead of returning
+    an invalid tool call to the client.
+    """
+    attempts = attempts or max(1, int(CONFIG.get("tool_call_retries", 3)))
+    messages = prompt
+    nudge_extra = ""
+    text, tool_calls = "", []
+    for attempt in range(attempts):
+        try:
+            text = generate(messages, model_id, think_mode, file_refs, extra_fields)
+        except GeminiError:
+            raise
+        except Exception as e:
+            raise GeminiError(f"upstream error: {e}")
+        text, tool_calls = parse_tool_calls(text)
+        missing = missing_required_params(tool_calls, tool_required)
+        if missing:
+            log("model emitted invalid tool call; missing required "
+                f"parameter(s): {', '.join(missing)}")
+            if attempt + 1 < attempts:
+                nudge_extra = (
+                    f" The previous tool call was missing required parameter(s): "
+                    f"{', '.join(missing)}. Include every required parameter."
+                )
+                messages = prompt + nudge_extra
+                continue
+            raise GeminiError(
+                "model emitted invalid tool call; missing required "
+                f"parameter(s): {', '.join(missing)}"
+            )
+        break
+    return text, tool_calls
 
 
 def _upload_images(images: list) -> list:
@@ -241,14 +282,17 @@ class GeminiHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            if tools and tool_choice != "none":
+                text, tool_calls = _generate_with_tool_retry(
+                    prompt, model_id, think_mode, file_refs, extra_fields,
+                    tool_required_params(tools))
+            else:
+                text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                tool_calls = None
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
-        tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
         msg = {"role": "assistant", "content": text or None}
         if tool_calls:
             msg["tool_calls"] = tool_calls
@@ -328,20 +372,24 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tool_choice = req.get("tool_choice", "auto")
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
+        if isinstance(tool_choice, dict):
+            tool_choice = tool_choice.get("type") or tool_choice.get("mode") or "auto"
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
         try:
             file_refs = _upload_images(images)
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            if tools and tool_choice != "none":
+                text, tool_calls = _generate_with_tool_retry(
+                    prompt, model_id, think_mode, file_refs, extra_fields,
+                    tool_required_params(tools))
+            else:
+                text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+                tool_calls = None
         except Exception as e:
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
-
-        tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"

@@ -440,6 +440,78 @@ class StreamingEndpointTests(unittest.TestCase):
         self.assertEqual(events[4][1]["arguments"], '{"city":"Shanghai"}')
         self.assertEqual(events[-1][1]["response"]["output"][0]["name"], "get_weather")
 
+    @mock.patch("gemini_web2api.server.generate", side_effect=[
+        '```tool_call\n{"name": "get_weather", "arguments": {}}\n```',
+        '```tool_call\n{"name": "get_weather", "arguments": {"city": "Hanoi"}}\n```',
+    ])
+    def test_chat_retries_when_the_tool_call_omits_a_required_parameter(self, generate):
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(status, 200)
+        payload = json.loads(body)
+        tool_calls = payload["choices"][0]["message"].get("tool_calls") or []
+        self.assertEqual(payload["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(
+            json.loads(tool_calls[0]["function"]["arguments"]), {"city": "Hanoi"})
+        # The retry prompt must carry a corrective nudge about the missing param.
+        self.assertEqual(generate.call_count, 2)
+        self.assertIn("missing required parameter(s): get_weather (city)",
+                      generate.call_args_list[1].args[0])
+
+    @mock.patch("gemini_web2api.server.generate", return_value=(
+        '```tool_call\n{"name": "get_weather", "arguments": {}}\n```'))
+    def test_chat_fails_closed_when_required_parameter_stays_missing(self, generate):
+        CONFIG["tool_call_retries"] = 3
+        status, _, body = self.post_json(
+            "/v1/chat/completions",
+            {
+                "model": "gemini-3.6-flash",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "description": "Get weather",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+        # Exhausted retries: the invalid tool call must NOT reach the client.
+        self.assertEqual(status, 502)
+        error = json.loads(body)["error"]["message"]
+        self.assertIn("missing required parameter(s)", error)
+        self.assertIn("get_weather (city)", error)
+        self.assertEqual(generate.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

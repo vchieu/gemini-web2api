@@ -22,6 +22,10 @@ _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
 
 
+class GeminiError(RuntimeError):
+    """Raised when the upstream/model response cannot be delivered safely."""
+
+
 def log(msg: str):
     if CONFIG["log_requests"]:
         import sys

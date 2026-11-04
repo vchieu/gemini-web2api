@@ -216,6 +216,50 @@ def build_tool_prompt(tool_defs: list) -> str:
     )
 
 
+def tool_required_params(tools: list) -> dict:
+    """Map tool name -> set of required parameter names from OpenAI-style tool defs."""
+    required = {}
+    for tool in tools or []:
+        fn = tool.get("function", tool) if isinstance(tool, dict) else {}
+        name = fn.get("name", "")
+        if not name:
+            continue
+        params = fn.get("parameters") or {}
+        req = params.get("required") or []
+        if isinstance(req, list):
+            required[name] = {r for r in req if isinstance(r, str)}
+        else:
+            required[name] = set()
+    return required
+
+
+def missing_required_params(tool_calls: list, tool_required: dict) -> list:
+    """Return names of tools whose emitted call omits a required parameter.
+
+    A tool call is invalid when its arguments JSON fails to decode or when it
+    lacks any parameter listed as required in the tool schema.
+    """
+    missing = []
+    for tc in tool_calls or []:
+        fn = (tc or {}).get("function") or {}
+        name = fn.get("name", "")
+        req = (tool_required or {}).get(name)
+        if not req:
+            continue
+        args_raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+        except (json.JSONDecodeError, TypeError):
+            args = None
+        if not isinstance(args, dict):
+            missing.append(name)
+            continue
+        absent = sorted(req - set(args))
+        if absent:
+            missing.append(f"{name} ({', '.join(absent)})")
+    return missing
+
+
 def _google_tool_choice_instruction(req: dict) -> str:
     """Extract tool_choice constraint from Google API toolConfig."""
     tool_config = req.get("toolConfig", {})
